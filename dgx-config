@@ -9,14 +9,14 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 
 # Define the absolute paths based on the script's location
-VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+VENV_PYTHON="$SCRIPT_DIR/dgx-env/bin/python"
 ORCHESTRATOR_SCRIPT="$SCRIPT_DIR/dgx-orchestrator.py"
 
 # Safety Check: Does the virtual environment exist?
 if [ ! -f "$VENV_PYTHON" ]; then
     echo "❌ ERROR: Virtual environment Python binary not found!"
     echo "Expected location: $VENV_PYTHON"
-    echo "Please build the environment: cd $SCRIPT_DIR && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    echo "Please build the environment: cd $SCRIPT_DIR && python3 -m venv dgx-env && dgx-env/bin/pip install -r requirements.txt"
     exit 1
 fi
 
