@@ -9,7 +9,7 @@ hosts:
   spark-9dbe:
     aliases: ["spark-4", "4"]
     ssh_user: "tetrel"
-    compute_dir: "/home/tetrel/docker/dgx-cluster-config"
+    compute_dir: "/home/tetrel/docker/dgx-cluster-control"
     volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
     networks:
       management:
@@ -20,7 +20,7 @@ hosts:
   spark-6e63:
     aliases: ["spark-3", "3"]
     ssh_user: "tetrel"
-    compute_dir: "/home/tetrel/docker/dgx-cluster-config"
+    compute_dir: "/home/tetrel/docker/dgx-cluster-control"
     volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
     networks:
       management:

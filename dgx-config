@@ -6,7 +6,8 @@
 # ==============================================================================
 
 # Dynamically find the directory where this script lives
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+REAL_SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT")" &> /dev/null && pwd)"
 
 # Define the absolute paths based on the script's location
 VENV_PYTHON="$SCRIPT_DIR/dgx-env/bin/python"
