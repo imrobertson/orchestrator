@@ -1,0 +1,90 @@
+# ==============================================================================
+# CORE BARE-METAL MULTI-NODE FABRIC ORCHESTRATION LAYER
+# ==============================================================================
+services:
+  cluster-node:
+    # Parametrized target image and container naming schema evaluated at runtime
+    image: ${CLUSTER_IMAGE}
+    container_name: ${CLUSTER_CONTAINER_NAME}
+    restart: unless-stopped
+    
+    # Bypasses standard container networking interfaces to surface onto bare-metal links directly
+    network_mode: host
+    ipc: host
+    shm_size: 64gb
+ 
+    # -----------------------------------------------------------------
+    # HARDWARE CAPABILITIES: Required for RDMA Direct Memory Access
+    # -----------------------------------------------------------------
+    # Privileged configuration allows direct non-virtualized access to device buses
+    privileged: true
+    cap_add:
+      - IPC_LOCK
+    devices:
+      - /dev/infiniband:/dev/infiniband
+          
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NCCL_DEBUG=INFO
+      
+      # -----------------------------------------------------------------
+      # FORCE NVIDIA ENTRYPOINT DRIVER BYPASS & JUMP TO COMPATIBILITY
+      # -----------------------------------------------------------------
+      - NVIDIA_DISABLE_REQUIRE=true
+      - VLLM_ENABLE_CUDA_COMPATIBILITY=1
+      - LD_LIBRARY_PATH=/usr/local/cuda/compat:$LD_LIBRARY_PATH
+
+      # -----------------------------------------------------------------
+      # CONNECTX-7 RDMA / ROCEV2 ACTIVATION (CORRECTED DEVICE NAME)
+      # -----------------------------------------------------------------
+      # Forces native hardware paths instead of falling back to standard TCP loops
+      - NCCL_IB_DISABLE=0
+      - NCCL_P2P_DISABLE=0
+      - NCCL_IB_HCA=rocep1s0f0
+      - NCCL_IB_GID_INDEX=3   
+              
+      # Socket control plane routing boundaries and dedicated bootstrap configurations
+      - NCCL_SOCKET_IFNAME=enp1s0f0np0
+      - GLOO_SOCKET_IFNAME=enp1s0f0np0
+      - TP_SOCKET_IFNAME=enp1s0f0np0
+      
+      # Ring buffer allocation optimized for 200Gbps ConnectX-7 link layers
+      - NCCL_BUFFSIZE=16777216
+      - HF_TOKEN=${HF_TOKEN}
+      - NCCL_NSOCKS_PER_THREAD=4
+      - NCCL_SOCKET_DRV_BUFFSIZE=2097152
+      
+      # -----------------------------------------------------------------
+      # DYNAMIC PASS-THROUGH: Pulls directly from evaluated .env profiles
+      # -----------------------------------------------------------------
+      # CLUSTER TIMEOUT BRIDGES (CRITICAL FIX FOR LARGE VISION PAYLOADS)
+      # -----------------------------------------------------------------
+      - VLLM_RPC_TIMEOUT
+      - VLLM_ENGINE_ITERATION_TIMEOUT_S
+      - TORCH_DISTRIBUTED_TIMEOUT
+      - TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+      - NCCL_TIMEOUT
+      - GLOO_TIMEOUT
+      - TORCH_INDUCTOR_RECOMPILE_LIMIT
+           
+    volumes:
+      # Isolated user-space cache directory mapping. Kernel driver mapping paths are omitted.
+      - /home/tetrel/.cache/huggingface:/root/.cache/huggingface
+      # -----------------------------------------------------------------
+      # DRIVER MOUNTS: Feed host user-space InfiniBand drivers to vLLM
+      # Permanently disabled to guarantee container isolation consistency
+      # -----------------------------------------------------------------
+      # - /usr/lib/aarch64-linux-gnu/libibverbs.so.1:/usr/lib/aarch64-linux-gnu/libibverbs.so.1:ro
+      # - /usr/lib/aarch64-linux-gnu/libmlx5.so.1:/usr/lib/aarch64-linux-gnu/libmlx5.so.1:ro
+              
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # Allocates the single isolated physical GPU assigned to the container context
+              count: 1
+              capabilities: [gpu]
+              
+    # Executes the string configuration parameters directly into the runtime context
+    command: ${CLUSTER_COMMAND}

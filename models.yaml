@@ -1,0 +1,162 @@
+# ==============================================================================
+# DGX SPARK CLUSTER: UNIFIED META-PROFILE & NETWORK CATALOG
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. HOST INVENTORY & MULTI-INTERFACE NETWORK MATRIX
+# ------------------------------------------------------------------------------
+hosts:
+  spark-9dbe:
+    aliases: ["spark-4", "4"]
+    ssh_user: "tetrel"
+    compute_dir: "/home/tetrel/docker"
+    volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
+    networks:
+      management:
+        wired: "10.0.14.43"
+        wireless: "10.0.14.44"
+      backplane: "192.168.99.2"
+
+  spark-6e63:
+    aliases: ["spark-3", "3"]
+    ssh_user: "tetrel"
+    compute_dir: "/home/tetrel/docker"
+    volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
+    networks:
+      management:
+        wired: "10.0.14.41"
+        wireless: "10.0.14.42"
+      backplane: "192.168.99.1"
+
+# ------------------------------------------------------------------------------
+# 2. MODEL METADATA & TOPOLOGY TUNABLES
+# ------------------------------------------------------------------------------
+models:
+  # ----------------------------------------------------------------------------
+  # DEEPSEEK ARCHITECTURES
+  # ----------------------------------------------------------------------------
+  deepseek-v4-pro:
+    hf_path: "deepseek-ai/DeepSeek-V4-Pro"
+    gpu_util: 0.78
+    topologies:
+      2_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
+          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
+        vllm_args: >-
+          --disable-custom-all-reduce
+          --trust-remote-code
+          --max-num-seqs 1
+          --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}'
+
+  deepseek-v4-flash:
+    hf_path: "deepseek-ai/DeepSeek-V4-Flash"
+    gpu_util: 0.78
+    topologies:
+      1_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 1
+        vllm_args: "--max-num-batched-tokens 4096"
+
+  # ----------------------------------------------------------------------------
+  # QWEN ARCHITECTURES (122B MIXTURE OF EXPERTS - DEEP CLUSTER OCR CORE)
+  # ----------------------------------------------------------------------------
+ # ----------------------------------------------------------------------------
+  # QWEN ARCHITECTURES (122B MIXTURE OF EXPERTS - DEEP CLUSTER OCR CORE)
+  # ----------------------------------------------------------------------------
+  qwen-3.5-122b:
+    hf_path: "Qwen/Qwen3.5-122B-A10B-FP8"
+    dtype: "fp8"
+    gpu_util: 0.90
+    topologies:
+      2_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
+          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
+        vllm_args: >-
+          --disable-custom-all-reduce
+          --trust-remote-code
+          --max-num-seqs 16
+
+  # ----------------------------------------------------------------------------
+  # GEMMA ARCHITECTURES (RECONSTRUCTION TARGET - LAYOUT SANITIZER)
+  # ----------------------------------------------------------------------------
+  gemma-4-31b:
+    hf_path: "google/gemma-4-31B-it"
+    gpu_util: 0.85
+    topologies:
+      1_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 1
+        vllm_args: "--max-num-batched-tokens 4096"
+
+  # ----------------------------------------------------------------------------
+  # LLAMA-4 SCOUT ARCHITECTURES (METADATA / FRONTMATTER CORE)
+  # ----------------------------------------------------------------------------
+  llama-4-fp4:
+    hf_path: "nvidia/Llama-4-Scout-17B-16E-Instruct-FP4"
+    topologies:
+      1_node:
+        max_model_len: 32768
+        gpu_util: 0.75
+        tp_size: 1
+        pp_size: 1
+        vllm_args: ""
+      2_node:
+        max_model_len: 32768
+        gpu_util: 0.70
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
+          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
+        vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 1"
+
+  llama-4-fp8:
+    hf_path: "nvidia/Llama-4-Scout-17B-16E-Instruct-FP8"
+    dtype: "fp8"
+    topologies:
+      1_node:
+        max_model_len: 16384
+        gpu_util: 0.85
+        tp_size: 1
+        pp_size: 1
+        vllm_args: "--max-num-seqs 1 --enforce-eager"
+      2_node:
+        max_model_len: 65536
+        gpu_util: 0.70
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
+          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
+        vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 16"
+ 
+  # ----------------------------------------------------------------------------
+  # LLAMA-3.3 ARCHITECTURES (FAST DISTILLATION & FRONTMATTER CORE)
+  # ----------------------------------------------------------------------------
+  llama-3.3-70b:
+    hf_path: "meta-llama/Llama-3.3-70B-Instruct"
+    gpu_util: 0.85
+    topologies:
+      1_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 1
+        vllm_args: "--max-num-batched-tokens 4096"
+      2_node:
+        max_model_len: 56000
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
+          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
+        vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 16 --max-num-batched-tokens 4096 --enforce-eager"

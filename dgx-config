@@ -1,0 +1,31 @@
+#!/bin/bash
+# ==============================================================================
+# DGX ORCHESTRATOR WRAPPER
+# Automatically binds to the local virtual environment to bypass PEP 668.
+# Includes self-healing transport layer for stale SSH multiplexing sockets.
+# ==============================================================================
+
+# Dynamically find the directory where this script lives
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+
+# Define the absolute paths based on the script's location
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+ORCHESTRATOR_SCRIPT="$SCRIPT_DIR/dgx-orchestrator.py"
+
+# Safety Check: Does the virtual environment exist?
+if [ ! -f "$VENV_PYTHON" ]; then
+    echo "❌ ERROR: Virtual environment Python binary not found!"
+    echo "Expected location: $VENV_PYTHON"
+    echo "Please build the environment: cd $SCRIPT_DIR && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    exit 1
+fi
+
+# ==============================================================================
+# SELF-HEALING TRANSPORT LAYER
+# Quietly clear any stale multiplexed sockets for the 10.0.14.x DGX subnet
+# before launching the orchestrator to prevent 'Connection timed out' deadlocks.
+# ==============================================================================
+rm -f ~/.ssh/cm-*10.0.14.* ~/.ssh/master-*10.0.14.* 2>/dev/null
+
+# Execute the orchestrator, passing all user arguments ("$@") into the CLI
+exec "$VENV_PYTHON" "$ORCHESTRATOR_SCRIPT" cli "$@"
