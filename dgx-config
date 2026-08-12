@@ -1,32 +1,52 @@
 #!/bin/bash
 # ==============================================================================
-# DGX ORCHESTRATOR WRAPPER
-# Automatically binds to the local virtual environment to bypass PEP 668.
-# Includes self-healing transport layer for stale SSH multiplexing sockets.
+# 🚀 DGX ORCHESTRATOR WRAPPER (V3.8 - PRODUCTION RELEASE)
+# ==============================================================================
+# Automatically binds to the local virtual environment to bypass PEP 668 constraints.
+# Includes a self-healing transport layer for stale SSH multiplexing sockets and
+# ensures safe path resolution for relative catalog files (models.yaml).
 # ==============================================================================
 
-# Dynamically find the directory where this script lives
+# 1. Dynamically resolve the absolute path of this script (safely handles symlinks)
 REAL_SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT")" &> /dev/null && pwd)"
 
-# Define the absolute paths based on the script's location
+# 2. Define the absolute paths for the Python binary and the orchestrator payload
 VENV_PYTHON="$SCRIPT_DIR/dgx-env/bin/python"
 ORCHESTRATOR_SCRIPT="$SCRIPT_DIR/dgx-orchestrator.py"
 
-# Safety Check: Does the virtual environment exist?
+# 3. Environment Safety Check
 if [ ! -f "$VENV_PYTHON" ]; then
     echo "❌ ERROR: Virtual environment Python binary not found!"
-    echo "Expected location: $VENV_PYTHON"
-    echo "Please build the environment: cd $SCRIPT_DIR && python3 -m venv dgx-env && dgx-env/bin/pip install -r requirements.txt"
+    echo "   Expected location: $VENV_PYTHON"
+    echo "   [Fix]: Please build the environment by running:"
+    echo "          cd $SCRIPT_DIR"
+    echo "          python3 -m venv dgx-env"
+    echo "          dgx-env/bin/pip install -r requirements.txt"
     exit 1
 fi
 
-# ==============================================================================
-# SELF-HEALING TRANSPORT LAYER
-# Quietly clear any stale multiplexed sockets for the 10.0.14.x DGX subnet
+# 4. Self-Healing Transport Layer
+# Quietly clear any stale multiplexed sockets for the 10.0.14.x DGX management subnet
 # before launching the orchestrator to prevent 'Connection timed out' deadlocks.
-# ==============================================================================
 rm -f ~/.ssh/cm-*10.0.14.* ~/.ssh/master-*10.0.14.* 2>/dev/null
 
-# Execute the orchestrator, passing all user arguments ("$@") into the CLI
+# 5. Context Switch
+# Change into the script directory to guarantee relative file lookups
+# (e.g., .secrets, models.yaml) resolve securely.
+cd "$SCRIPT_DIR" || {
+    echo "❌ ERROR: Failed to change directory to $SCRIPT_DIR"
+    exit 1
+}
+
+# ==============================================================================
+# 6. EXECUTION MODE SELECTION
+# ==============================================================================
+# Option A: Shared Service Account Mode
+# Requires matching sudoers configuration (e.g., %wheel ALL=(tetrel) NOPASSWD: /path).
+# exec sudo -u tetrel "$VENV_PYTHON" "$ORCHESTRATOR_SCRIPT" cli "$@"
+
+# Option B: Per-User Key Mode (Default)
+# Executes using the caller's native user account and personal SSH keys.
+# Requires users to run 'dgx-config authorize-key' first.
 exec "$VENV_PYTHON" "$ORCHESTRATOR_SCRIPT" cli "$@"

@@ -9,7 +9,7 @@ hosts:
   spark-9dbe:
     aliases: ["spark-4", "4"]
     ssh_user: "tetrel"
-    compute_dir: "/home/tetrel/docker/dgx-cluster-control"
+    compute_dir: "/home/tetrel/docker"
     volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
     networks:
       management:
@@ -20,7 +20,7 @@ hosts:
   spark-6e63:
     aliases: ["spark-3", "3"]
     ssh_user: "tetrel"
-    compute_dir: "/home/tetrel/docker/dgx-cluster-control"
+    compute_dir: "/home/tetrel/docker"
     volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
     networks:
       management:
@@ -33,34 +33,74 @@ hosts:
 # ------------------------------------------------------------------------------
 models:
   # ----------------------------------------------------------------------------
-  # DEEPSEEK ARCHITECTURES
+  # DEEPSEEK ARCHITECTURES (Tuned for 2x GB10 Stability)
   # ----------------------------------------------------------------------------
-  deepseek-v4-pro:
-    hf_path: "deepseek-ai/DeepSeek-V4-Pro"
-    gpu_util: 0.78
+  deepseek-v4-flash-0731:
+    hf_path: "deepseek-ai/DeepSeek-V4-Flash-0731"
+    gpu_util: 0.80
     topologies:
       2_node:
-        max_model_len: 32768
+        max_model_len: 393216
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
+          - "DG_JIT_USE_NVRTC=0"
         vllm_args: >-
-          --disable-custom-all-reduce
           --trust-remote-code
-          --max-num-seqs 1
-          --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}'
+          --kv-cache-dtype fp8
+          --distributed-executor-backend mp
+          --enable-ep-weight-filter
+          --max-num-seqs 4
 
-  deepseek-v4-flash:
-    hf_path: "deepseek-ai/DeepSeek-V4-Flash"
-    gpu_util: 0.78
+  deepseek-v4-flash-nvfp4:
+    hf_path: "nvidia/DeepSeek-V4-Flash-NVFP4"
+    gpu_util: 0.80
+    topologies:
+      2_node:
+        max_model_len: 393216
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - "DG_JIT_USE_NVRTC=0"
+        vllm_args: >-
+          --trust-remote-code
+          --kv-cache-dtype fp8
+          --distributed-executor-backend mp
+          --enable-ep-weight-filter
+          --max-num-seqs 4
+
+  deepseek-v4-flash-dspark:
+    hf_path: "deepseek-ai/DeepSeek-V4-Flash-DSpark"
+    gpu_util: 0.80
+    topologies:
+      2_node:
+        max_model_len: 393216
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - "DG_JIT_USE_NVRTC=0"
+        vllm_args: >-
+          --trust-remote-code
+          --kv-cache-dtype fp8
+          --distributed-executor-backend mp
+          --enable-ep-weight-filter
+          --speculative-config '{"method":"dspark"}'
+          --max-num-seqs 4
+          
+  # ----------------------------------------------------------------------------
+  # NEMOTRON ARCHITECTURES (AGENTIC AUTOMATION CORE)
+  # ----------------------------------------------------------------------------
+  nemotron-3.5-lightning:
+    hf_path: "nvidia/Nemotron-3.5-Lightning-30B-A3B"
+    gpu_util: 0.85
     topologies:
       1_node:
-        max_model_len: 32768
+        max_model_len: 1048576
         tp_size: 1
         pp_size: 1
-        vllm_args: "--max-num-batched-tokens 4096"
+        vllm_args: >-
+          --trust-remote-code
+          --kv-cache-dtype fp8
 
   # ----------------------------------------------------------------------------
   # QWEN ARCHITECTURES (122B MIXTURE OF EXPERTS - DEEP CLUSTER OCR CORE)
@@ -123,7 +163,7 @@ models:
     topologies:
       1_node:
         max_model_len: 16384
-        gpu_util: 0.85
+        gpu_util: 0.95
         tp_size: 1
         pp_size: 1
         vllm_args: "--max-num-seqs 1 --enforce-eager"
@@ -136,7 +176,7 @@ models:
           - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
           - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
         vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 16"
-
+ 
   # ----------------------------------------------------------------------------
   # LLAMA-3.3 ARCHITECTURES (FAST DISTILLATION & FRONTMATTER CORE)
   # ----------------------------------------------------------------------------

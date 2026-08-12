@@ -41,7 +41,7 @@ services:
       - NCCL_IB_DISABLE=0
       - NCCL_P2P_DISABLE=0
       - NCCL_IB_HCA=rocep1s0f0
-      - NCCL_IB_GID_INDEX=3   
+      - NCCL_IB_GID_INDEX=3
               
       # Socket control plane routing boundaries and dedicated bootstrap configurations
       - NCCL_SOCKET_IFNAME=enp1s0f0np0
@@ -68,8 +68,16 @@ services:
       - TORCH_INDUCTOR_RECOMPILE_LIMIT
            
     volumes:
-      # Isolated user-space cache directory mapping. Kernel driver mapping paths are omitted.
-      - /home/tetrel/.cache/huggingface:/root/.cache/huggingface
+      # -----------------------------------------------------------------
+      # [v3.8 Update]: DYNAMIC VOLUME MAPPING
+      # Hardcoded tetrel mapping replaced with dynamic variable injected by dgx-orchestrator.py
+      # based on the host definition in models.yaml to support multi-user environments.
+      # -----------------------------------------------------------------
+      - ${CLUSTER_VOLUME_MOUNT}
+      
+      # OLD HARDCODED MOUNT (Retained for historical context):
+      # - /home/tetrel/.cache/huggingface:/root/.cache/huggingface
+      
       # -----------------------------------------------------------------
       # DRIVER MOUNTS: Feed host user-space InfiniBand drivers to vLLM
       # Permanently disabled to guarantee container isolation consistency
