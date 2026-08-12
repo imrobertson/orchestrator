@@ -33,31 +33,14 @@ hosts:
 # ------------------------------------------------------------------------------
 models:
   # ----------------------------------------------------------------------------
-  # DEEPSEEK ARCHITECTURES (Tuned for 2x GB10 Stability)
+  # DEEPSEEK ARCHITECTURES (0731 RELEASE - NVFP4 QUANTIZED)
   # ----------------------------------------------------------------------------
-  deepseek-v4-flash-0731:
-    hf_path: "deepseek-ai/DeepSeek-V4-Flash-0731"
-    gpu_util: 0.80
-    topologies:
-      2_node:
-        max_model_len: 393216
-        tp_size: 1
-        pp_size: 2
-        env_vars:
-          - "DG_JIT_USE_NVRTC=0"
-        vllm_args: >-
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --distributed-executor-backend mp
-          --enable-ep-weight-filter
-          --max-num-seqs 4
-
   deepseek-v4-flash-nvfp4:
-    hf_path: "nvidia/DeepSeek-V4-Flash-NVFP4"
-    gpu_util: 0.80
+    hf_path: "Rarri/DeepSeek-V4-Flash-0731-NVFP4"
+    gpu_util: 0.90
     topologies:
       2_node:
-        max_model_len: 393216
+        max_model_len: 1048576
         tp_size: 1
         pp_size: 2
         env_vars:
@@ -67,13 +50,13 @@ models:
           --kv-cache-dtype fp8
           --distributed-executor-backend mp
           --enable-ep-weight-filter
-          --max-num-seqs 4
-          
+          --attention-config '{"use_fp4_indexer_cache": true}'
+
   # ----------------------------------------------------------------------------
-  # NEMOTRON ARCHITECTURES (AGENTIC AUTOMATION CORE)
+  # NEMOTRON ARCHITECTURES (AGENTIC AUTOMATION CORE - AUG 11 DROP)
   # ----------------------------------------------------------------------------
   nemotron-3.5-lightning:
-    hf_path: "nvidia/Nemotron-3.5-Lightning-30B-A3B"
+    hf_path: "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
     gpu_util: 0.85
     topologies:
       1_node:
@@ -83,10 +66,68 @@ models:
         vllm_args: >-
           --trust-remote-code
           --kv-cache-dtype fp8
+          --speculative-model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
+          --speculative-config '{"method":"dspark"}'
 
   # ----------------------------------------------------------------------------
-  # QWEN ARCHITECTURES (122B MIXTURE OF EXPERTS - DEEP CLUSTER OCR CORE)
+  # META MUSE ARCHITECTURES (MULTIMODAL AGENTIC CORE)
   # ----------------------------------------------------------------------------
+  muse-glimmer-30b:
+    hf_path: "meta-models/Muse-Glimmer-30B"
+    gpu_util: 0.85
+    topologies:
+      1_node:
+        max_model_len: 131072
+        tp_size: 1
+        pp_size: 1
+        vllm_args: >-
+          --trust-remote-code
+          --kv-cache-dtype fp8
+          --speculative-model meta-models/Muse-Glimmer-30B-DFlash
+          --speculative-config '{"method":"dflash"}'
+
+  # ----------------------------------------------------------------------------
+  # QWEN ARCHITECTURES (27B NVFP4, 122B MoE)
+  # ----------------------------------------------------------------------------
+  qwen-3.6-27b-nvfp4:
+    hf_path: "nvidia/Qwen3.6-27B-NVFP4"
+    gpu_util: 0.85
+    topologies:
+      1_node:
+        max_model_len: 262144
+        tp_size: 1
+        pp_size: 1
+        vllm_args: >-
+          --trust-remote-code
+          --kv-cache-dtype fp8
+          --language-model-only
+          --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+      2_node:
+        max_model_len: 262144
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
+          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
+        vllm_args: >-
+          --disable-custom-all-reduce
+          --trust-remote-code
+          --kv-cache-dtype fp8
+          --language-model-only
+
+  qwen-3.8-27b:
+    hf_path: "Qwen/Qwen3.8-27B"
+    gpu_util: 0.85
+    topologies:
+      1_node:
+        max_model_len: 262144
+        tp_size: 1
+        pp_size: 1
+        vllm_args: >-
+          --trust-remote-code
+          --kv-cache-dtype fp8
+          --language-model-only
+
   qwen-3.5-122b:
     hf_path: "Qwen/Qwen3.5-122B-A10B-FP8"
     dtype: "fp8"
@@ -158,7 +199,7 @@ models:
           - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
           - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
         vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 16"
- 
+
   # ----------------------------------------------------------------------------
   # LLAMA-3.3 ARCHITECTURES (FAST DISTILLATION & FRONTMATTER CORE)
   # ----------------------------------------------------------------------------
@@ -170,12 +211,12 @@ models:
         max_model_len: 32768
         tp_size: 1
         pp_size: 1
-        vllm_args: "--max-num-batched-tokens 4096"
+        vllm_args: "--max-num-batched-tokens 8192 --kv-cache-dtype fp8 --enable-chunked-prefill"
       2_node:
-        max_model_len: 56000
+        max_model_len: 65536
         tp_size: 1
         pp_size: 2
         env_vars:
           - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
           - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-        vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 16 --max-num-batched-tokens 4096 --enforce-eager"
+        vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 16 --max-num-batched-tokens 8192 --kv-cache-dtype fp8 --enable-chunked-prefill"
