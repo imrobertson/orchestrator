@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# DGX SPARK CLUSTER ORCHESTRATOR (V3.8.1 - PRODUCTION RELEASE)
+# 🚀 DGX SPARK CLUSTER ORCHESTRATOR (V3.8 - PRODUCTION RELEASE)
 # ==============================================================================
 import os
 import sys
@@ -173,7 +173,6 @@ def enforce_safeguards(ip: str, user: str, is_batch: bool, dry_run: bool = False
 # ==============================================================================
 # CORE CLI ACTIONS
 # ==============================================================================
-# ... (authorize_user_key and build_deployment_string remain identical to Source [3]) ...
 def authorize_user_key(pubkey_path: Optional[str] = None):
     if not pubkey_path:
         for candidate in ["~/.ssh/id_ed25519.pub", "~/.ssh/id_rsa.pub"]:
@@ -304,14 +303,7 @@ def execute_deployment(model: str, target_nodes: int, is_batch: bool, head_ident
         user = host_details['ssh_user']
         compute_dir = host_details['compute_dir']
         
-        with ssh_mux_session(ip, user) as mux_socket:
-            # 🛡️ WAKE-UP DAEMONS: Safe container resurrection bypass
-            print(f"  [+] Waking up Docker daemons on {ip}...")
-            subprocess.run(
-                ["ssh", "-S", mux_socket, f"{user}@{ip}", "sudo systemctl start containerd && sudo systemctl start docker"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15
-            )
-
+        with ssh_mux_session(ip, user):
             enforce_safeguards(ip, user, is_batch, dry_run)
             env_data = build_deployment_string(model, role, head_backplane_ip, rank, config, topo_config, host_details)
             
@@ -330,7 +322,6 @@ def execute_deployment(model: str, target_nodes: int, is_batch: bool, head_ident
             
     print("\n[✓] Deployment sequence complete.")
 
-# ... (get_remote_logs, sync_compose_templates, check_cluster_status remain identical to Source [3]) ...
 def get_remote_logs(host_identifier: str, tail: int, follow: bool):
     catalog = get_catalog()
     host_name, details = find_host_by_identifier(host_identifier, catalog.get("hosts", {}))
@@ -403,13 +394,7 @@ def check_cluster_status():
         user = details['ssh_user']
         compute_dir = details['compute_dir']
         
-        with ssh_mux_session(ip, user) as mux_socket:
-            # Wake up Docker daemons to accurately check status
-            subprocess.run(
-                ["ssh", "-S", mux_socket, f"{user}@{ip}", "sudo systemctl start containerd && sudo systemctl start docker"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15
-            )
-            
+        with ssh_mux_session(ip, user):
             res = run_ssh(ip, user, ["docker", "info"], capture=True, timeout=15)
             if res.returncode != 0:
                 print(f"{host_name:<12} | {ip:<20} | {'STOPPED':<8}")
@@ -430,7 +415,7 @@ def check_cluster_status():
             print(f"{host_name:<12} | {ip:<20} | {'ACTIVE':<8} | {active_str}")
 
 # ==============================================================================
-# FASTAPI ENGINE & MAIN CLI RUNNER
+# FASTAPI ENGINE (OPTIONAL DAEMON MODE)
 # ==============================================================================
 app = FastAPI()
 
@@ -445,6 +430,9 @@ async def api_deploy(request: DeployRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(execute_deployment, request.model, request.nodes, True, request.head, request.dry_run)
     return {"status": "accepted"}
 
+# ==============================================================================
+# MAIN ENTRYPOINT / CLI ROUTER
+# ==============================================================================
 def main():
     parser = argparse.ArgumentParser(description="DGX Spark Cluster Orchestrator")
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -493,13 +481,7 @@ def main():
                     compute_dir = details['compute_dir']
                     
                     print(f"  -> Shutting down runtimes on {host_name} ({ip} via {interface})...")
-                    with ssh_mux_session(ip, user) as mux_socket:
-                        # 🛡️ WAKE-UP DAEMONS: Safe container teardown bypass
-                        print(f"  [+] Waking up Docker daemons on {ip}...")
-                        subprocess.run(
-                            ["ssh", "-S", mux_socket, f"{user}@{ip}", "sudo systemctl start containerd && sudo systemctl start docker"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15
-                        )
+                    with ssh_mux_session(ip, user):
                         for compose_file in ["docker-compose.cluster.yml", "docker-compose.standalone.yml"]:
                             run_ssh(ip, user, ["docker", "compose", "-f", f"{compute_dir}/{compose_file}", "down"])
                             
