@@ -68,24 +68,6 @@ models:
           --distributed-executor-backend mp
           --enable-ep-weight-filter
           --max-num-seqs 4
-
-  deepseek-v4-flash-dspark:
-    hf_path: "deepseek-ai/DeepSeek-V4-Flash-DSpark"
-    gpu_util: 0.80
-    topologies:
-      2_node:
-        max_model_len: 393216
-        tp_size: 1
-        pp_size: 2
-        env_vars:
-          - "DG_JIT_USE_NVRTC=0"
-        vllm_args: >-
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --distributed-executor-backend mp
-          --enable-ep-weight-filter
-          --speculative-config '{"method":"dspark"}'
-          --max-num-seqs 4
           
   # ----------------------------------------------------------------------------
   # NEMOTRON ARCHITECTURES (AGENTIC AUTOMATION CORE)
