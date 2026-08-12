@@ -1,5 +1,5 @@
 # ==============================================================================
-# DGX SPARK CLUSTER: UNIFIED META-PROFILE & NETWORK CATALOG
+# DGX SPARK CLUSTER: UNIFIED META-PROFILE & NETWORK CATALOG (3.8.1)
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -160,7 +160,8 @@ models:
         max_model_len: 32768
         tp_size: 1
         pp_size: 1
-        vllm_args: "--max-num-batched-tokens 4096"
+        # [v3.8.1 Fix]: --enforce-eager added to bypass CUDA graph profiling locks
+        vllm_args: "--max-num-batched-tokens 4096 --enforce-eager"
       2_node:
         max_model_len: 56000
         tp_size: 1
