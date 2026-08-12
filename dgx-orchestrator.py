@@ -47,7 +47,10 @@ def ssh_mux_session(ip: str, user: str):
     ]
     
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if res.returncode != 0:
+            print(f"  [-] Critical: SSH key verification failed for {user}@{ip}.")
+            sys.exit(1)
     except subprocess.TimeoutExpired:
         print(f"  [-] Critical: Multiplex connection to {ip} timed out.")
         sys.exit(1)

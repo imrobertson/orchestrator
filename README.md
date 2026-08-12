@@ -1,41 +1,92 @@
-# 🚀 DGX Cluster Control Plane (`dgx-cluster-control`)
+# 🚀 DGX Cluster Control Plane (`dgx-cluster-control`) — V3.8 Hardened Edition
 
 This repository contains the `dgx-config` orchestration suite. It acts as the central control plane for managing distributed vLLM deployments across a twin-node RoCEv2 NVIDIA Grace Blackwell fabric.
+
+---
 
 ## 🖥️ Target Infrastructure
 
 This tool brokers deployments to the remote inference cluster.
 
 * **Hardware:** 2x GB10 (Grace Blackwell) DGX Sparks. Both nodes natively run the vLLM engine.
-* **spark-4 (Head Node):** `10.0.14.43`. Features 128GB of Unified Memory.
-* **spark-3 (Worker Node):** `10.0.14.41`. Features 128GB of Unified Memory and operates with strict headless guardrails.
+
+
+* **spark-4 (Head Node):** `10.0.14.43` (`spark-9dbe`). Features 128GB of Unified Memory.
+
+
+* **spark-3 (Worker Node):** `10.0.14.41` (`spark-6e63`). Features 128GB of Unified Memory and operates with strict headless guardrails.
+
+
 
 ---
 
 ## 🔬 Low-Level Network Fabric & Hardware Safeguards
 
-### 1. Network Interface Targets & Boundaries
+### 1. Network Interface Targets & Gloo/NCCL Bindings
 
 * **Management TCP Interface (`enp1s0f0np0`):** All SSH orchestration, administrative commands, and `dgx-config` calls route strictly across the management subnet (`10.0.14.x`).
-* *⚠️ Warning:* Do **not** attempt to route management SSH commands across the private backplane subnet (`192.168.99.x`). Doing so triggers host-key verification failures and locks remote shells.
+
+
+* **Gloo & NCCL Interface Binding (`enp1s0f0np0`):** Multi-node distributed topologies **must** pass `GLOO_SOCKET_IFNAME=enp1s0f0np0` and `NCCL_SOCKET_IFNAME=enp1s0f0np0`.
+
+
+* *⚠️ Critical Errata:* PyTorch Gloo requires a physical Linux network device name (e.g., `enp1s0f0np0`). Passing an IP prefix or CIDR block (such as `192.168.99.`) causes `ProcessGroupGloo` to crash with `RuntimeError: ifa != nullptr`.
+
+
 
 
 * **RoCEv2 Link Layer (200Gbps ConnectX-7):**
 * **InfiniBand / HCA Target:** `rocep1s0f0`
+
 * **RoCE GID Index:** `NCCL_IB_GID_INDEX=3`
+
 * **Inter-Node Port:** Port `29500` bound across `192.168.99.x` for PyTorch distributed backplanes.
 
 
 
-### 2. GPU Power & Hardware Locks
+
+
+### 2. Self-Healing SSH Transport & Execution Timeouts
+
+To prevent orphaned SSH multiplex processes or hung remote Docker daemons from freezing the orchestration control plane:
+
+* **Automatic Socket Purging:** Every execution automatically purges stale control sockets in both `/tmp/ssh-mux-*` and `~/.ssh/cm-*`.
+
+
+* **Execution Timeout Guards:** Remote command invocations (such as `docker rm -f` or `docker logs`) are wrapped in explicit `timeout 10` execution guards to guarantee non-blocking return codes if a remote node experiences a GPU driver or socket lockup.
+
+
+
+### 3. Ubiquiti / UniFi Gateway IDS/IPS Mitigation
+
+When executing `dgx-config` from a host located on a different VLAN or subnet (e.g., workstation `192.168.1.x` $\rightarrow$ cluster `10.0.14.x`), automated rapid-fire SSH multiplexing and status polling can trigger UniFi Threat Management / Suricata (IPS/IDS) SSH brute-force heuristics.
+
+* **Symptom:** Port 22 connections abruptly hang (`Connection timed out` or `BLOCKED`) specifically from the orchestrator workstation, while other machines or local L2 nodes continue to connect without issue.
+* **Resolution A (Permanent Gateway Unblock):** Navigate to the UniFi Network Dashboard $\rightarrow$ **System Logs** $\rightarrow$ **Security Detections**, locate the event blocking your workstation IP, and select **Allow IP / Unblock Threat**.
+* **Resolution B (Transparent L2 ProxyJump Bypass):** Tunnel SSH traffic through an unblocked node on the target L2 management subnet to bypass inter-VLAN inspection rules completely. Add the following to `~/.ssh/config` on the orchestration workstation:
+
+```ssh
+Host 10.0.14.43 spark-9dbe spark-4
+    HostName 10.0.14.43
+    User tetrel
+    ProxyJump tetrel@10.0.14.41
+
+```
+
+### 4. GPU Power & Hardware Clock Locks
 
 To prevent Over-Current Protection (OCP) power excursions during heavy batch inference on Grace Blackwell chips, `dgx-config` automatically executes hardware clock locking (`nvidia-smi -lgc 300,1800`) on target nodes prior to spinning up containers.
 
-### 3. vLLM Runtime Container Environment
+### 5. vLLM Runtime Container Environment
 
 * **Base NGC Image:** `nvcr.io/nvidia/vllm:26.05.post1-py3`
-* **Host Driver Requirement:** Data Center driver release 595.58+ with active `nvidia-fabricmanager` services.
+
+* **Host Driver Requirement:** Data Center driver release 580.159+ / 595.58+ with active `nvidia-fabricmanager` services.
+
+
 * **Command Pass-through:** Container command strings explicitly prepend `vllm serve` to bypass NGC shell entrypoint parsing limits.
+
+
 
 ---
 
@@ -99,7 +150,7 @@ sudo -u tetrel /opt/dgx-cluster-control/dgx-config authorize-key --key ~/.ssh/id
 
 ```
 
-*Once authorized, the user can run `dgx-config` natively without `sudo`.*
+Once authorized, the user can run `dgx-config` natively without `sudo`.
 
 ---
 
@@ -112,7 +163,9 @@ dgx-config status
 
 ```
 
-* **Tear Down the Cluster:** *(Must be run before pivoting models to release VRAM)*.
+* **Tear Down Active Cluster Runtimes:** *(Must be run before pivoting models to release VRAM)*.
+
+
 
 ```bash
 dgx-config teardown
@@ -126,85 +179,127 @@ dgx-config deploy --model <model_alias> --nodes <count>
 
 ```
 
+* **Synchronize Compose Templates Across Nodes:**
+
+```bash
+dgx-config sync
+
+```
+
+* **Stream Live Remote Logs:**
+
+```bash
+dgx-config logs --host spark-4 --tail 100 -f
+
+```
+
 ---
 
 ## 📚 Core Model Catalog (`models.yaml`)
 
 When deploying, reference the exact aliases defined in `/opt/dgx-cluster-control/models.yaml`.
 
-*Note: Model footprints and VRAM capacities are tuned for Grace Blackwell (GB10) LPDDR5x unified memory constraints.*
+Note: Model footprints and VRAM capacities are tuned for Grace Blackwell (GB10) LPDDR5x unified memory constraints.
 
-* **DeepSeek Architectures (0731 NVFP4 Transcode):**
-* `deepseek-v4-flash-nvfp4`: `Rarri/DeepSeek-V4-Flash-0731-NVFP4` (Requires `--nodes 2`). Official 0731 release quantized to 4-bit NVFP4. Utilizes `--attention-config '{"use_fp4_indexer_cache": true}'` to accelerate MLA indexing directly on GB10 FP4 tensor cores.
+* **DeepSeek Architectures:**
+* `deepseek-v4-pro`: `deepseek-ai/DeepSeek-V4-Pro` (Requires `--nodes 2`). Multi-node MoE pipeline parallel topology using `GLOO_SOCKET_IFNAME=enp1s0f0np0`.
 
 
-* **Agentic & Automation Cores:**
-* `nemotron-3.5-lightning`: `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` (Requires `--nodes 1`). 30B MoE (3B active) model with native DSpark speculative decoding support.
-* `muse-glimmer-30b`: `meta-models/Muse-Glimmer-30B` (Requires `--nodes 1`). Multimodal agentic model featuring integrated vision perception and DFlash block-diffusion speculative drafter.
+* `deepseek-v4-flash`: `deepseek-ai/DeepSeek-V4-Flash` (Requires `--nodes 1`). Single-node high-throughput inference engine.
+
+
 
 
 * **Qwen Architectures:**
-* `qwen-3.6-27b-nvfp4`: `nvidia/Qwen3.6-27B-NVFP4` (Supports `--nodes 1` or `--nodes 2`). Optimized with `--language-model-only` and native MTP speculative prediction.
-* `qwen-3.8-27b`: `Qwen/Qwen3.8-27B` (Requires `--nodes 1`). Standard text core.
-* `qwen-3.5-122b`: `Qwen/Qwen3.5-122B-A10B-FP8` (Requires `--nodes 2`). Deep cluster MoE OCR and document extraction engine.
+* `qwen-3.5-122b`: `Qwen/Qwen3.5-122B-A10B-FP8` (Requires `--nodes 2`). Deep cluster MoE OCR and document extraction engine. Explicitly configured with `GLOO_SOCKET_IFNAME=enp1s0f0np0` and `NCCL_SOCKET_IFNAME=enp1s0f0np0`.
+
+
 
 
 * **Llama & Gemma Architectures:**
+* `llama-3.3-70b`: `meta-llama/Llama-3.3-70B-Instruct` (Supports `--nodes 1` or `--nodes 2`). Optimized via chunked prefill (`--enable-chunked-prefill`), FP8 KV cache, and CUDA graph compilation.
+
+
 * `llama-4-fp4`: `nvidia/Llama-4-Scout-17B-16E-Instruct-FP4` (Supports `--nodes 1` or `--nodes 2`). Ultra-fast single-node frontmatter & metadata extraction core.
+
+
 * `llama-4-fp8`: `nvidia/Llama-4-Scout-17B-16E-Instruct-FP8` (Supports `--nodes 1` or `--nodes 2`).
-* `llama-3.3-70b`: `meta-llama/Llama-3.3-70B-Instruct` (Supports `--nodes 1` or `--nodes 2`). Optimized via chunked prefill (`--enable-chunked-prefill`), FP8 KV cache, and CUDA graph compilation (eager mode disabled).
+
+
 * `gemma-4-31b`: `google/gemma-4-31B-it` (Requires `--nodes 1`). Reconstruction & layout sanitizer core.
+
+
 
 
 
 ---
 
-# 🪦 Release Tombstones: DGX Orchestrator v3.8
+# 🪦 Release Tombstones & Fix Log: DGX Orchestrator v3.8 Hardened
 
-### 1. `dgx-orchestrator.py` (Core Engine)
+### 1. PyTorch Gloo Device Binding Fix (`GLOO_SOCKET_IFNAME`)
 
-* **Global Execution & Path Resolution Fix:** Replaced hardcoded `open("models.yaml")` calls with a dynamic `get_catalog()` helper. The script now safely resolves its absolute path relative to `__file__`, preventing `FileNotFoundError` crashes when executed globally via the `/usr/local/bin/` symlink.
-* **Concurrency-Safe Temp Files:** The `.env` manifest payload is now written to a host-specific temporary file (`.env.tmp.{host_name}`) before SCP transfer, preventing race conditions during parallel multi-node deployments.
-* **New Native SSH Key Distribution:** Added the `authorize-key` CLI command. It piggybacks on the multiplexed socket engine to securely inject local public keys into the remote nodes' `~/.ssh/authorized_keys`, checking for duplicates to maintain a clean ledger.
-* **Docker Subshell Quoting Bug Fixed:** Wrapped the `docker ps --format` argument in single quotes (`'{{.Names}} ({{.Status}})'`). This prevents the remote SSH bash interpreter from evaluating the parentheses as a subshell, fixing the blank "ACTIVE RUNTIMES" dashboard bug.
-* **Dynamic Dashboard Model ID Injection:** The `status` command now executes a secondary SSH command to `cat` the `.env` payload, parses it natively in Python, and dynamically appends the loaded HuggingFace model alias to the dashboard output (e.g., `➔ [DeepSeek-V4-Flash]`).
-* **Dynamic Cluster Volume Mounts:** Added `CLUSTER_VOLUME_MOUNT` to the deployment string compiler, removing the dependency on hardcoded `tetrel` paths.
-
-### 2. `dgx-config` (Bash Wrapper)
-
-* **Execution Paradigm Shift:** Disabled the `sudo -u tetrel` elevation layer. The wrapper now defaults to executing as the calling user, enforcing per-user SSH key authentication for strict auditing.
-* **VENV Error Trapping:** Added explicit, copy-pasteable terminal instructions for rebuilding the virtual environment if the `dgx-env/bin/python` binary is missing.
-* **Directory Context Switching:** Enforced `cd "$SCRIPT_DIR"` prior to execution to ensure relative `.secrets` files resolve correctly.
-
-### 3. `models.yaml` (Hardware Topology Catalog)
-
-* **DeepSeek 0731 NVFP4 Alignment:**
-* Purged the unquantized FP8 `deepseek-v4-flash-0731` base entry to prevent OOM panics on 256GB unified memory setups.
-* Replaced outdated preview paths with `Rarri/DeepSeek-V4-Flash-0731-NVFP4` to maintain 0731 post-training weights while capitalizing on Blackwell FP4 memory savings.
-* Added `--attention-config '{"use_fp4_indexer_cache": true}'` to accelerate MLA indexing over the RoCE backplane.
+* **Bug:** Multi-node deployments crashed during worker initialization with `RuntimeError: ifa != nullptr. Unable to find address for: 192.168.99.`.
 
 
-* **August 11 Release Additions:** Integrated `nemotron-3.5-lightning`, `muse-glimmer-30b`, and `qwen-3.6-27b-nvfp4`.
-* **Llama 3.3 Decoding Throughput Fix:** Removed `--enforce-eager` to enable CUDA graph compilation, combined with `--enable-chunked-prefill` and `--kv-cache-dtype fp8` for ~2.5× throughput gains.
+* **Fix:** Replaced the IP-prefix value `192.168.99.` with the physical host network device `enp1s0f0np0` in `models.yaml`. Gloo uses Linux `getifaddrs()` interface matching and requires explicit interface names.
 
-### 4. `docker-compose.cluster.yml`
 
-* **Volume Decoupling:** Removed the hardcoded `/home/tetrel/.cache/...` volume mount string. Replaced it with `${CLUSTER_VOLUME_MOUNT}`, bringing it to parity with the standalone compose file and allowing dynamic injection from `models.yaml`.
+
+### 2. NCCL Socket Interface Alignment (`NCCL_SOCKET_IFNAME`)
+
+* **Bug:** Worker processes reported `NCCL WARN Bootstrap : no socket interface found` when initialized with IP subnet prefixes.
+
+
+* **Fix:** Aligned `NCCL_SOCKET_IFNAME=enp1s0f0np0` across all multi-node topology definitions in `models.yaml`.
+
+
+
+### 3. SSH Multiplexer Self-Healing & Socket Cleanup
+
+* **Bug:** Stale `/tmp/ssh-mux-*` socket files from interrupted SSH sessions caused subsequent `dgx-config` executions to hang indefinitely.
+
+
+* **Fix:** Updated both `dgx-config` and `dgx-orchestrator.py` to purge `/tmp/ssh-mux-*` socket files before initiating connection attempts.
+
+
+
+### 4. Non-Blocking Command Execution Timeouts
+
+* **Bug:** If a remote node experienced a Docker lock or GPU driver freeze during teardown or log inspection, the host CLI hung forever.
+
+
+* **Fix:** Wrapped remote SSH command calls in `timeout 10` guards to ensure hard exit codes and self-healing continuity in bash orchestrators.
+
+
+
+### 5. Early SSH Authentication Error Trapping
+
+* **Bug:** `ssh_mux_session` context manager suppressed SSH verification failures, allowing invalid authentication loops to proceed to file transfers.
+
+
+* **Fix:** Added explicit `if res.returncode != 0:` checking inside the multiplex setup to abort with clear diagnostics if SSH keys fail.
+
+
+
+### 6. Inter-VLAN Gateway Intrusion Prevention (IDS/IPS Errata)
+
+* **Bug:** Rapid automated SSH multiplexing across subnets triggered UniFi Gateway IPS threat rules, causing port 22 connections to silently drop for the management host.
+* **Fix:** Added documentation for UniFi Threat Management exception rules alongside `ProxyJump` tunneling to route SSH traffic over uninspected L2 local domains.
 
 ---
 
 # ⚠️ Upgrade Errata (Action Required)
 
-If you are upgrading an existing ingestion workstation or pipeline from v3.7 or earlier, please review the following breaking changes:
+If upgrading from v3.7 or earlier, review the following breaking operational changes:
 
-**1. SSH Authentication & Pipeline Breakage (Critical)**
-The `dgx-config` wrapper no longer brokers commands through the shared `tetrel` account via `sudo`.
+1. **Gloo/NCCL Configuration Update (Critical)**
+* Existing `models.yaml` files containing `GLOO_SOCKET_IFNAME=192.168.99.` or `192.168.99.0/24` **must** be updated to `GLOO_SOCKET_IFNAME=enp1s0f0np0`.
 
-* **Impact:** Any user, cron job, or automated ingestion script (e.g., `master_pipeline.py`) that attempts to run a `deploy`, `status`, or `teardown` command will fail with `Permission denied (publickey)` if they have not provisioned their own SSH keys.
-* **Remediation:** Before starting the ingestion pipeline, the executing user *must* run `dgx-config authorize-key` to push their public key to the Spark cluster.
 
-**2. CLI Output Parsing (Regex Breakage)**
-The standard output of `dgx-config status` has been enriched.
 
-* **Impact:** Legacy scripts utilizing rigid Regex anchored to the end of the line (e.g., `(Up \d+ hours)$`) to verify container health will fail.
-* **Remediation:** Update scraping logic to account for the new appended model string (e.g., `(Up 2 days) ➔ [llama-3.3-70b-instruct]`).
+
+2. **SSH Authentication & Pipeline Breakage**
+* The `dgx-config` wrapper no longer brokers commands through the shared `tetrel` account via `sudo`.
+
+
+* Executing users or cron agents *must* run `dgx-config authorize-key` to register their public SSH keys across all cluster nodes prior to starting pipelines.
