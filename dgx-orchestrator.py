@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# 🚀 DGX SPARK CLUSTER ORCHESTRATOR (V3.8 - PRODUCTION RELEASE)
+# 🚀 DGX SPARK CLUSTER ORCHESTRATOR (V3.9.2 - FAIL-FAST EDITION)
 # ==============================================================================
 import os
 import sys
@@ -309,6 +309,10 @@ def execute_deployment(model: str, target_nodes: int, is_batch: bool, head_ident
             
             if dry_run: continue
             
+            # V3.9.2: Standalone Proactive Cleanup
+            container_name = f"vllm-{role}" if target_nodes > 1 else "vllm-standalone"
+            run_ssh(ip, user, ["docker", "rm", "-f", container_name], capture=True, timeout=15)
+            
             temp_file = Path(__file__).resolve().parent / f".env.tmp.{host_name}"
             with open(temp_file, "w") as tf:
                 tf.write(env_data)
@@ -319,6 +323,13 @@ def execute_deployment(model: str, target_nodes: int, is_batch: bool, head_ident
                 
             compose_file = "docker-compose.cluster.yml" if target_nodes > 1 else "docker-compose.standalone.yml"
             run_ssh(ip, user, ["docker", "compose", "-f", f"{compute_dir}/{compose_file}", "up", "-d"], timeout=30)
+            
+            # V3.9.1: Verification Gate
+            time.sleep(2)
+            verify_res = run_ssh(ip, user, ["docker", "ps", "-a", "-q", "-f", f"name={container_name}"], capture=True, timeout=10)
+            if not verify_res.stdout.strip():
+                print(f"  ❌ FATAL: Container '{container_name}' failed to spawn on {host_name}. Check OOM or auth logs.")
+                sys.exit(1)
             
     print("\n[✓] Deployment sequence complete.")
 
