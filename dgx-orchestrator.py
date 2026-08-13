@@ -294,7 +294,7 @@ def execute_deployment(model: str, target_nodes: int, is_batch: bool, head_ident
         
     deploy_hosts = [head_name] + [n for n in active_hosts.keys() if n != head_name]
     deploy_hosts = deploy_hosts[:target_nodes]
-    head_backplane_ip = head_details['networks']['backplane']
+    head_backplane_ip, _ = resolve_management_ip(head_details)
 
     for rank, host_name in enumerate(deploy_hosts):
         role = "head" if rank == 0 else "worker"
