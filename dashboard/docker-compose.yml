@@ -1,0 +1,9 @@
+services:
+  dashboard-ui:
+    image: nginx:alpine
+    container_name: dgx-dashboard-ui
+    restart: unless-stopped
+    ports:
+      - "5000:80"
+    volumes:
+      - ./html:/usr/share/nginx/html:ro

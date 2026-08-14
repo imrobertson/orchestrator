@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Tetrel Security | DGX Spark Control Plane</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+        header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; padding-bottom: 15px; margin-bottom: 20px; }
+        h1 { margin: 0; font-size: 24px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+        .clock { font-family: monospace; background: #1e293b; padding: 6px 12px; border-radius: 6px; border: 1px solid #475569; }
+        .net-badge { font-size: 13px; padding: 6px 12px; border-radius: 6px; font-weight: bold; cursor: pointer; display: inline-block; transition: all 0.2s ease; border: 1px solid transparent; }
+        .net-badge:hover { filter: brightness(1.2); transform: translateY(-1px); }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+        .card h2 { margin-top: 0; font-size: 18px; border-bottom: 1px solid #334155; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+        .log-card { grid-column: 1 / -1; }
+        .badge { font-size: 12px; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+        .badge.online { background: #065f46; color: #34d399; }
+        .badge.offline { background: #7f1d1d; color: #f87171; }
+        .metric-row { display: flex; justify-content: space-between; margin: 8px 0; font-size: 14px; }
+        .metric-val { font-family: monospace; color: #38bdf8; }
+        pre { background: #0f172a; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: #cbd5e1; max-height: 400px; }
+        .btn { background: #0284c7; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background 0.2s; width: 100%; }
+        .btn:hover { background: #0369a1; }
+        .btn-danger { background: #dc2626; }
+        .btn-danger:hover { background: #b91c1c; }
+        select, input { background: #0f172a; color: white; border: 1px solid #475569; padding: 8px; border-radius: 6px; width: 100%; margin-bottom: 10px; box-sizing: border-box; }
+        label { font-size: 13px; color: #94a3b8; display: block; margin-bottom: 4px; }
+    </style>
+</head>
+<body>
+    <header>
+        <div>
+            <h1>
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+                Tetrel Security | DGX Spark Control Plane
+            </h1>
+            <div id="netBadge" class="net-badge" style="margin-top: 8px;" onclick="toggleNetworkMode()">Checking Network State...</div>
+        </div>
+        <div class="clock" id="serverClock">Connecting...</div>
+    </header>
+
+    <div class="grid" id="hostsGrid">
+        <!-- Dynamic Host Cards -->
+    </div>
+
+    <div class="grid">
+        <div class="card" style="grid-column: 1 / -1; max-width: 600px; margin: 0 auto; width: 100%;">
+            <h2>Model Deployer</h2>
+            <label>Select Model:</label>
+            <select id="modelSelect" onchange="updateTopologyOptions()"></select>
+            
+            <label>Topology:</label>
+            <select id="nodesSelect" onchange="updateHeadNodeVisibility()">
+                <!-- Populated Dynamically -->
+            </select>
+            
+            <div id="headSelectContainer">
+                <label>Target Head Node (for 1-Node):</label>
+                <select id="headSelect">
+                    <option value="spark-4">spark-4 (spark-9dbe)</option>
+                    <option value="spark-3">spark-3 (spark-6e63)</option>
+                </select>
+            </div>
+            
+            <label>User ID / Auditor:</label>
+            <input type="text" id="userIdInput" value="dashboard_user">
+            
+            <button class="btn" onclick="triggerDeploy()">Deploy Model</button>
+            <button class="btn btn-danger" onclick="triggerTeardown()" style="margin-top: 10px;">Teardown Active Runtimes</button>
+        </div>
+
+        <div class="card log-card">
+            <h2>Live Container Logs (<span id="logHostLabel">spark-4</span>)</h2>
+            <div style="max-width: 300px;">
+                <label>Select Target Node:</label>
+                <select id="logHostSelect" onchange="updateLogHost()">
+                    <option value="spark-4">spark-4</option>
+                    <option value="spark-3">spark-3</option>
+                </select>
+            </div>
+            <pre id="logBox">Loading logs...</pre>
+        </div>
+    </div>
+
+<script>
+    const API_PORT = 5001;
+    const API_BASE = `http://${window.location.hostname}:${API_PORT}/api`;
+    let currentLogHost = 'spark-4';
+    let currentOfflineState = false;
+    let globalCatalog = {};
+
+    async function fetchStatus() {
+        try {
+            const res = await fetch(`${API_BASE}/status`);
+            const data = await res.json();
+            document.getElementById('serverClock').innerText = `Server Time: ${data.server_time}`;
+            
+            const netBadge = document.getElementById('netBadge');
+            if (data.network_mode === "Working in OFFLINE mode") {
+                currentOfflineState = true;
+                netBadge.innerHTML = '🔒 Working in OFFLINE mode <span style="font-size:11px; color:#cbd5e1; font-weight:normal;">(Click to Toggle)</span>';
+                netBadge.style.color = '#f87171';
+                netBadge.style.borderColor = '#991b1b';
+                netBadge.style.background = '#450a0a';
+            } else {
+                currentOfflineState = false;
+                netBadge.innerHTML = '🌐 Working in ONLINE mode <span style="font-size:11px; color:#cbd5e1; font-weight:normal;">(Click to Toggle)</span>';
+                netBadge.style.color = '#34d399';
+                netBadge.style.borderColor = '#065f46';
+                netBadge.style.background = '#022c22';
+            }
+
+            const grid = document.getElementById('hostsGrid');
+            grid.innerHTML = '';
+            
+            for (const [host, info] of Object.entries(data.hosts)) {
+                const statusBadge = info.status === 'ONLINE' ? '<span class="badge online">ONLINE</span>' : '<span class="badge offline">OFFLINE</span>';
+                let telemetryHtml = '';
+                if (info.telemetry && info.telemetry.gpu_temp_c !== undefined) {
+                    telemetryHtml = `
+                        <div class="metric-row"><span>GPU Temp:</span><span class="metric-val">${info.telemetry.gpu_temp_c} °C</span></div>
+                        <div class="metric-row"><span>GPU Util:</span><span class="metric-val">${info.telemetry.gpu_util_pct} %</span></div>
+                        <div class="metric-row"><span>VRAM Used:</span><span class="metric-val">${info.telemetry.mem_used_mb} / ${info.telemetry.mem_total_mb} MB</span></div>
+                    `;
+                } else {
+                    telemetryHtml = `<div class="metric-row"><span>Telemetry:</span><span class="metric-val">Unavailable</span></div>`;
+                }
+
+                grid.innerHTML += `
+                    <div class="card">
+                        <h2>${host} ${statusBadge}</h2>
+                        <div class="metric-row"><span>IP Address:</span><span class="metric-val">${info.ip || 'N/A'}</span></div>
+                        <div class="metric-row"><span>Docker Status:</span><span class="metric-val">${info.docker}</span></div>
+                        <div class="metric-row"><span>Active Runtime:</span><span class="metric-val">${info.container || 'None'}</span></div>
+                        <div class="metric-row"><span>Loaded Model:</span><span class="metric-val">${info.active_model || 'None'}</span></div>
+                        <hr style="border-color: #334155; margin: 12px 0;">
+                        ${telemetryHtml}
+                    </div>
+                `;
+            }
+        } catch (e) {
+            document.getElementById('serverClock').innerText = 'API Connection Lost';
+            const netBadge = document.getElementById('netBadge');
+            netBadge.innerText = '⚠️ API Disconnected';
+            netBadge.style.color = '#fbbf24';
+            netBadge.style.background = '#451a03';
+            netBadge.style.borderColor = '#78350f';
+        }
+    }
+
+    async function toggleNetworkMode() {
+        const nextState = !currentOfflineState;
+        const targetModeStr = nextState ? "Working in OFFLINE mode" : "Working in ONLINE mode";
+        if(!confirm(`Switch cluster network state to: "${targetModeStr}"?`)) return;
+
+        try {
+            await fetch(`${API_BASE}/toggle-network`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ offline: nextState })
+            });
+            fetchStatus();
+        } catch(e) {
+            alert('Failed to toggle network mode.');
+        }
+    }
+
+    async function fetchCatalog() {
+        try {
+            const res = await fetch(`${API_BASE}/catalog`);
+            const data = await res.json();
+            globalCatalog = data.catalog.models || {};
+            
+            const select = document.getElementById('modelSelect');
+            select.innerHTML = '';
+            for (const modelKey of Object.keys(globalCatalog)) {
+                select.innerHTML += `<option value="${modelKey}">${modelKey}</option>`;
+            }
+            updateTopologyOptions();
+        } catch (e) {
+            console.error('Failed to load catalog');
+        }
+    }
+
+    function updateTopologyOptions() {
+        const model = document.getElementById('modelSelect').value;
+        const nodesSelect = document.getElementById('nodesSelect');
+        const topologies = globalCatalog[model]?.topologies || {};
+        
+        nodesSelect.innerHTML = '';
+        if (topologies['1_node']) {
+            nodesSelect.innerHTML += `<option value="1">Single Node (1x Spark)</option>`;
+        }
+        if (topologies['2_node']) {
+            nodesSelect.innerHTML += `<option value="2">Clustered (2x Sparks via RoCEv2)</option>`;
+        }
+        updateHeadNodeVisibility();
+    }
+
+    function updateHeadNodeVisibility() {
+        const nodes = document.getElementById('nodesSelect').value;
+        const headContainer = document.getElementById('headSelectContainer');
+        if (nodes === "2") {
+            headContainer.style.display = 'none';
+        } else {
+            headContainer.style.display = 'block';
+        }
+    }
+
+    async function fetchLogs() {
+        try {
+            const res = await fetch(`${API_BASE}/logs/${currentLogHost}?tail=40`);
+            const data = await res.json();
+            document.getElementById('logBox').innerText = data.logs.join('\n');
+        } catch (e) {
+            document.getElementById('logBox').innerText = 'Failed to fetch logs.';
+        }
+    }
+
+    function updateLogHost() {
+        currentLogHost = document.getElementById('logHostSelect').value;
+        document.getElementById('logHostLabel').innerText = currentLogHost;
+        fetchLogs();
+    }
+
+    async function triggerDeploy() {
+        const model = document.getElementById('modelSelect').value;
+        const nodes = parseInt(document.getElementById('nodesSelect').value);
+        const head = document.getElementById('headSelect').value;
+        const user_id = document.getElementById('userIdInput').value;
+
+        if(!confirm(`Deploy ${model} on ${nodes} node(s)?`)) return;
+
+        try {
+            const response = await fetch(`${API_BASE}/deploy`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({model, nodes, head, user_id})
+            });
+            
+            if (!response.ok) {
+                const errData = await response.json();
+                alert(`Deployment Error: ${errData.detail || response.statusText}`);
+                return;
+            }
+            
+            alert('Deployment sequence initiated successfully!');
+        } catch(e) {
+            alert('Deployment request failed.');
+        }
+    }
+
+    async function triggerTeardown() {
+        if(!confirm('Are you sure you want to teardown all active runtimes across the cluster?')) return;
+        try {
+            await fetch(`${API_BASE}/teardown`, {method: 'POST'});
+            alert('Teardown sequence initiated.');
+        } catch(e) {
+            alert('Teardown request failed.');
+        }
+    }
+
+    fetchCatalog();
+    fetchStatus();
+    fetchLogs();
+    setInterval(fetchStatus, 4000);
+    setInterval(fetchLogs, 5000);
+</script>
+</body>
+</html>
