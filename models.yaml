@@ -1,9 +1,42 @@
+# ==============================================================================
+# TETREL SECURITY - DGX CLUSTER MODEL INVENTORY
+# ==============================================================================
+# RUNTIME ASSUMPTIONS:
+# - Hardware: Dual DGX Spark (Grace Blackwell GB10, LPDDR5x Unified Memory).
+# - Software: vLLM 0.21.0+ (NVIDIA NGC Container 26.05.post1+).
+# - Interconnect: 100GbE Backplane (enp1s0f0np0) via NCCL.
+# ------------------------------------------------------------------------------
+# DOCUMENTED ERRATA & TUNABLES (vLLM 0.21.0 / GB10):
+# 1. UNIFIED MEMORY OOM: GB10 uses unified OS/GPU memory. `gpu_util` MUST NOT
+#    exceed 0.70-0.75, or the Grace OS will be starved, causing container panics.
+# 2. ASYNC SCHEDULING: vLLM 0.21.0+ requires asynchronous background scheduling
+#    for performance. `--no-async-scheduling` must NEVER be used on this version.
+# 3. GRACE CPU THREADING: Grace CPUs (72+ cores) suffer extreme context-switching
+#    overhead in PyTorch if unbound. `OMP_NUM_THREADS=16` is strictly required
+#    on ALL topologies (1-node and 2-node).
+# 4. NEMOTRON NVFP4 BATCHING: Nemotron V3 NVFP4 variants on GB10 crash during
+#    ingestion if sequences exceed 4. `--max-num-seqs 4` is strictly enforced.
+# 5. MULTI-NUMA ALL-REDUCE: Custom all-reduce kernels hang on GB10 PCIe multi-node.
+#    `--disable-custom-all-reduce` forces a stable NCCL fallback on 2-node setups.
+# 6. CHUNKED PREFILL + SPECULATIVE: `--enable-chunked-prefill` is fatal when
+#    combined with speculative decoding/MTP. Never mix these two flags.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# GLOBAL BEHAVIOR FLAGS
+# Set to 1 to force offline mode across all models. Set to 0 to parse per-stanza.
+# ------------------------------------------------------------------------------
+GLOBAL_HF_HUB_OFFLINE: 1
+GLOBAL_TRANSFORMERS_OFFLINE: 1
+
 # ------------------------------------------------------------------------------
 # 1. HOST INVENTORY & MULTI-INTERFACE NETWORK MATRIX
 # ------------------------------------------------------------------------------
 hosts:
   spark-9dbe:
-    aliases: ["spark-4", "4"]
+    aliases:
+      - "spark-4"
+      - "4"
     ssh_user: "tetrel"
     compute_dir: "/opt/dgx-cluster-control"
     volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
@@ -14,7 +47,9 @@ hosts:
       backplane: "192.168.99.2"
 
   spark-6e63:
-    aliases: ["spark-3", "3"]
+    aliases:
+      - "spark-3"
+      - "3"
     ssh_user: "tetrel"
     compute_dir: "/opt/dgx-cluster-control"
     volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
@@ -23,315 +58,399 @@ hosts:
         wired: "10.0.14.41"
         wireless: "10.0.14.42"
       backplane: "192.168.99.1"
-      
+
 # ------------------------------------------------------------------------------
 # 2. MODEL METADATA & TOPOLOGY TUNABLES
 # ------------------------------------------------------------------------------
 models:
+
+  # ============================================================================
+  # DEEPSEEK FAMILY
+  # ============================================================================
   deepseek-v4-flash-nvfp4:
-    hf_path: "Rarri/DeepSeek-V4-Flash-0731-NVFP4"
-    gpu_util: 0.90
+    hf_path: Rarri/DeepSeek-V4-Flash-0731-NVFP4
+    gpu_util: 0.70
     topologies:
       2_node:
         max_model_len: 65536
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "OMP_NUM_THREADS=16"
-          - "VLLM_CPU_OMP_THREADS=16"
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-          - "DG_JIT_USE_NVRTC=0"
-          - "NCCL_CUMEM_ENABLE=0"
-          - "NCCL_IB_GID_INDEX=3"
-          - "NCCL_SOCKET_IFNAME=enp1s0f0np0"
-          - "GLOO_SOCKET_IFNAME=enp1s0f0np0"
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - DG_JIT_USE_NVRTC=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
-          --disable-custom-all-reduce
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --distributed-executor-backend mp
-          --enable-ep-weight-filter
+          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
+          --distributed-executor-backend mp --enable-ep-weight-filter
           --attention-config '{"use_fp4_indexer_cache": true}'
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
-          --moe-backend flashinfer_trtllm
+          --moe-backend flashinfer_cutlass --compilation-config '{"mode": 0}'
 
-  # ----------------------------------------------------------------------------
-  # NEMOTRON ARCHITECTURES (AGENTIC AUTOMATION CORE)
-  # ----------------------------------------------------------------------------
-  nemotron-3.5-lightning:
-    hf_path: "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
-    gpu_util: 0.85
+  deepseek-r1-nvfp4:
+    hf_path: unsloth/DeepSeek-R1-NVFP4
+    gpu_util: 0.70
+    topologies:
+      2_node:
+        max_model_len: 65536
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - DG_JIT_USE_NVRTC=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
+        vllm_args: >-
+          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
+          --distributed-executor-backend mp --reasoning-parser deepseek_r1
+          --enable-chunked-prefill --enforce-eager
+          --moe-backend flashinfer_cutlass --compilation-config '{"mode": 0}'
+
+  deepseek-r1-distill-qwen-32b:
+    hf_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+    gpu_util: 0.70
+    topologies:
+      1_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+        vllm_args: >-
+          --trust-remote-code --kv-cache-dtype fp8 --reasoning-parser deepseek_r1
+      2_node:
+        max_model_len: 131072
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
+        vllm_args: >-
+          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
+          --reasoning-parser deepseek_r1 --enable-chunked-prefill
+
+  # ============================================================================
+  # NVIDIA NEMOTRON FAMILY
+  # ============================================================================
+  nemotron-3.5-lightning-nvfp4:
+    hf_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+    gpu_util: 0.70
     topologies:
       1_node:
         max_model_len: 131072
         tp_size: 1
         pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
         vllm_args: >-
-          --trust-remote-code
-          --kv-cache-dtype fp8
+          --trust-remote-code --kv-cache-dtype fp8 --max-num-seqs 4
           --speculative-model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
           --speculative-config '{"method":"dspark"}'
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
 
-  # ----------------------------------------------------------------------------
-  # META MUSE ARCHITECTURES (MULTIMODAL AGENTIC CORE)
-  # ----------------------------------------------------------------------------
-  muse-glimmer-30b:
-    hf_path: "meta-models/Muse-Glimmer-30B"
-    gpu_util: 0.85
+  nemotron-3.5-lightning-bf16:
+    hf_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+    gpu_util: 0.70
     topologies:
       1_node:
         max_model_len: 131072
         tp_size: 1
         pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+        vllm_args: "--trust-remote-code --enable-chunked-prefill"
+
+  # ============================================================================
+  # MUSE GLIMMER FAMILY
+  # ============================================================================
+  muse-glimmer-30b:
+    hf_path: meta-models/Muse-Glimmer-30B
+    gpu_util: 0.70
+    topologies:
+      1_node:
+        max_model_len: 131072
+        tp_size: 1
+        pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
         vllm_args: >-
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --speculative-model meta-models/Muse-Glimmer-30B-DFlash
-          --speculative-config '{"method":"dflash"}'
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
+          --trust-remote-code --enable-chunked-prefill --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer
 
   muse-glimmer-30b-nvfp4:
-    hf_path: "Inferact/Muse-Glimmer-30B-NVFP4-W4A4"
-    gpu_util: 0.85
+    hf_path: Inferact/Muse-Glimmer-30B-NVFP4-W4A4
+    gpu_util: 0.70
     topologies:
       1_node:
         max_model_len: 131072
         tp_size: 1
         pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
         vllm_args: >-
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --speculative-model meta-models/Muse-Glimmer-30B-DFlash
-          --speculative-config '{"method":"dflash"}'
-          --tool-call-parser muse_glimmer
-          --reasoning-parser muse_glimmer
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
+          --trust-remote-code --enable-chunked-prefill --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer
+          --compilation-config '{"mode": 0}'
 
-  # ----------------------------------------------------------------------------
-  # QWEN ARCHITECTURES (27B Native, 27B NVFP4, 122B MoE)
-  # ----------------------------------------------------------------------------
+  # ============================================================================
+  # QWEN FAMILY
+  # ============================================================================
   qwen-3.8-27b:
-    hf_path: "Qwen/Qwen3.8-27B"
-    gpu_util: 0.85
+    hf_path: Qwen/Qwen3.8-27B
+    gpu_util: 0.70
     topologies:
       1_node:
         max_model_len: 262144
         tp_size: 1
         pp_size: 1
-        vllm_args: >-
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --language-model-only
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+        vllm_args: "--trust-remote-code --kv-cache-dtype fp8 --language-model-only --enable-chunked-prefill"
       2_node:
         max_model_len: 262144
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "OMP_NUM_THREADS=16"
-          - "VLLM_CPU_OMP_THREADS=16"
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-          - "NCCL_CUMEM_ENABLE=0"
-          - "NCCL_IB_GID_INDEX=3"
-          - "NCCL_SOCKET_IFNAME=enp1s0f0np0"
-          - "GLOO_SOCKET_IFNAME=enp1s0f0np0"
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
-          --disable-custom-all-reduce
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --language-model-only
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
+          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
+          --language-model-only --enable-chunked-prefill
 
   qwen-3.8-27b-nvfp4:
-    hf_path: "unsloth/Qwen3.8-27B-NVFP4"
-    gpu_util: 0.85
+    hf_path: unsloth/Qwen3.8-27B-NVFP4
+    gpu_util: 0.70
     topologies:
       1_node:
         max_model_len: 262144
         tp_size: 1
         pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
         vllm_args: >-
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --language-model-only
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
+          --trust-remote-code --kv-cache-dtype fp8 --language-model-only
+          --enable-chunked-prefill --compilation-config '{"mode": 0}'
       2_node:
         max_model_len: 262144
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "OMP_NUM_THREADS=16"
-          - "VLLM_CPU_OMP_THREADS=16"
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-          - "NCCL_CUMEM_ENABLE=0"
-          - "NCCL_IB_GID_INDEX=3"
-          - "NCCL_SOCKET_IFNAME=enp1s0f0np0"
-          - "GLOO_SOCKET_IFNAME=enp1s0f0np0"
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
-          --disable-custom-all-reduce
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --language-model-only
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
+          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
+          --language-model-only --enable-chunked-prefill --compilation-config '{"mode": 0}'
 
   qwen-3.6-27b-nvfp4:
-    hf_path: "nvidia/Qwen3.6-27B-NVFP4"
-    gpu_util: 0.85
+    hf_path: nvidia/Qwen3.6-27B-NVFP4
+    gpu_util: 0.70
     topologies:
       1_node:
         max_model_len: 262144
         tp_size: 1
         pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
         vllm_args: >-
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --language-model-only
+          --trust-remote-code --kv-cache-dtype fp8 --language-model-only
           --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
+          --compilation-config '{"mode": 0}'
       2_node:
         max_model_len: 262144
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "OMP_NUM_THREADS=16"
-          - "VLLM_CPU_OMP_THREADS=16"
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-          - "NCCL_CUMEM_ENABLE=0"
-          - "NCCL_IB_GID_INDEX=3"
-          - "NCCL_SOCKET_IFNAME=enp1s0f0np0"
-          - "GLOO_SOCKET_IFNAME=enp1s0f0np0"
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
-          --disable-custom-all-reduce
-          --trust-remote-code
-          --kv-cache-dtype fp8
-          --language-model-only
-          --no-async-scheduling
-          --num-gpu-blocks-override 8192
+          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
+          --language-model-only --compilation-config '{"mode": 0}'
 
   qwen-3.5-122b:
-    hf_path: "Qwen/Qwen3.5-122B-A10B-FP8"
-    dtype: "fp8"
-    gpu_util: 0.85
+    hf_path: Qwen/Qwen3.5-122B-A10B-FP8
+    gpu_util: 0.70
     topologies:
       2_node:
         max_model_len: 32768
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "OMP_NUM_THREADS=16"
-          - "VLLM_CPU_OMP_THREADS=16"
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-          - "NCCL_CUMEM_ENABLE=0"
-          - "NCCL_IB_GID_INDEX=3"
-          - "NCCL_SOCKET_IFNAME=enp1s0f0np0"
-          - "GLOO_SOCKET_IFNAME=enp1s0f0np0"
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
-          --disable-custom-all-reduce
-          --trust-remote-code
-          --max-num-seqs 16
+          --disable-custom-all-reduce --trust-remote-code --max-num-seqs 16
           --enforce-eager
-          --no-async-scheduling
 
-  # ----------------------------------------------------------------------------
-  # GEMMA ARCHITECTURES
-  # ----------------------------------------------------------------------------
-  gemma-4-31b:
-    hf_path: "google/gemma-4-31B-it"
-    gpu_util: 0.85
+  qwen-2.5-coder-32b:
+    hf_path: Qwen/Qwen2.5-Coder-32B-Instruct
+    gpu_util: 0.70
     topologies:
       1_node:
         max_model_len: 32768
         tp_size: 1
         pp_size: 1
-        vllm_args: "--max-num-batched-tokens 4096 --no-async-scheduling --num-gpu-blocks-override 8192"
-
-  # ----------------------------------------------------------------------------
-  # LLAMA-4 SCOUT ARCHITECTURES
-  # ----------------------------------------------------------------------------
-  llama-4-fp4:
-    hf_path: "nvidia/Llama-4-Scout-17B-16E-Instruct-FP4"
-    topologies:
-      1_node:
-        max_model_len: 32768
-        gpu_util: 0.75
-        tp_size: 1
-        pp_size: 1
-        vllm_args: "--no-async-scheduling --num-gpu-blocks-override 8192"
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+        vllm_args: >-
+          --trust-remote-code --kv-cache-dtype fp8 --enable-chunked-prefill
       2_node:
-        max_model_len: 32768
-        gpu_util: 0.70
+        max_model_len: 131072
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "OMP_NUM_THREADS=16"
-          - "VLLM_CPU_OMP_THREADS=16"
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-          - "NCCL_CUMEM_ENABLE=0"
-          - "NCCL_IB_GID_INDEX=3"
-          - "NCCL_SOCKET_IFNAME=enp1s0f0np0"
-          - "GLOO_SOCKET_IFNAME=enp1s0f0np0"
-        vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 1 --no-async-scheduling --num-gpu-blocks-override 8192"
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
+        vllm_args: >-
+          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
+          --enable-chunked-prefill
+
+  # ============================================================================
+  # GOOGLE GEMMA FAMILY
+  # ============================================================================
+  gemma-4-31b:
+    hf_path: google/gemma-4-31B-it
+    gpu_util: 0.70
+    topologies:
+      1_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+        vllm_args: "--max-num-batched-tokens 4096"
+
+  # ============================================================================
+  # META LLAMA FAMILY
+  # ============================================================================
+  llama-4-fp4:
+    hf_path: nvidia/Llama-4-Scout-17B-16E-Instruct-FP4
+    gpu_util: 0.70
+    topologies:
+      1_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+        vllm_args: >-
+          --compilation-config '{"mode": 0}'
+      2_node:
+        max_model_len: 32768
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
+        vllm_args: >-
+          --disable-custom-all-reduce --trust-remote-code --max-num-seqs 1
+          --compilation-config '{"mode": 0}'
 
   llama-4-fp8:
-    hf_path: "nvidia/Llama-4-Scout-17B-16E-Instruct-FP8"
-    dtype: "fp8"
+    hf_path: nvidia/Llama-4-Scout-17B-16E-Instruct-FP8
+    gpu_util: 0.70
     topologies:
       1_node:
         max_model_len: 16384
-        gpu_util: 0.95
         tp_size: 1
         pp_size: 1
-        vllm_args: "--max-num-seqs 1 --enforce-eager --no-async-scheduling --num-gpu-blocks-override 8192"
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+        vllm_args: "--max-num-seqs 1 --enforce-eager"
       2_node:
         max_model_len: 65536
-        gpu_util: 0.70
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "OMP_NUM_THREADS=16"
-          - "VLLM_CPU_OMP_THREADS=16"
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-          - "NCCL_CUMEM_ENABLE=0"
-          - "NCCL_IB_GID_INDEX=3"
-          - "NCCL_SOCKET_IFNAME=enp1s0f0np0"
-          - "GLOO_SOCKET_IFNAME=enp1s0f0np0"
-        vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 16 --no-async-scheduling --num-gpu-blocks-override 8192"
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
+        vllm_args: >-
+          --disable-custom-all-reduce --trust-remote-code --max-num-seqs 16
+          --enable-chunked-prefill
 
-  # ----------------------------------------------------------------------------
-  # LLAMA-3.3 ARCHITECTURES
-  # ----------------------------------------------------------------------------
   llama-3.3-70b:
-    hf_path: "meta-llama/Llama-3.3-70B-Instruct"
-    gpu_util: 0.85
+    hf_path: meta-llama/Llama-3.3-70B-Instruct
+    gpu_util: 0.70
     topologies:
       2_node:
         max_model_len: 56000
         tp_size: 1
         pp_size: 2
         env_vars:
-          - "OMP_NUM_THREADS=16"
-          - "VLLM_CPU_OMP_THREADS=16"
-          - "TORCHINDUCTOR_AUTOGRAD_CACHE=0"
-          - "TORCHINDUCTOR_FX_GRAPH_CACHE=0"
-          - "NCCL_CUMEM_ENABLE=0"
-          - "NCCL_IB_GID_INDEX=3"
-          - "NCCL_SOCKET_IFNAME=enp1s0f0np0"
-          - "GLOO_SOCKET_IFNAME=enp1s0f0np0"
-        vllm_args: "--disable-custom-all-reduce --trust-remote-code --max-num-seqs 16 --max-num-batched-tokens 8192 --kv-cache-dtype fp8 --enable-chunked-prefill --enforce-eager --no-async-scheduling --num-gpu-blocks-override 8192"
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
+        vllm_args: >-
+          --disable-custom-all-reduce --trust-remote-code --max-num-seqs 16
+          --max-num-batched-tokens 8192 --kv-cache-dtype fp8 --enable-chunked-prefill
+          --enforce-eager
