@@ -1,0 +1,25 @@
+services:
+  orchestrator-api:
+    build: .
+    container_name: dgx-orchestrator-api
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      - BASE_DIR=/app
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - .:/app
+      - ~/.ssh:/root/.ssh
+      - ~/.cache/huggingface:/root/.cache/huggingface:ro
+
+  dashboard-ui:
+    image: nginx:alpine
+    container_name: dgx-dashboard-ui
+    restart: unless-stopped
+    ports:
+      - "5000:80"
+    volumes:
+      - ./html:/usr/share/nginx/html:ro
+    depends_on:
+      - orchestrator-api

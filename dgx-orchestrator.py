@@ -33,7 +33,7 @@ except ImportError:
     HAS_FASTAPI = False
 
 # --- Core Configurations ---
-BASE_DIR = Path("/opt/dgx-cluster-control")
+BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
 SHARED_KEY_PATH = BASE_DIR / "id_dgx_orchestrator"
 MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 LOAD_TIMES_PATH = BASE_DIR / "load_times.json"
@@ -212,7 +212,7 @@ def load_model_catalog() -> dict:
         return {"catalog": {"models": {}}}
     try:
         with open(MODELS_YAML_PATH, "r") as f:
-            config = yaml.safe_load(f)
+            config = yaml.safe_load(f) or {}
             
         # 1. Parse the global config headers
         global_hf = config.get('GLOBAL_HF_HUB_OFFLINE', 0)
@@ -220,20 +220,26 @@ def load_model_catalog() -> dict:
 
         # 2. Iterate through all models and enforce global overrides on env_vars
         models = config.get('models', {})
-        for model_name, model_data in models.items():
-            topologies = model_data.get('topologies', {})
-            for topo_name, topo_data in topologies.items():
-                if 'env_vars' not in topo_data:
-                    topo_data['env_vars'] = []
-                
-                # Strip out existing declarations to avoid duplicated vars, then append force-state
-                if global_hf == 1:
-                    topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('HF_HUB_OFFLINE=')]
-                    topo_data['env_vars'].append('HF_HUB_OFFLINE=1')
+        if isinstance(models, dict):
+            for model_name, model_data in models.items():
+                if not isinstance(model_data, dict):
+                    continue
+                topologies = model_data.get('topologies', {})
+                if isinstance(topologies, dict):
+                    for topo_name, topo_data in topologies.items():
+                        if not isinstance(topo_data, dict):
+                            continue
+                        if 'env_vars' not in topo_data:
+                            topo_data['env_vars'] = []
+                        
+                        # Strip out existing declarations to avoid duplicated vars, then append force-state
+                        if global_hf == 1:
+                            topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('HF_HUB_OFFLINE=')]
+                            topo_data['env_vars'].append('HF_HUB_OFFLINE=1')
 
-                if global_tf == 1:
-                    topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('TRANSFORMERS_OFFLINE=')]
-                    topo_data['env_vars'].append('TRANSFORMERS_OFFLINE=1')
+                        if global_tf == 1:
+                            topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('TRANSFORMERS_OFFLINE=')]
+                            topo_data['env_vars'].append('TRANSFORMERS_OFFLINE=1')
                     
         return {"catalog": config}
     except Exception as e:
@@ -381,8 +387,10 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
         ip = HOSTS[h]["ip"]
         run_ssh(ip, "tetrel", ["sudo", "nvidia-smi", "-lgc", "300,1800"], timeout=10)
 
-    # Using the July 2026 NVIDIA NGC Release tracking vLLM 0.27.x optimizations
-    image_tag = "nvcr.io/nvidia/vllm:26.07-py3"
+    # Dynamic container image resolution from models.yaml catalog with fallback
+    default_img = catalog_resp.get("catalog", {}).get("default_image", "nvcr.io/nvidia/vllm:26.07-py3")
+    image_tag = model_config.get("image", default_img)
+
     vol_mount = "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
     patch_mount = "/opt/dgx-cluster-control/vllm_gb10_patch.py:/usr/local/lib/python3.12/dist-packages/sitecustomize.py"
     

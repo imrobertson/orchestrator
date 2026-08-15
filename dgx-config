@@ -1,52 +1,51 @@
 #!/bin/bash
 # ==============================================================================
-# 🚀 DGX ORCHESTRATOR WRAPPER (V3.8 - PRODUCTION RELEASE)
-# ==============================================================================
-# Automatically binds to the local virtual environment to bypass PEP 668 constraints.
-# Includes a self-healing transport layer for stale SSH multiplexing sockets and
-# ensures safe path resolution for relative catalog files (models.yaml).
+# 🚀 DGX ORCHESTRATOR WRAPPER (CONTAINER DELEGATE V2)
 # ==============================================================================
 
-# 1. Dynamically resolve the absolute path of this script (safely handles symlinks)
-REAL_SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
-SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT")" &> /dev/null && pwd)"
+CONTAINER_NAME="dgx-orchestrator-api"
 
-# 2. Define the absolute paths for the Python binary and the orchestrator payload
-VENV_PYTHON="$SCRIPT_DIR/dgx-env/bin/python"
-ORCHESTRATOR_SCRIPT="$SCRIPT_DIR/dgx-orchestrator.py"
-
-# 3. Environment Safety Check
-if [ ! -f "$VENV_PYTHON" ]; then
-    echo "❌ ERROR: Virtual environment Python binary not found!"
-    echo "   Expected location: $VENV_PYTHON"
-    echo "   [Fix]: Please build the environment by running:"
-    echo "          cd $SCRIPT_DIR"
-    echo "          python3 -m venv dgx-env"
-    echo "          dgx-env/bin/pip install -r requirements.txt"
+# 1. Container Readiness Guard
+if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    echo "❌ ERROR: Container '${CONTAINER_NAME}' is not running!"
+    echo "   [Fix]: Start stack: cd ~/docker/orchestrator && docker compose up -d"
     exit 1
 fi
 
-# 4. Self-Healing Transport Layer
-# Quietly clear any stale multiplexed sockets for the 10.0.14.x DGX management subnet
-# before launching the orchestrator to prevent 'Connection timed out' deadlocks.
-rm -f ~/.ssh/cm-*10.0.14.* ~/.ssh/master-*10.0.14.* 2>/dev/null
+# 2. Flush Stale SSH Multiplex Sockets inside Container
+docker exec "$CONTAINER_NAME" rm -f /root/.ssh/cm-* /tmp/cm-* 2>/dev/null
 
-# 5. Context Switch
-# Change into the script directory to guarantee relative file lookups
-# (e.g., .secrets, models.yaml) resolve securely.
-cd "$SCRIPT_DIR" || {
-    echo "❌ ERROR: Failed to change directory to $SCRIPT_DIR"
-    exit 1
-}
+# 3. Dynamic TTY Allocation
+DOCKER_TTY="-i"
+if [ -t 0 ]; then
+    DOCKER_TTY="-it"
+fi
 
-# ==============================================================================
-# 6. EXECUTION MODE SELECTION
-# ==============================================================================
-# Option A: Shared Service Account Mode
-# Requires matching sudoers configuration (e.g., %wheel ALL=(tetrel) NOPASSWD: /path).
-# exec sudo -u tetrel "$VENV_PYTHON" "$ORCHESTRATOR_SCRIPT" cli "$@"
+# 4. Smart Path Staging for --key Flags
+PROCESSED_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --key)
+            KEY_PATH="$2"
+            if [ -f "$KEY_PATH" ]; then
+                mkdir -p ~/.ssh
+                cp "$KEY_PATH" ~/.ssh/.staged_auth_key.pub
+                chmod 600 ~/.ssh/.staged_auth_key.pub
+                PROCESSED_ARGS+=("--key" "/root/.ssh/.staged_auth_key.pub")
+                shift 2
+            else
+                PROCESSED_ARGS+=("$1")
+                shift
+            fi
+            ;;
+        *)
+            PROCESSED_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
 
-# Option B: Per-User Key Mode (Default)
-# Executes using the caller's native user account and personal SSH keys.
-# Requires users to run 'dgx-config authorize-key' first.
-exec "$VENV_PYTHON" "$ORCHESTRATOR_SCRIPT" cli "$@"
+# 5. Execute with Host User Context
+exec docker exec $DOCKER_TTY \
+    -e USER="${USER:-ian}" \
+    "$CONTAINER_NAME" python3 dgx-orchestrator.py cli "${PROCESSED_ARGS[@]}"

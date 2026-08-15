@@ -28,6 +28,8 @@
 # ------------------------------------------------------------------------------
 GLOBAL_HF_HUB_OFFLINE: 1
 GLOBAL_TRANSFORMERS_OFFLINE: 1
+default_image: "nvcr.io/nvidia/vllm:26.07-py3"
+
 
 # ------------------------------------------------------------------------------
 # 1. HOST INVENTORY & MULTI-INTERFACE NETWORK MATRIX
