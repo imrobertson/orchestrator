@@ -186,18 +186,20 @@ def parse_iso_time(ts_str: str) -> float:
         return time.time()
 
 def detect_model_stage(ip: str, user: str, c_name: str) -> str:
-    """Inspects recent log output to determine the active initialization phase."""
-    res = run_ssh(ip, user, ["docker", "logs", "--tail", "25", c_name], timeout=5)
-    logs = res.stdout + res.stderr
-    
-    if any(k in logs for k in ["TileLang", "DeepGEMM", "kernel", "compiling", "JIT"]):
-        return "NOT READY - COMPILING KERNELS"
-    elif any(k in logs for k in ["Loading weights", "safetensors", "shard", "Downloading", "Loading model"]):
-        return "NOT READY - LOADING SHARDS"
-    elif any(k in logs for k in ["Warming up", "KV cache", "graph", "mHC warmup", "profiling"]):
-        return "NOT READY - WARMUP"
-    else:
-        return "NOT READY - INITIALIZING"
+    """Inspects recent log output from bottom to top to accurately report the current active phase."""
+    res = run_ssh(ip, user, ["docker", "logs", "--tail", "30", c_name], timeout=5)
+    lines = [l.strip() for l in (res.stdout + res.stderr).splitlines() if l.strip()]
+
+    # Scan backwards (newest log line first) so the active phase takes priority
+    for line in reversed(lines):
+        if any(k in line for k in ["Loading weights", "safetensors", "shard", "Loading model"]):
+            return "NOT READY - LOADING SHARDS"
+        if any(k in line for k in ["Warming up", "KV cache", "graph", "mHC warmup", "profiling"]):
+            return "NOT READY - WARMUP"
+        if any(k in line for k in ["TileLang", "DeepGEMM", "kernel", "compiling", "JIT"]):
+            return "NOT READY - COMPILING KERNELS"
+
+    return "NOT READY - INITIALIZING"
 
 def get_cluster_status() -> dict:
     """

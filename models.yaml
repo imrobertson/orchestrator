@@ -96,8 +96,7 @@ models:
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
           --distributed-executor-backend mp --enable-ep-weight-filter
           --attention-config '{"use_fp4_indexer_cache": true}'
-          --compilation-config '{"mode": 0}'
-
+          --compilation-config '{"mode": 0}' --enforce-eager
 
   deepseek-r1-distill-qwen-32b:
     hf_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
