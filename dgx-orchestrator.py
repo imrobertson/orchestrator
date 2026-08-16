@@ -3,7 +3,7 @@
 TETREL SECURITY - DGX CLUSTER ORCHESTRATOR
 --------------------------------------------------------------------------------
 Architecture Target: Dual DGX Spark (Grace Blackwell GB10, LPDDR5x Unified Memory).
-vLLM Runtime Target: nvcr.io/nvidia/vllm:26.07-py3 (vLLM 0.27.x equivalent).
+vLLM Runtime Target: nvcr.io/nvidia/vllm:26.07-py3 / eugr/spark-vllm-b12x:latest.
 
 This orchestrator manages the lifecycle, network state, and tuning deployments 
 of multi-node LLM serving over a 100GbE backplane via NCCL.
@@ -391,8 +391,10 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
     default_img = catalog_resp.get("catalog", {}).get("default_image", "nvcr.io/nvidia/vllm:26.07-py3")
     image_tag = model_config.get("image", default_img)
 
+    # Volume Mounts: Cache, Bug Patches, and CUDA Compatibility Drivers
     vol_mount = "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
     patch_mount = "/opt/dgx-cluster-control/vllm_gb10_patch.py:/usr/local/lib/python3.12/dist-packages/sitecustomize.py"
+    compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"  # Overrides container CUDA compat shim to fix Error 803
     
     head_ip = HOSTS[head]["ip"]
     hf_token = get_hf_token()
@@ -401,13 +403,11 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
         ip = HOSTS[head]["ip"]
         env_flags = [
             "-e", "PYTHONUNBUFFERED=1",
-            "-e", "NVIDIA_DISABLE_REQUIRE=true",
-            "-e", "VLLM_ENABLE_CUDA_COMPATIBILITY=1",
-            "-e", "LD_LIBRARY_PATH=/usr/local/cuda/compat:$LD_LIBRARY_PATH"
+            "-e", "NVIDIA_DISABLE_REQUIRE=true"
         ]
         if hf_token: env_flags.extend(["-e", f"HF_TOKEN={hf_token}"])
 
-        # INJECT ENV VARS FOR 1-NODE (Fixes Grace CPU context-switch thrashing)
+        # INJECT ENV VARS FOR 1-NODE
         for ev in topo_config.get("env_vars", []):
             env_flags.extend(["-e", ev])
 
@@ -424,7 +424,8 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
             "--net=host", "--ipc=host", "--shm-size=16gb",
             "--gpus", "all",
             "-v", vol_mount,
-            "-v", patch_mount
+            "-v", patch_mount,
+            "-v", compat_mount
         ] + env_flags + [image_tag] + container_args
 
         res = run_ssh(ip, "tetrel", docker_cmd, timeout=60)
@@ -440,8 +441,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
                 "-e", "PYTHONUNBUFFERED=1",
                 "-e", "NCCL_DEBUG=INFO",
                 "-e", "NVIDIA_DISABLE_REQUIRE=true",
-                "-e", "VLLM_ENABLE_CUDA_COMPATIBILITY=1",
-                "-e", "LD_LIBRARY_PATH=/usr/local/cuda/compat:$LD_LIBRARY_PATH",
                 "-e", "NCCL_IB_DISABLE=0",
                 "-e", "NCCL_P2P_DISABLE=0",
                 "-e", "NCCL_IB_HCA=rocep1s0f0",
@@ -480,7 +479,8 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
                 "--device", "/dev/infiniband:/dev/infiniband",
                 "--gpus", "all",
                 "-v", vol_mount,
-                "-v", patch_mount
+                "-v", patch_mount,
+                "-v", compat_mount
             ] + env_flags + [image_tag] + container_args
 
             res = run_ssh(ip, "tetrel", docker_cmd, timeout=60)
