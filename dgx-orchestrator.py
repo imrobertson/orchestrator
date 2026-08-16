@@ -75,10 +75,7 @@ def resolve_user_identity_key() -> str:
     return str(SHARED_KEY_PATH)
 
 def get_hf_token() -> str:
-    """
-    Extracts HuggingFace authentication token from the environment or local cache.
-    Crucial for deploying gating models like Meta Llama 3.3 / Llama 4.
-    """
+    """Extracts HuggingFace authentication token from environment or local cache."""
     if "HF_TOKEN" in os.environ and os.environ["HF_TOKEN"].strip():
         return os.environ["HF_TOKEN"].strip()
     
@@ -101,10 +98,7 @@ def get_hf_token() -> str:
     return ""
 
 def run_ssh(ip: str, user: str, command_list: list, capture: bool = True, timeout: int = 10) -> subprocess.CompletedProcess:
-    """
-    Executes remote commands via SSH. Quotes each token individually so OpenSSH's
-    remote shell evaluation preserves whitespace, quotes, and JSON structures.
-    """
+    """Executes remote commands via SSH with quoted token evaluation."""
     key_path = resolve_user_identity_key()
     quoted_remote_cmd = " ".join(shlex.quote(str(arg)) for arg in command_list)
     ssh_cmd = [
@@ -126,11 +120,7 @@ def run_ssh(ip: str, user: str, command_list: list, capture: bool = True, timeou
         return subprocess.CompletedProcess(args=ssh_cmd, returncode=1, stdout="", stderr=str(e))
 
 def get_lightweight_telemetry(ip: str, user: str) -> dict:
-    """
-    Queries nvidia-smi telemetry line-by-line.
-    Handles Grace Blackwell (GB10) LPDDR5x Unified Memory where standard memory 
-    allocation fields often report [N/A] due to OS shared memory spaces.
-    """
+    """Queries nvidia-smi telemetry line-by-line for Grace Blackwell unified memory."""
     cmd = ["/usr/bin/nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
     res = run_ssh(ip, user, cmd, capture=True, timeout=10)
     
@@ -140,7 +130,6 @@ def get_lightweight_telemetry(ip: str, user: str) -> dict:
             if len(parts) >= 2:
                 temp_str, util_str = parts[0], parts[1]
                 if temp_str.isdigit() and util_str.isdigit():
-                    # Fallback to Unified / 131072 MB if SMI fails to read Grace memory
                     mem_used = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else "Unified"
                     mem_total = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else "131072"
                     return {
@@ -162,7 +151,7 @@ def check_vllm_health(head_ip: str = "10.0.14.43", port: int = 8000) -> bool:
         return False
 
 def wait_for_cluster_ready(head_ip: str = "10.0.14.43", timeout_sec: int = 900, poll_interval: int = 15) -> bool:
-    """Polls the vLLM /health endpoint until the model finishes compilation/warmup and enters HTTP 200 ready state."""
+    """Polls the vLLM /health endpoint until HTTP 200 ready state."""
     start_time = time.time()
     print(f"[+] Polling http://{head_ip}:8000/health until serving ready (Timeout: {timeout_sec}s)...")
     
@@ -186,11 +175,10 @@ def parse_iso_time(ts_str: str) -> float:
         return time.time()
 
 def detect_model_stage(ip: str, user: str, c_name: str) -> str:
-    """Inspects recent log output from bottom to top to accurately report the current active phase."""
+    """Inspects recent log output from bottom to top so the active phase takes priority."""
     res = run_ssh(ip, user, ["docker", "logs", "--tail", "30", c_name], timeout=5)
     lines = [l.strip() for l in (res.stdout + res.stderr).splitlines() if l.strip()]
 
-    # Scan backwards (newest log line first) so the active phase takes priority
     for line in reversed(lines):
         if any(k in line for k in ["Loading weights", "safetensors", "shard", "Loading model"]):
             return "NOT READY - LOADING SHARDS"
@@ -204,7 +192,7 @@ def detect_model_stage(ip: str, user: str, c_name: str) -> str:
 def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
     """
     Calculates historical moving average of container startup times.
-    Returns tuple of (estimated_seconds, has_historical_data).
+    Returns (estimated_seconds, has_historical_data).
     """
     default_est = 600 if "deepseek" in model.lower() else 180
     if not LOAD_TIMES_PATH.exists():
@@ -219,10 +207,7 @@ def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
     return default_est, False
 
 def get_cluster_status() -> dict:
-    """
-    Returns a full state map of Docker daemons, models, health, and telemetry across all nodes.
-    Separates Docker status, Container status, Granular Model Status, and ETA remaining.
-    """
+    """Returns state map of Docker daemons, models, health, and telemetry across nodes."""
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
         try:
@@ -279,7 +264,6 @@ def get_cluster_status() -> dict:
             if active_container != "None" and loaded_model in ["None", "Active Container"] and discovered_head_model != "None":
                 loaded_model = discovered_head_model
 
-            # Explicit separation of Container State, Model Status, and ETA
             eta_seconds = 0
             eta_display = "Ready" if cluster_ready else "N/A"
 
@@ -292,19 +276,21 @@ def get_cluster_status() -> dict:
                     time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
                     if time_res.returncode == 0 and time_res.stdout.strip():
                         start_ts = parse_iso_time(time_res.stdout.strip())
-                        elapsed = time.time() - start_ts
+                        elapsed = int(time.time() - start_ts)
                         topo_key = "2_node" if active_container in ["vllm-head", "vllm-worker"] else "1_node"
                         est_total, has_history = get_estimated_load_time(loaded_model, topo_key)
-                        remaining = max(0, int(est_total - elapsed))
-                        eta_seconds = remaining
+                        remaining = est_total - elapsed
+                        eta_seconds = max(0, remaining)
                         
-                        if has_history:
-                            eta_display = f"~{remaining}s remaining" if remaining > 0 else "Finishing startup..."
+                        if remaining > 0:
+                            suffix = "" if has_history else " (Initial run - no history)"
+                            eta_display = f"~{remaining}s remaining{suffix}"
                         else:
-                            if remaining > 0:
-                                eta_display = f"~{remaining}s remaining (Guesstimate - insufficient historic data)"
+                            overrun = elapsed - est_total
+                            if has_history:
+                                eta_display = f"Finishing startup (+{overrun}s over est.)"
                             else:
-                                eta_display = "Finishing startup... (No historic data)"
+                                eta_display = f"Loading... ({elapsed}s elapsed - no historic data)"
             elif active_container != "None":
                 model_status = f"STOPPED ({container_state.upper()})"
                 eta_display = "N/A"
@@ -339,11 +325,7 @@ def get_cluster_status() -> dict:
     return status_data
 
 def load_model_catalog() -> dict:
-    """
-    Loads models.yaml and aggressively enforces global offline overrides.
-    This prevents an accidental online validation check from hanging vLLM startup 
-    on firewalled backplanes.
-    """
+    """Loads models.yaml and enforces global offline overrides."""
     if not MODELS_YAML_PATH.exists():
         return {"catalog": {"models": {}}}
     try:
@@ -379,8 +361,8 @@ def load_model_catalog() -> dict:
         return {"error": str(e), "catalog": {"models": {}}}
 
 def record_load_time(model: str, topo_key: str, duration_sec: int):
-    """Saves startup telemetry to inform the UI of expected wait times."""
-    if duration_sec > 1800 or duration_sec < 5: return
+    """Saves verified startup telemetry only upon successful HTTP health check."""
+    if duration_sec > 1800 or duration_sec < 60: return
     data = {}
     if LOAD_TIMES_PATH.exists():
         try: data = json.loads(LOAD_TIMES_PATH.read_text())
@@ -392,7 +374,7 @@ def record_load_time(model: str, topo_key: str, duration_sec: int):
     except Exception: pass
 
 def execute_teardown(target_hosts: list = None) -> dict:
-    """Forcefully destroys existing vLLM containers to free GPU Unified Memory."""
+    """Forcefully destroys existing vLLM containers."""
     results = {}
     hosts_to_clean = target_hosts if target_hosts else list(HOSTS.keys())
     for host in hosts_to_clean:
@@ -434,15 +416,9 @@ def execute_sync() -> dict:
     return {"status": "success", "details": results}
 
 def ensure_container_patch(target_hosts: list):
-    """
-    Distributes the python container patch to remote nodes.
-    This fixes a specific FlashInfer Cutlass bug involving MXFP8 memory allocation.
-    It is programmed defensively: if NVIDIA fixes this in a later container (e.g. 26.07)
-    and the file no longer exists, it passes silently without crashing.
-    """
+    """Distributes the python container patch to remote nodes."""
     patch_path = BASE_DIR / "vllm_gb10_patch.py"
     patch_content = """import os, sys
-# Dynamic launcher lookup fix for transformers pickling issue
 main_mod = sys.modules.get("__main__")
 if main_mod and not hasattr(main_mod, "launcher"):
     setattr(main_mod, "launcher", lambda *args, **kwargs: None)
@@ -472,7 +448,8 @@ if os.path.exists(target):
         run_ssh(ip, "tetrel", cmd, timeout=10)
 
 def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False) -> dict:
-    """Orchestrates container deployment. Handles 1-node and 2-node PP pipelines."""
+    """Orchestrates container deployment across 1-node or 2-node topologies."""
+    deploy_start_time = time.time()
     target_hosts = ["spark-4", "spark-3"] if nodes == 2 else [head]
     ensure_container_patch(target_hosts)
     
@@ -491,7 +468,7 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
 
     topo_config = topologies[topo_key]
     hf_path = model_config.get("hf_path", model)
-    gpu_util = model_config.get("gpu_util", 0.70)  # Safe GB10 default fallback
+    gpu_util = model_config.get("gpu_util", 0.70)
     max_model_len = topo_config.get("max_model_len", 32768)
     tp_size = topo_config.get("tp_size", 1)
     pp_size = topo_config.get("pp_size", nodes)
@@ -504,19 +481,16 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
 
     execute_teardown(target_hosts=target_hosts)
 
-    # Hardware clock lock for sustained inference stability
     for h in target_hosts:
         ip = HOSTS[h]["ip"]
         run_ssh(ip, "tetrel", ["sudo", "nvidia-smi", "-lgc", "300,1800"], timeout=10)
 
-    # Dynamic container image resolution from models.yaml catalog with fallback
     default_img = catalog_resp.get("catalog", {}).get("default_image", "nvcr.io/nvidia/vllm:26.07-py3")
     image_tag = model_config.get("image", default_img)
 
-    # Volume Mounts: Cache, Bug Patches, and CUDA Compatibility Drivers
     vol_mount = "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
     patch_mount = "/opt/dgx-cluster-control/vllm_gb10_patch.py:/usr/local/lib/python3.12/dist-packages/sitecustomize.py"
-    compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"  # Overrides container CUDA compat shim to fix Error 803
+    compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"
     
     head_ip = HOSTS[head]["ip"]
     hf_token = get_hf_token()
@@ -608,7 +582,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
             if res.returncode != 0:
                 return {"status": "error", "message": f"Docker run failed on {host}: {res.stderr}"}
 
-    # Verify launch stability
     time.sleep(4)
     for host in target_hosts:
         ip = HOSTS[host]["ip"]
@@ -620,18 +593,21 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
             err_log = log_res.stdout.strip() or log_res.stderr.strip() or "No logs captured."
             return {"status": "error", "message": f"Container '{target_role}' crashed on {host}.\nLogs:\n{err_log}"}
 
-    # Built-in Health Wait & Auto-Benchmark Trigger
     if wait or run_benchmark:
         head_ip = HOSTS[head]["ip"]
         is_ready = wait_for_cluster_ready(head_ip=head_ip, timeout_sec=900)
         
-        if is_ready and run_benchmark:
-            print("[+] Triggering 3-pass performance benchmark...")
-            time.sleep(30)  # Allow CUDA memory and graphs to settle
-            bench_res = subprocess.run(["python3", "benchmark.py"], capture_output=True, text=True)
-            bench_file = BASE_DIR / "benchmark_results.txt"
-            bench_file.write_text(bench_res.stdout)
-            print(f"[+] Benchmark completed. Results written to {bench_file}")
+        if is_ready:
+            total_duration = int(time.time() - deploy_start_time)
+            record_load_time(model, topo_key, total_duration)
+
+            if run_benchmark:
+                print("[+] Triggering 3-pass performance benchmark...")
+                time.sleep(30)
+                bench_res = subprocess.run(["python3", "benchmark.py"], capture_output=True, text=True)
+                bench_file = BASE_DIR / "benchmark_results.txt"
+                bench_file.write_text(bench_res.stdout)
+                print(f"[+] Benchmark completed. Results written to {bench_file}")
 
     return {
         "status": "success",
@@ -715,16 +691,13 @@ def interactive_menu():
         confirm = input(f"\nDeploy {selected_model} ({selected_topo}) with head {head}? (y/N): ").strip().lower()
         if confirm == 'y':
             print(f"[+] Launching deployment sequence for {selected_model}...")
-            start_time = time.time()
             res = execute_deployment(selected_model, nodes, head, user_id, wait=do_wait, run_benchmark=do_bench)
             print(json.dumps(res, indent=2))
-            if res.get("status") == "success":
-                record_load_time(selected_model, selected_topo, int(time.time() - start_time))
     except (IndexError, ValueError) as e:
         print(f"[-] Invalid selection: {e}")
 
 if HAS_FASTAPI:
-    app = FastAPI(title="Tetrel Security DGX Control Plane API", version="4.6.2")
+    app = FastAPI(title="Tetrel Security DGX Control Plane API", version="4.6.3")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
     class DeployRequest(BaseModel):

@@ -1,5 +1,4 @@
 import os, sys
-# Dynamic launcher lookup fix for transformers pickling issue
 main_mod = sys.modules.get("__main__")
 if main_mod and not hasattr(main_mod, "launcher"):
     setattr(main_mod, "launcher", lambda *args, **kwargs: None)

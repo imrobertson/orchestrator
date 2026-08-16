@@ -71,6 +71,28 @@ models:
   # ============================================================================
   # MASSIVE update using custom build of the vllm docker from community eugr
   # =========================================================================== 
+  deepseek-v4-flash:
+    hf_path: deepseek-ai/DeepSeek-V4-Flash-0731
+    image: eugr/spark-vllm-b12x:latest
+    gpu_util: 0.70
+    topologies:
+      2_node:
+        max_model_len: 65536
+        tp_size: 1
+        pp_size: 2
+        env_vars:
+          - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+          - OMP_NUM_THREADS=16
+          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
+          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
+          - NCCL_CUMEM_ENABLE=0
+          - NCCL_IB_GID_INDEX=3
+          - NCCL_SOCKET_IFNAME=enp1s0f0np0
+          - GLOO_SOCKET_IFNAME=enp1s0f0np0
+        vllm_args: >-
+          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
+          --enable-ep-weight-filter --enforce-eager
+
   deepseek-v4-flash-nvfp4:
     hf_path: Rarri/DeepSeek-V4-Flash-0731-NVFP4
     image: eugr/spark-vllm-b12x:latest
@@ -81,7 +103,6 @@ models:
         tp_size: 1
         pp_size: 2
         env_vars:
-          - VLLM_USE_V1=0
           - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
           - VLLM_USE_BREAKABLE_CUDAGRAPH=0
           - DG_JIT_USE_NVRTC=0
@@ -94,9 +115,10 @@ models:
           - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
-          --distributed-executor-backend mp --enable-ep-weight-filter
+          --enable-ep-weight-filter
           --attention-config '{"use_fp4_indexer_cache": true}'
           --compilation-config '{"mode": 0}' --enforce-eager
+
 
   deepseek-r1-distill-qwen-32b:
     hf_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
