@@ -20,6 +20,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 import yaml
 
@@ -149,8 +151,21 @@ def get_lightweight_telemetry(ip: str, user: str) -> dict:
                     }
     return {}
 
+def check_vllm_health(head_ip: str = "10.0.14.43", port: int = 8000) -> bool:
+    """Probes the vLLM /health endpoint to check if HTTP API serving is ready."""
+    url = f"http://{head_ip}:{port}/health"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=2) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
 def get_cluster_status() -> dict:
-    """Returns a full state map of Docker daemons, models, and telemetry across all nodes."""
+    """
+    Returns a full state map of Docker daemons, models, health, and telemetry across all nodes.
+    Uses 'docker ps -a' and HTTP health probing to accurately report initializing vs serving states.
+    """
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
         try:
@@ -158,28 +173,37 @@ def get_cluster_status() -> dict:
         except Exception:
             pass
 
+    cluster_ready = check_vllm_health(HOSTS["spark-4"]["ip"])
+
     status_data = {
         "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S EST"),
         "network_mode": "Working in OFFLINE mode" if offline_mode else "Working in ONLINE mode",
+        "cluster_ready": cluster_ready,
         "hosts": {}
     }
+
+    discovered_head_model = "None"
 
     for host, meta in HOSTS.items():
         ip = meta["ip"]
         user = "tetrel"
-        res = run_ssh(ip, user, ["docker", "ps", "--format", "{{.Names}}::{{.Image}}"], timeout=8)
+        # Increased timeout to 15s to prevent UNREACHABLE states during heavy TileLang/DeepGEMM compilation
+        res = run_ssh(ip, user, ["docker", "ps", "-a", "--format", "{{.Names}}::{{.State}}::{{.Image}}"], timeout=15)
         
         if res.returncode == 0:
-            active_container, loaded_model = "None", "None"
+            active_container, container_state, loaded_model = "None", "None", "None"
             lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
             for line in lines:
                 parts = line.split("::")
                 if parts:
                     c_name = parts[0]
+                    c_state = parts[1] if len(parts) > 1 else "running"
                     if c_name in ["vllm-standalone", "vllm-head", "vllm-worker"]:
                         active_container = c_name
-                        # Peek into container startup flags to find the actively loaded model
-                        inspect_res = run_ssh(ip, user, ["docker", "inspect", c_name, "--format", "{{json .Config.Cmd}}"], timeout=5)
+                        container_state = c_state.lower()
+                        
+                        # Inspect container startup command to extract model name
+                        inspect_res = run_ssh(ip, user, ["docker", "inspect", c_name, "--format", "{{json .Config.Cmd}}"], timeout=8)
                         if inspect_res.returncode == 0 and "--model" in inspect_res.stdout:
                             try:
                                 cmd_parts = json.loads(inspect_res.stdout.strip())
@@ -187,8 +211,27 @@ def get_cluster_status() -> dict:
                                     idx = cmd_parts.index("--model")
                                     if idx + 1 < len(cmd_parts):
                                         loaded_model = cmd_parts[idx + 1].split("/")[-1]
+                                        if host == "spark-4":
+                                            discovered_head_model = loaded_model
                             except Exception:
                                 loaded_model = "Active Container"
+                        elif discovered_head_model != "None":
+                            loaded_model = discovered_head_model
+                        else:
+                            loaded_model = "Active Container"
+                        break
+
+            # Fall back to head node model if worker inspection took too long
+            if active_container != "None" and loaded_model in ["None", "Active Container"] and discovered_head_model != "None":
+                loaded_model = discovered_head_model
+
+            # Annotate runtime state so UI clearly distinguishes compilation/loading from active serving
+            if active_container != "None":
+                if container_state == "running":
+                    if not cluster_ready:
+                        active_container = f"{active_container} (Initializing)"
+                else:
+                    active_container = f"{active_container} ({container_state})"
 
             telemetry = get_lightweight_telemetry(ip, user)
             status_data["hosts"][host] = {
@@ -491,7 +534,7 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
     time.sleep(4)
     for host in target_hosts:
         ip = HOSTS[host]["ip"]
-        check_res = run_ssh(ip, "tetrel", ["docker", "ps", "--format", "{{.Names}}"], timeout=5)
+        check_res = run_ssh(ip, "tetrel", ["docker", "ps", "-a", "--format", "{{.Names}}"], timeout=5)
         running = [c.strip() for c in check_res.stdout.splitlines() if c.strip() in ["vllm-standalone", "vllm-head", "vllm-worker"]]
         if not running:
             target_role = "vllm-standalone" if nodes == 1 else ("vllm-head" if host == head else "vllm-worker")
@@ -509,7 +552,7 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
     if host not in HOSTS: return {"logs": ["Invalid target host specified."]}
     
     ip = HOSTS[host]["ip"]
-    res = run_ssh(ip, "tetrel", ["docker", "ps", "--format", "{{.Names}}"], timeout=5)
+    res = run_ssh(ip, "tetrel", ["docker", "ps", "-a", "--format", "{{.Names}}"], timeout=5)
     if res.returncode != 0: return {"logs": ["Failed to connect to host."]}
 
     containers = [c.strip() for c in res.stdout.strip().splitlines() if c.strip() in ["vllm-standalone", "vllm-head", "vllm-worker"]]
@@ -524,14 +567,14 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
 def interactive_menu():
     print("=== [ TETREL SECURITY ] DGX Cluster Orchestrator ===")
     status = get_cluster_status()
-    print(f"Server Time: {status['server_time']} | Mode: {status['network_mode']}\n")
+    print(f"Server Time: {status['server_time']} | Mode: {status['network_mode']} | vLLM API Ready: {status['cluster_ready']}\n")
 
     for h, data in status["hosts"].items():
         tele = data.get("telemetry", {})
         temp = f"{tele.get('gpu_temp_c', 'N/A')}°C" if 'gpu_temp_c' in tele else "N/A"
         util = f"{tele.get('gpu_util_pct', 'N/A')}%" if 'gpu_util_pct' in tele else "N/A"
         mem = f"{tele.get('mem_used_mb', 'N/A')}/{tele.get('mem_total_mb', 'N/A')} MB" if 'mem_used_mb' in tele else "N/A"
-        print(f"[{h}] Status: {data['status']} | Docker: {data['docker']} | Model: {data['active_model']} | Temp: {temp} | Util: {util} | Memory: {mem}")
+        print(f"[{h}] Status: {data['status']} | Docker: {data['docker']} | Container: {data['container']} | Model: {data['active_model']} | Temp: {temp} | Util: {util} | Memory: {mem}")
     print("-" * 75)
 
     catalog_data = load_model_catalog().get("catalog", {}).get("models", {})
