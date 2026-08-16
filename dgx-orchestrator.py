@@ -161,6 +161,21 @@ def check_vllm_health(head_ip: str = "10.0.14.43", port: int = 8000) -> bool:
     except Exception:
         return False
 
+def wait_for_cluster_ready(head_ip: str = "10.0.14.43", timeout_sec: int = 900, poll_interval: int = 15) -> bool:
+    """Polls the vLLM /health endpoint until the model finishes compilation/warmup and enters HTTP 200 ready state."""
+    start_time = time.time()
+    print(f"[+] Polling http://{head_ip}:8000/health until serving ready (Timeout: {timeout_sec}s)...")
+    
+    while time.time() - start_time < timeout_sec:
+        if check_vllm_health(head_ip):
+            elapsed = int(time.time() - start_time)
+            print(f"[+] vLLM Engine is HEALTHY and serving! (Warmup took {elapsed}s)")
+            return True
+        time.sleep(poll_interval)
+        
+    print(f"[-] Timeout ({timeout_sec}s) reached waiting for cluster readiness.")
+    return False
+
 def get_cluster_status() -> dict:
     """
     Returns a full state map of Docker daemons, models, health, and telemetry across all nodes.
@@ -187,7 +202,7 @@ def get_cluster_status() -> dict:
     for host, meta in HOSTS.items():
         ip = meta["ip"]
         user = "tetrel"
-        # Increased timeout to 15s to prevent UNREACHABLE states during heavy TileLang/DeepGEMM compilation
+        # Extended SSH timeout to 15s to prevent UNREACHABLE states during heavy JIT compilation
         res = run_ssh(ip, user, ["docker", "ps", "-a", "--format", "{{.Names}}::{{.State}}::{{.Image}}"], timeout=15)
         
         if res.returncode == 0:
@@ -202,7 +217,6 @@ def get_cluster_status() -> dict:
                         active_container = c_name
                         container_state = c_state.lower()
                         
-                        # Inspect container startup command to extract model name
                         inspect_res = run_ssh(ip, user, ["docker", "inspect", c_name, "--format", "{{json .Config.Cmd}}"], timeout=8)
                         if inspect_res.returncode == 0 and "--model" in inspect_res.stdout:
                             try:
@@ -221,11 +235,9 @@ def get_cluster_status() -> dict:
                             loaded_model = "Active Container"
                         break
 
-            # Fall back to head node model if worker inspection took too long
             if active_container != "None" and loaded_model in ["None", "Active Container"] and discovered_head_model != "None":
                 loaded_model = discovered_head_model
 
-            # Annotate runtime state so UI clearly distinguishes compilation/loading from active serving
             if active_container != "None":
                 if container_state == "running":
                     if not cluster_ready:
@@ -257,11 +269,9 @@ def load_model_catalog() -> dict:
         with open(MODELS_YAML_PATH, "r") as f:
             config = yaml.safe_load(f) or {}
             
-        # 1. Parse the global config headers
         global_hf = config.get('GLOBAL_HF_HUB_OFFLINE', 0)
         global_tf = config.get('GLOBAL_TRANSFORMERS_OFFLINE', 0)
 
-        # 2. Iterate through all models and enforce global overrides on env_vars
         models = config.get('models', {})
         if isinstance(models, dict):
             for model_name, model_data in models.items():
@@ -275,7 +285,6 @@ def load_model_catalog() -> dict:
                         if 'env_vars' not in topo_data:
                             topo_data['env_vars'] = []
                         
-                        # Strip out existing declarations to avoid duplicated vars, then append force-state
                         if global_hf == 1:
                             topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('HF_HUB_OFFLINE=')]
                             topo_data['env_vars'].append('HF_HUB_OFFLINE=1')
@@ -307,7 +316,7 @@ def record_load_time(model: str, topo_key: str, duration_sec: int):
         except Exception: data = {}
     key = f"{model}::{topo_key}"
     data.setdefault(key, []).append(duration_sec)
-    data[key] = data[key][-20:]  # Keep rolling average tight to last 20 launches
+    data[key] = data[key][-20:]
     try: LOAD_TIMES_PATH.write_text(json.dumps(data, indent=2))
     except Exception: pass
 
@@ -385,14 +394,13 @@ if os.path.exists(target):
         patch_path.write_text(patch_content)
         patch_path.chmod(0o664)
 
-    # Push to target remote nodes so the Docker daemon can correctly map the -v mount
     escaped_patch = shlex.quote(patch_content)
     for host in target_hosts:
         ip = HOSTS[host]["ip"]
         cmd = ["bash", "-c", f"mkdir -p /opt/dgx-cluster-control && echo {escaped_patch} > /opt/dgx-cluster-control/vllm_gb10_patch.py"]
         run_ssh(ip, "tetrel", cmd, timeout=10)
 
-def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
+def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False) -> dict:
     """Orchestrates container deployment. Handles 1-node and 2-node PP pipelines."""
     target_hosts = ["spark-4", "spark-3"] if nodes == 2 else [head]
     ensure_container_patch(target_hosts)
@@ -450,7 +458,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
         ]
         if hf_token: env_flags.extend(["-e", f"HF_TOKEN={hf_token}"])
 
-        # INJECT ENV VARS FOR 1-NODE
         for ev in topo_config.get("env_vars", []):
             env_flags.extend(["-e", ev])
 
@@ -542,6 +549,19 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
             err_log = log_res.stdout.strip() or log_res.stderr.strip() or "No logs captured."
             return {"status": "error", "message": f"Container '{target_role}' crashed on {host}.\nLogs:\n{err_log}"}
 
+    # Built-in Health Wait & Auto-Benchmark Trigger
+    if wait or run_benchmark:
+        head_ip = HOSTS[head]["ip"]
+        is_ready = wait_for_cluster_ready(head_ip=head_ip, timeout_sec=900)
+        
+        if is_ready and run_benchmark:
+            print("[+] Triggering 3-pass performance benchmark...")
+            time.sleep(30)  # Allow CUDA memory and graphs to settle
+            bench_res = subprocess.run(["python3", "benchmark.py"], capture_output=True, text=True)
+            bench_file = BASE_DIR / "benchmark_results.txt"
+            bench_file.write_text(bench_res.stdout)
+            print(f"[+] Benchmark completed. Results written to {bench_file}")
+
     return {
         "status": "success",
         "message": f"Deployment sequence for {model} across {nodes} node(s) initiated.",
@@ -614,12 +634,18 @@ def interactive_menu():
 
         user_name = os.environ.get("USER") or getpass.getuser()
         user_id = input(f"Enter User ID / Auditor [{user_name}]: ").strip() or user_name
+        
+        wait_choice = input("Block until vLLM passes HTTP health check? (y/N) [y]: ").strip().lower() or 'y'
+        do_wait = wait_choice == 'y'
+        
+        bench_choice = input("Automatically run benchmark after health check? (y/N) [n]: ").strip().lower()
+        do_bench = bench_choice == 'y'
 
         confirm = input(f"\nDeploy {selected_model} ({selected_topo}) with head {head}? (y/N): ").strip().lower()
         if confirm == 'y':
             print(f"[+] Launching deployment sequence for {selected_model}...")
             start_time = time.time()
-            res = execute_deployment(selected_model, nodes, head, user_id)
+            res = execute_deployment(selected_model, nodes, head, user_id, wait=do_wait, run_benchmark=do_bench)
             print(json.dumps(res, indent=2))
             if res.get("status") == "success":
                 record_load_time(selected_model, selected_topo, int(time.time() - start_time))
@@ -631,7 +657,12 @@ if HAS_FASTAPI:
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
     class DeployRequest(BaseModel):
-        model: str; nodes: int; head: str = "spark-4"; user_id: str = "dashboard_user"
+        model: str
+        nodes: int
+        head: str = "spark-4"
+        user_id: str = "dashboard_user"
+        wait: bool = False
+        run_benchmark: bool = False
 
     class NetworkToggleRequest(BaseModel):
         offline: bool
@@ -647,7 +678,7 @@ if HAS_FASTAPI:
 
     @app.post("/api/deploy")
     def api_deploy(req: DeployRequest):
-        res = execute_deployment(req.model, req.nodes, req.head, req.user_id)
+        res = execute_deployment(req.model, req.nodes, req.head, req.user_id, wait=req.wait, run_benchmark=req.run_benchmark)
         if res.get("status") != "success": raise HTTPException(status_code=400, detail=res.get("message", "Deployment failed"))
         return res
 
@@ -677,6 +708,8 @@ def main():
     deploy_parser.add_argument("--model", required=True)
     deploy_parser.add_argument("--nodes", type=int, default=2)
     deploy_parser.add_argument("--head", default="spark-4")
+    deploy_parser.add_argument("--wait", action="store_true", help="Block until HTTP /health passes")
+    deploy_parser.add_argument("--benchmark", action="store_true", help="Automatically run benchmark.py when ready")
     deploy_parser.add_argument("-y", "--yes", action="store_true")
 
     logs_parser = subparsers.add_parser("logs")
@@ -698,6 +731,8 @@ def main():
     cli_deploy.add_argument("--model", required=True)
     cli_deploy.add_argument("--nodes", type=int, default=2)
     cli_deploy.add_argument("--head", default="spark-4")
+    cli_deploy.add_argument("--wait", action="store_true")
+    cli_deploy.add_argument("--benchmark", action="store_true")
     cli_deploy.add_argument("-y", "--yes", action="store_true")
 
     cli_logs = cli_sub.add_parser("logs")
@@ -718,7 +753,7 @@ def main():
 
     elif subcommand == "status": print(json.dumps(get_cluster_status(), indent=2))
     elif subcommand == "teardown": print(json.dumps(execute_teardown(), indent=2))
-    elif subcommand == "deploy": print(json.dumps(execute_deployment(args.model, args.nodes, args.head, os.environ.get("USER") or getpass.getuser()), indent=2))
+    elif subcommand == "deploy": print(json.dumps(execute_deployment(args.model, args.nodes, args.head, os.environ.get("USER") or getpass.getuser(), wait=getattr(args, "wait", False), run_benchmark=getattr(args, "benchmark", False)), indent=2))
     elif subcommand == "logs": print("\n".join(get_container_logs(args.host, args.tail).get("logs", [])))
     elif subcommand == "authorize-key": print(json.dumps(authorize_user_key(args.key), indent=2))
     elif subcommand == "sync": print(json.dumps(execute_sync(), indent=2))
