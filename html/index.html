@@ -17,6 +17,9 @@
         .badge { font-size: 12px; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
         .badge.online { background: #065f46; color: #34d399; }
         .badge.offline { background: #7f1d1d; color: #f87171; }
+        .badge.ready { background: #065f46; color: #34d399; }
+        .badge.loading { background: #78350f; color: #fbbf24; }
+        .badge.none { background: #334155; color: #94a3b8; }
         .metric-row { display: flex; justify-content: space-between; margin: 8px 0; font-size: 14px; }
         .metric-val { font-family: monospace; color: #38bdf8; }
         pre { background: #0f172a; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: #cbd5e1; max-height: 400px; }
@@ -115,7 +118,24 @@
             grid.innerHTML = '';
             
             for (const [host, info] of Object.entries(data.hosts)) {
-                const statusBadge = info.status === 'ONLINE' ? '<span class="badge online">ONLINE</span>' : '<span class="badge offline">OFFLINE</span>';
+                const nodeStatus = info.docker_status || info.status || 'OFFLINE';
+                const statusBadge = nodeStatus === 'ONLINE' ? '<span class="badge online">ONLINE</span>' : '<span class="badge offline">OFFLINE</span>';
+                
+                // Format Granular Model Status Badges
+                let modelBadgeClass = 'none';
+                const modelStatusStr = info.model_status || 'NONE';
+                if (modelStatusStr === 'READY') {
+                    modelBadgeClass = 'ready';
+                } else if (modelStatusStr.startsWith('NOT READY')) {
+                    modelBadgeClass = 'loading';
+                }
+                const modelBadge = `<span class="badge ${modelBadgeClass}">${modelStatusStr}</span>`;
+
+                // Format Active Container State
+                const containerName = info.container_name || info.container || 'None';
+                const containerState = info.container_state ? `(${info.container_state})` : '';
+                const runtimeDisplay = containerName !== 'None' ? `${containerName} ${containerState}` : 'None';
+
                 let telemetryHtml = '';
                 if (info.telemetry && info.telemetry.gpu_temp_c !== undefined) {
                     telemetryHtml = `
@@ -131,9 +151,11 @@
                     <div class="card">
                         <h2>${host} ${statusBadge}</h2>
                         <div class="metric-row"><span>IP Address:</span><span class="metric-val">${info.ip || 'N/A'}</span></div>
-                        <div class="metric-row"><span>Docker Status:</span><span class="metric-val">${info.docker}</span></div>
-                        <div class="metric-row"><span>Active Runtime:</span><span class="metric-val">${info.container || 'None'}</span></div>
+                        <div class="metric-row"><span>Docker Daemon:</span><span class="metric-val">${nodeStatus}</span></div>
+                        <div class="metric-row"><span>Active Container:</span><span class="metric-val">${runtimeDisplay}</span></div>
                         <div class="metric-row"><span>Loaded Model:</span><span class="metric-val">${info.active_model || 'None'}</span></div>
+                        <div class="metric-row"><span>Model Status:</span><span class="metric-val">${modelBadge}</span></div>
+                        <div class="metric-row"><span>Est. Startup Time:</span><span class="metric-val">${info.eta_display || 'N/A'}</span></div>
                         <hr style="border-color: #334155; margin: 12px 0;">
                         ${telemetryHtml}
                     </div>

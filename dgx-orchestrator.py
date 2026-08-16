@@ -176,10 +176,33 @@ def wait_for_cluster_ready(head_ip: str = "10.0.14.43", timeout_sec: int = 900, 
     print(f"[-] Timeout ({timeout_sec}s) reached waiting for cluster readiness.")
     return False
 
+def parse_iso_time(ts_str: str) -> float:
+    """Parses Docker StartedAt ISO timestamp into unix epoch seconds."""
+    try:
+        ts_clean = ts_str.split(".")[0].replace("Z", "")
+        dt = datetime.datetime.strptime(ts_clean, "%Y-%m-%dT%H:%M:%S")
+        return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        return time.time()
+
+def detect_model_stage(ip: str, user: str, c_name: str) -> str:
+    """Inspects recent log output to determine the active initialization phase."""
+    res = run_ssh(ip, user, ["docker", "logs", "--tail", "25", c_name], timeout=5)
+    logs = res.stdout + res.stderr
+    
+    if any(k in logs for k in ["TileLang", "DeepGEMM", "kernel", "compiling", "JIT"]):
+        return "NOT READY - COMPILING KERNELS"
+    elif any(k in logs for k in ["Loading weights", "safetensors", "shard", "Downloading", "Loading model"]):
+        return "NOT READY - LOADING SHARDS"
+    elif any(k in logs for k in ["Warming up", "KV cache", "graph", "mHC warmup", "profiling"]):
+        return "NOT READY - WARMUP"
+    else:
+        return "NOT READY - INITIALIZING"
+
 def get_cluster_status() -> dict:
     """
     Returns a full state map of Docker daemons, models, health, and telemetry across all nodes.
-    Uses 'docker ps -a' and HTTP health probing to accurately report initializing vs serving states.
+    Separates Docker status, Container status, Granular Model Status, and ETA remaining.
     """
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
@@ -202,7 +225,6 @@ def get_cluster_status() -> dict:
     for host, meta in HOSTS.items():
         ip = meta["ip"]
         user = "tetrel"
-        # Extended SSH timeout to 15s to prevent UNREACHABLE states during heavy JIT compilation
         res = run_ssh(ip, user, ["docker", "ps", "-a", "--format", "{{.Names}}::{{.State}}::{{.Image}}"], timeout=15)
         
         if res.returncode == 0:
@@ -238,22 +260,56 @@ def get_cluster_status() -> dict:
             if active_container != "None" and loaded_model in ["None", "Active Container"] and discovered_head_model != "None":
                 loaded_model = discovered_head_model
 
-            if active_container != "None":
-                if container_state == "running":
-                    if not cluster_ready:
-                        active_container = f"{active_container} (Initializing)"
+            # Explicit separation of Container State, Model Status, and ETA
+            eta_seconds = 0
+            eta_display = "Ready" if cluster_ready else "N/A"
+
+            if active_container != "None" and container_state == "running":
+                if cluster_ready:
+                    model_status = "READY"
                 else:
-                    active_container = f"{active_container} ({container_state})"
+                    model_status = detect_model_stage(ip, user, active_container)
+                    
+                    # Calculate ETA using Docker start time vs historical averages
+                    time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
+                    if time_res.returncode == 0 and time_res.stdout.strip():
+                        start_ts = parse_iso_time(time_res.stdout.strip())
+                        elapsed = time.time() - start_ts
+                        topo_key = "2_node" if active_container in ["vllm-head", "vllm-worker"] else "1_node"
+                        est_total = get_estimated_load_time(loaded_model, topo_key)
+                        remaining = max(0, int(est_total - elapsed))
+                        eta_seconds = remaining
+                        eta_display = f"~{remaining}s remaining" if remaining > 0 else "Finishing startup..."
+            elif active_container != "None":
+                model_status = f"STOPPED ({container_state.upper()})"
+                eta_display = "N/A"
+            else:
+                model_status = "NONE"
+                eta_display = "N/A"
 
             telemetry = get_lightweight_telemetry(ip, user)
             status_data["hosts"][host] = {
-                "ip": ip, "status": "ONLINE", "docker": "ONLINE",
-                "container": active_container, "active_model": loaded_model, "telemetry": telemetry
+                "ip": ip,
+                "docker_status": "ONLINE",
+                "container_name": active_container,
+                "container_state": container_state.upper() if active_container != "None" else "NONE",
+                "active_model": loaded_model,
+                "model_status": model_status,
+                "eta_seconds": eta_seconds,
+                "eta_display": eta_display,
+                "telemetry": telemetry
             }
         else:
             status_data["hosts"][host] = {
-                "ip": ip, "status": "OFFLINE", "docker": "UNREACHABLE",
-                "container": "None", "active_model": "None", "telemetry": {}
+                "ip": ip,
+                "docker_status": "UNREACHABLE",
+                "container_name": "None",
+                "container_state": "NONE",
+                "active_model": "None",
+                "model_status": "NONE",
+                "eta_seconds": 0,
+                "eta_display": "N/A",
+                "telemetry": {}
             }
     return status_data
 
@@ -594,8 +650,8 @@ def interactive_menu():
         temp = f"{tele.get('gpu_temp_c', 'N/A')}°C" if 'gpu_temp_c' in tele else "N/A"
         util = f"{tele.get('gpu_util_pct', 'N/A')}%" if 'gpu_util_pct' in tele else "N/A"
         mem = f"{tele.get('mem_used_mb', 'N/A')}/{tele.get('mem_total_mb', 'N/A')} MB" if 'mem_used_mb' in tele else "N/A"
-        print(f"[{h}] Status: {data['status']} | Docker: {data['docker']} | Container: {data['container']} | Model: {data['active_model']} | Temp: {temp} | Util: {util} | Memory: {mem}")
-    print("-" * 75)
+        print(f"[{h}] Docker: {data['docker_status']} | Container: {data['container_name']} ({data['container_state']}) | Model: {data['active_model']} | Status: {data['model_status']} | ETA: {data['eta_display']} | Temp: {temp} | Util: {util} | Memory: {mem}")
+    print("-" * 85)
 
     catalog_data = load_model_catalog().get("catalog", {}).get("models", {})
     models = list(catalog_data.keys())
