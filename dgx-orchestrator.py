@@ -201,6 +201,23 @@ def detect_model_stage(ip: str, user: str, c_name: str) -> str:
 
     return "NOT READY - INITIALIZING"
 
+def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
+    """
+    Calculates historical moving average of container startup times.
+    Returns tuple of (estimated_seconds, has_historical_data).
+    """
+    default_est = 600 if "deepseek" in model.lower() else 180
+    if not LOAD_TIMES_PATH.exists():
+        return default_est, False
+    try:
+        data = json.loads(LOAD_TIMES_PATH.read_text())
+        times = data.get(f"{model}::{topo_key}", [])
+        if times:
+            return int(sum(times) / len(times)), True
+    except Exception:
+        pass
+    return default_est, False
+
 def get_cluster_status() -> dict:
     """
     Returns a full state map of Docker daemons, models, health, and telemetry across all nodes.
@@ -272,16 +289,22 @@ def get_cluster_status() -> dict:
                 else:
                     model_status = detect_model_stage(ip, user, active_container)
                     
-                    # Calculate ETA using Docker start time vs historical averages
                     time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
                     if time_res.returncode == 0 and time_res.stdout.strip():
                         start_ts = parse_iso_time(time_res.stdout.strip())
                         elapsed = time.time() - start_ts
                         topo_key = "2_node" if active_container in ["vllm-head", "vllm-worker"] else "1_node"
-                        est_total = get_estimated_load_time(loaded_model, topo_key)
+                        est_total, has_history = get_estimated_load_time(loaded_model, topo_key)
                         remaining = max(0, int(est_total - elapsed))
                         eta_seconds = remaining
-                        eta_display = f"~{remaining}s remaining" if remaining > 0 else "Finishing startup..."
+                        
+                        if has_history:
+                            eta_display = f"~{remaining}s remaining" if remaining > 0 else "Finishing startup..."
+                        else:
+                            if remaining > 0:
+                                eta_display = f"~{remaining}s remaining (Guesstimate - insufficient historic data)"
+                            else:
+                                eta_display = "Finishing startup... (No historic data)"
             elif active_container != "None":
                 model_status = f"STOPPED ({container_state.upper()})"
                 eta_display = "N/A"
@@ -355,19 +378,9 @@ def load_model_catalog() -> dict:
     except Exception as e:
         return {"error": str(e), "catalog": {"models": {}}}
 
-def get_estimated_load_time(model: str, topo_key: str) -> int:
-    """Calculates historical moving average of container startup times."""
-    if not LOAD_TIMES_PATH.exists(): return 90
-    try:
-        data = json.loads(LOAD_TIMES_PATH.read_text())
-        times = data.get(f"{model}::{topo_key}", [])
-        if times: return int(sum(times) / len(times))
-    except Exception: pass
-    return 90
-
 def record_load_time(model: str, topo_key: str, duration_sec: int):
     """Saves startup telemetry to inform the UI of expected wait times."""
-    if duration_sec > 300 or duration_sec < 5: return
+    if duration_sec > 1800 or duration_sec < 5: return
     data = {}
     if LOAD_TIMES_PATH.exists():
         try: data = json.loads(LOAD_TIMES_PATH.read_text())
@@ -676,7 +689,7 @@ def interactive_menu():
         print(f"\nAvailable Topologies for {selected_model}:")
         topo_keys = list(topologies.keys())
         for idx, t in enumerate(topo_keys, 1):
-            est = get_estimated_load_time(selected_model, t)
+            est, _ = get_estimated_load_time(selected_model, t)
             print(f"  {idx}. {t} (Est. Warm Load Time: ~{est}s)")
 
         t_choice = input("Select topology number: ").strip()
