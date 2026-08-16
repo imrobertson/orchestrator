@@ -69,8 +69,11 @@ models:
   # ============================================================================
   # DEEPSEEK FAMILY
   # ============================================================================
+  # MASSIVE update using custom build of the vllm docker from community eugr
+  # =========================================================================== 
   deepseek-v4-flash-nvfp4:
     hf_path: Rarri/DeepSeek-V4-Flash-0731-NVFP4
+    image: eugr/spark-vllm-b12x:latest
     gpu_util: 0.70
     topologies:
       2_node:
@@ -78,11 +81,13 @@ models:
         tp_size: 1
         pp_size: 2
         env_vars:
+          - VLLM_USE_V1=0
+          - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+          - VLLM_USE_BREAKABLE_CUDAGRAPH=0
+          - DG_JIT_USE_NVRTC=0
           - OMP_NUM_THREADS=16
-          - VLLM_CPU_OMP_THREADS=16
           - TORCHINDUCTOR_AUTOGRAD_CACHE=0
           - TORCHINDUCTOR_FX_GRAPH_CACHE=0
-          - DG_JIT_USE_NVRTC=0
           - NCCL_CUMEM_ENABLE=0
           - NCCL_IB_GID_INDEX=3
           - NCCL_SOCKET_IFNAME=enp1s0f0np0
@@ -91,31 +96,8 @@ models:
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
           --distributed-executor-backend mp --enable-ep-weight-filter
           --attention-config '{"use_fp4_indexer_cache": true}'
-          --moe-backend flashinfer_cutlass --compilation-config '{"mode": 0}'
+          --compilation-config '{"mode": 0}'
 
-  deepseek-r1-nvfp4:
-    hf_path: unsloth/DeepSeek-R1-NVFP4
-    gpu_util: 0.70
-    topologies:
-      2_node:
-        max_model_len: 65536
-        tp_size: 1
-        pp_size: 2
-        env_vars:
-          - OMP_NUM_THREADS=16
-          - VLLM_CPU_OMP_THREADS=16
-          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
-          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
-          - DG_JIT_USE_NVRTC=0
-          - NCCL_CUMEM_ENABLE=0
-          - NCCL_IB_GID_INDEX=3
-          - NCCL_SOCKET_IFNAME=enp1s0f0np0
-          - GLOO_SOCKET_IFNAME=enp1s0f0np0
-        vllm_args: >-
-          --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
-          --distributed-executor-backend mp --reasoning-parser deepseek_r1
-          --enable-chunked-prefill --enforce-eager
-          --moe-backend flashinfer_cutlass --compilation-config '{"mode": 0}'
 
   deepseek-r1-distill-qwen-32b:
     hf_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B

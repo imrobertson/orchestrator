@@ -427,7 +427,7 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
             "-v", patch_mount
         ] + env_flags + [image_tag] + container_args
 
-        res = run_ssh(ip, "tetrel", docker_cmd, timeout=15)
+        res = run_ssh(ip, "tetrel", docker_cmd, timeout=60)
         if res.returncode != 0:
             return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
     else:
@@ -483,7 +483,7 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str) -> dict:
                 "-v", patch_mount
             ] + env_flags + [image_tag] + container_args
 
-            res = run_ssh(ip, "tetrel", docker_cmd, timeout=15)
+            res = run_ssh(ip, "tetrel", docker_cmd, timeout=60)
             if res.returncode != 0:
                 return {"status": "error", "message": f"Docker run failed on {host}: {res.stderr}"}
 
