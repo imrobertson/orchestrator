@@ -23,6 +23,7 @@
             flex-direction: column; 
             height: 100vh; 
             box-sizing: border-box;
+            overflow: hidden; /* Locks body scroll so log box dynamically expands */
         }
         
         /* Header */
@@ -42,12 +43,12 @@
         .net-badge { font-size: 12px; padding: 4px 10px; border-radius: 6px; font-weight: bold; cursor: pointer; display: inline-block; transition: all 0.2s ease; border: 1px solid transparent; }
         .net-badge:hover { filter: brightness(1.2); }
 
-        /* Top Layout: Hosts + Deployer */
+        /* Top Layout: Anchored Hosts + Deployer */
         .dashboard-top {
             display: grid;
             grid-template-columns: 2fr 1fr;
             gap: 15px;
-            flex-shrink: 0;
+            flex-shrink: 0; /* Prevents telemetry cards from shrinking */
         }
         .hosts-grid {
             display: grid;
@@ -112,16 +113,32 @@
         .btn-danger { background: #dc2626; margin-top: 8px; }
         .btn-danger:hover:not(:disabled) { background: #b91c1c; }
 
-        /* Logs Section */
+        /* Logs Section - Fills remaining screen space with min 300px height */
         .log-section {
+            margin-top: 15px;
             flex-grow: 1;
             display: flex;
             flex-direction: column;
-            margin-top: 15px;
-            min-height: 0;
+            min-height: 300px; /* Minimum guaranteed log box height */
+            min-width: 0;
         }
-        .log-card { margin: 0; flex-grow: 1; padding: 15px; }
-        .log-header-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; margin-bottom: 10px; }
+        .log-card { 
+            margin: 0; 
+            padding: 15px; 
+            flex-grow: 1; 
+            display: flex; 
+            flex-direction: column; 
+            min-height: 0; 
+        }
+        .log-header-row { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            border-bottom: 1px solid var(--border-color); 
+            padding-bottom: 10px; 
+            margin-bottom: 10px; 
+            flex-shrink: 0;
+        }
         .log-header-row h2 { margin: 0; border: none; padding: 0; }
         .log-header-row select { width: auto; min-height: 32px; padding: 4px 10px; margin: 0; font-size: 12px; }
         
@@ -131,17 +148,18 @@
             border-radius: 6px; 
             font-size: 12px; 
             color: #cbd5e1; 
-            flex-grow: 1; 
             margin: 0; 
+            flex-grow: 1;
             overflow-y: auto; 
             white-space: pre-wrap; 
             word-wrap: break-word; 
+            font-family: monospace;
         }
 
         @media (max-width: 1024px) {
             body { height: auto; min-height: 100vh; overflow-y: auto; }
             .dashboard-top { grid-template-columns: 1fr; }
-            .log-section { height: 50vh; min-height: 400px; flex-grow: 0; }
+            .log-section { height: 450px; min-height: 300px; flex-grow: 0; }
         }
         @media (max-width: 650px) {
             .hosts-grid { grid-template-columns: 1fr; }
@@ -222,6 +240,10 @@
     let currentLogHost = 'spark-4';
     let currentOfflineState = false;
     let globalCatalog = {};
+
+    function stripAnsiCodes(str) {
+        return str.replace(/[\u001b\u009b]\[[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqv-y]/g, '');
+    }
 
     async function fetchStatus() {
         try {
@@ -367,7 +389,9 @@
             const logBox = document.getElementById('logBox');
             
             const isScrolledToBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 20;
-            logBox.innerText = data.logs.join('\n');
+            const cleanLogs = (data.logs || []).map(line => stripAnsiCodes(line)).join('\n');
+            logBox.innerText = cleanLogs;
+
             if (isScrolledToBottom) {
                 logBox.scrollTop = logBox.scrollHeight;
             }

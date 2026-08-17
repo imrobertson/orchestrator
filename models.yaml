@@ -91,7 +91,6 @@ models:
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
           --enable-ep-weight-filter --enforce-eager --tokenizer-mode deepseek_v4
           --distributed-executor-backend ray
-          --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'
 
   deepseek-v4-flash-nvfp4:
     hf_path: Rarri/DeepSeek-V4-Flash-0731-NVFP4

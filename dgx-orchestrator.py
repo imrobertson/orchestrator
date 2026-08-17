@@ -15,6 +15,7 @@ import getpass
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -192,6 +193,24 @@ def detect_model_stage(ip: str, user: str, c_name: str) -> str:
 
     return "NOT READY - INITIALIZING"
 
+def record_load_time(model: str, topo_key: str, duration_sec: int):
+    if duration_sec > 1800 or duration_sec < 60: return
+    data = {}
+    if LOAD_TIMES_PATH.exists():
+        try: data = json.loads(LOAD_TIMES_PATH.read_text())
+        except Exception: data = {}
+    key = f"{model}::{topo_key}"
+    
+    # Avoid recording duplicate exact entries from continuous health polls
+    existing = data.get(key, [])
+    if existing and existing[-1] == duration_sec:
+        return
+
+    data.setdefault(key, []).append(duration_sec)
+    data[key] = data[key][-20:]
+    try: LOAD_TIMES_PATH.write_text(json.dumps(data, indent=2))
+    except Exception: pass
+
 def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
     default_est = 700 if "deepseek" in model.lower() else 180
     if not LOAD_TIMES_PATH.exists():
@@ -235,6 +254,8 @@ def get_cluster_status() -> dict:
 
     cluster_ready = check_vllm_health(HOSTS["spark-4"]["ip"])
     vllm_metrics = get_vllm_metrics(HOSTS["spark-4"]["ip"]) if cluster_ready else {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
+
+    catalog_models = load_model_catalog().get("catalog", {}).get("models", {})
 
     status_data = {
         "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S EST"),
@@ -298,20 +319,35 @@ def get_cluster_status() -> dict:
             if active_container != "None" and loaded_model in ["None", "Active Container"] and discovered_head_model != "None":
                 loaded_model = discovered_head_model
 
+            # Model key normalization for load_times.json matching
+            matched_key = loaded_model
+            if catalog_models and isinstance(catalog_models, dict):
+                for cat_key, cat_data in catalog_models.items():
+                    hf_path = cat_data.get("hf_path", "")
+                    if hf_path.endswith(loaded_model) or cat_key == loaded_model or loaded_model in hf_path:
+                        matched_key = cat_key
+                        break
+
             eta_seconds = 0
             eta_display = "Ready" if cluster_ready else "N/A"
+            topo_key = "2_node" if active_container in ["vllm-head", "vllm-worker"] else "1_node"
 
             if active_container != "None" and container_state == "running":
                 if cluster_ready:
                     model_status = "READY"
+                    if host == "spark-4":
+                        time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
+                        if time_res.returncode == 0 and time_res.stdout.strip():
+                            start_ts = parse_iso_time(time_res.stdout.strip())
+                            elapsed = int(time.time() - start_ts)
+                            record_load_time(matched_key, topo_key, elapsed)
                 else:
                     model_status = detect_model_stage(ip, user, active_container)
                     time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
                     if time_res.returncode == 0 and time_res.stdout.strip():
                         start_ts = parse_iso_time(time_res.stdout.strip())
                         elapsed = int(time.time() - start_ts)
-                        topo_key = "2_node" if active_container in ["vllm-head", "vllm-worker"] else "1_node"
-                        est_total, has_history = get_estimated_load_time(loaded_model, topo_key)
+                        est_total, has_history = get_estimated_load_time(matched_key, topo_key)
                         remaining = est_total - elapsed
                         eta_seconds = max(0, remaining)
                         
@@ -391,18 +427,6 @@ def load_model_catalog() -> dict:
         return {"catalog": config}
     except Exception as e:
         return {"error": str(e), "catalog": {"models": {}}}
-
-def record_load_time(model: str, topo_key: str, duration_sec: int):
-    if duration_sec > 1800 or duration_sec < 60: return
-    data = {}
-    if LOAD_TIMES_PATH.exists():
-        try: data = json.loads(LOAD_TIMES_PATH.read_text())
-        except Exception: data = {}
-    key = f"{model}::{topo_key}"
-    data.setdefault(key, []).append(duration_sec)
-    data[key] = data[key][-20:]
-    try: LOAD_TIMES_PATH.write_text(json.dumps(data, indent=2))
-    except Exception: pass
 
 def execute_teardown(target_hosts: list = None) -> dict:
     results = {}
@@ -697,8 +721,11 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
     c_name = containers[0]
     log_res = run_ssh(ip, "tetrel", ["docker", "logs", "--tail", str(tail), c_name], timeout=10)
     
-    logs = log_res.stdout.splitlines() if log_res.returncode == 0 else log_res.stderr.splitlines()
-    return {"logs": logs if logs else ["Log buffer empty."]}
+    raw_logs = log_res.stdout.splitlines() if log_res.returncode == 0 else log_res.stderr.splitlines()
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    clean_logs = [ansi_escape.sub('', line) for line in raw_logs]
+
+    return {"logs": clean_logs if clean_logs else ["Log buffer empty."]}
 
 def interactive_menu():
     print("=== [ TETREL SECURITY ] DGX Cluster Orchestrator ===")
