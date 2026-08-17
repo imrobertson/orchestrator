@@ -1,0 +1,17 @@
+Starting 3-pass benchmark against spark-4...
+
+--- Run 1 (Cold Start) ---
+  TTFT:  0.01s | Decode Speed: 1398101.33 tokens/sec (1 tokens)
+
+--- Run 2 (Warm Pass) ---
+  TTFT:  0.00s | Decode Speed: 4194304.00 tokens/sec (1 tokens)
+
+--- Run 3 (Warm Pass) ---
+  TTFT:  0.00s | Decode Speed: 2097152.00 tokens/sec (1 tokens)
+
+==================================================
+SUMMARY RESULTS
+==================================================
+Cold Start (Run 1): TTFT 0.01s | Speed 1398101.33 tok/s
+Warm Avg (Runs 2-3): TTFT 0.00s | Speed 3145728.00 tok/s
+==================================================

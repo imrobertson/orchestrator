@@ -1,5 +1,5 @@
-
-## ============================================================================== TETREL SECURITY - DGX CLUSTER MODEL INVENTORY
+## ==============================================================================
+# TETREL SECURITY - DGX CLUSTER MODEL INVENTORY
 # ==============================================================================
 # RUNTIME ASSUMPTIONS:
 # - Hardware: Dual DGX Spark (Grace Blackwell GB10, LPDDR5x Unified Memory).
@@ -69,7 +69,6 @@ models:
   # ============================================================================
   # DEEPSEEK FAMILY
   # ============================================================================
-models:
   deepseek-v4-flash:
     hf_path: deepseek-ai/DeepSeek-V4-Flash
     image: eugr/spark-vllm-b12x:latest
@@ -90,14 +89,14 @@ models:
           --attention-backend B12X_ATTN --moe-backend b12x
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
           --enforce-eager --tokenizer-mode deepseek_v4
-          --distributed-executor-backend ray
+          --distributed-executor-backend mp
           --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
           --block-size 256
- 
-   deepseek-v4-flash-nvfp4:
+
+  deepseek-v4-flash-nvfp4:
     hf_path: nvidia/DeepSeek-V4-Flash-NVFP4
     image: eugr/spark-vllm-b12x:latest
-    gpu_util: 0.82
+    gpu_util: 0.70
     topologies:
       2_node:
         max_model_len: 32768
@@ -111,13 +110,13 @@ models:
           - NCCL_SOCKET_IFNAME=enp1s0f0np0
           - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
-          --quantization modelopt_fp4 --attention-backend B12X_ATTN --moe-backend b12x
+          --quantization modelopt_fp4 --attention-backend B12X_ATTN --moe-backend flashinfer_cutlass
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
           --enforce-eager --tokenizer-mode deepseek_v4
           --distributed-executor-backend ray
           --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
           --block-size 256
-  
+
   deepseek-r1-distill-qwen-32b:
     hf_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
     gpu_util: 0.70
