@@ -75,19 +75,24 @@ def resolve_user_identity_key() -> str:
     return str(SHARED_KEY_PATH)
 
 def get_hf_token() -> str:
-    """Extracts HuggingFace authentication token from environment or local cache."""
+    """Extracts HuggingFace authentication token with safe fallbacks and warnings."""
+    # Priority 1: Check active environment variable
     if "HF_TOKEN" in os.environ and os.environ["HF_TOKEN"].strip():
         return os.environ["HF_TOKEN"].strip()
     
+    # Priority 2: Check the local .secrets file
     secrets_file = BASE_DIR / ".secrets"
     if secrets_file.exists():
         try:
             for line in secrets_file.read_text().splitlines():
                 if line.startswith("HF_TOKEN="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except PermissionError:
+            print(f"[!] Warning: You do not have permission to read {secrets_file}. Checking local cache...")
         except Exception:
             pass
 
+    # Priority 3: Fallback to the user's personal huggingface-cli login cache
     hf_token_file = Path.home() / ".cache" / "huggingface" / "token"
     if hf_token_file.exists():
         try:
@@ -95,6 +100,9 @@ def get_hf_token() -> str:
         except Exception:
             pass
 
+    # Safe Fallback: Warn the user but do not crash the script
+    print("[!] Warning: No HF_TOKEN found in env, .secrets, or ~/.cache. Gated models may fail to download.")
+    print("[!] -> Fix: Run 'export HF_TOKEN=your_token' before running this script.")
     return ""
 
 def run_ssh(ip: str, user: str, command_list: list, capture: bool = True, timeout: int = 10) -> subprocess.CompletedProcess:
@@ -176,7 +184,8 @@ def parse_iso_time(ts_str: str) -> float:
 
 def detect_model_stage(ip: str, user: str, c_name: str) -> str:
     """Inspects recent log output from bottom to top so the active phase takes priority."""
-    res = run_ssh(ip, user, ["docker", "logs", "--tail", "30", c_name], timeout=5)
+    # Extended tail to 150 to prevent Ray/Compilation output from pushing initialization status out of bounds
+    res = run_ssh(ip, user, ["docker", "logs", "--tail", "150", c_name], timeout=10)
     lines = [l.strip() for l in (res.stdout + res.stderr).splitlines() if l.strip()]
 
     for line in reversed(lines):
@@ -194,7 +203,7 @@ def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
     Calculates historical moving average of container startup times.
     Returns (estimated_seconds, has_historical_data).
     """
-    default_est = 600 if "deepseek" in model.lower() else 180
+    default_est = 700 if "deepseek" in model.lower() else 180
     if not LOAD_TIMES_PATH.exists():
         return default_est, False
     try:
@@ -229,7 +238,7 @@ def get_cluster_status() -> dict:
     for host, meta in HOSTS.items():
         ip = meta["ip"]
         user = "tetrel"
-        res = run_ssh(ip, user, ["docker", "ps", "-a", "--format", "{{.Names}}::{{.State}}::{{.Image}}"], timeout=15)
+        res = run_ssh(ip, user, ["docker", "ps", "-a", "--format", "{{.Names}}::{{.State}}::{{.Image}}"], timeout=10)
         
         if res.returncode == 0:
             active_container, container_state, loaded_model = "None", "None", "None"
@@ -255,10 +264,23 @@ def get_cluster_status() -> dict:
                                             discovered_head_model = loaded_model
                             except Exception:
                                 loaded_model = "Active Container"
-                        elif discovered_head_model != "None":
-                            loaded_model = discovered_head_model
                         else:
-                            loaded_model = "Active Container"
+                            # Fallback model extraction for Ray detached execution where CMD is 'ray start'
+                            ps_res = run_ssh(ip, user, ["docker", "exec", c_name, "ps", "aux"], timeout=10)
+                            if ps_res.returncode == 0 and "--model" in ps_res.stdout:
+                                try:
+                                    for part in ps_res.stdout.split():
+                                        if "/" in part and ("DeepSeek" in part or "Qwen" in part or "Llama" in part or "model" in part or "gemma" in part):
+                                            loaded_model = part.split("/")[-1]
+                                            if host == "spark-4":
+                                                discovered_head_model = loaded_model
+                                            break
+                                except Exception:
+                                    loaded_model = "Active Container"
+                            elif discovered_head_model != "None":
+                                loaded_model = discovered_head_model
+                            else:
+                                loaded_model = "Active Container"
                         break
 
             if active_container != "None" and loaded_model in ["None", "Active Container"] and discovered_head_model != "None":
@@ -479,6 +501,9 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
     except Exception:
         vllm_args_list = vllm_args_raw.split()
 
+    # Detect if Ray multi-node is explicitly requested in models.yaml vllm_args
+    use_ray = (nodes > 1) and ("--distributed-executor-backend" in vllm_args_list) and ("ray" in vllm_args_list)
+
     execute_teardown(target_hosts=target_hosts)
 
     for h in target_hosts:
@@ -527,6 +552,7 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
         if res.returncode != 0:
             return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
     else:
+        vllm_head_args = None
         for host in target_hosts:
             ip = HOSTS[host]["ip"]
             role_name = "vllm-head" if host == head else "vllm-worker"
@@ -564,9 +590,23 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
                 "--gpu-memory-utilization", str(gpu_util),
                 "--max-model-len", str(max_model_len)
             ]
-            if node_rank > 0 and "--headless" not in vllm_args_list:
+            
+            # vLLM V0 multi-node requires worker nodes to run headless
+            if not use_ray and node_rank > 0 and "--headless" not in vllm_args_list:
                 container_args.append("--headless")
+            
             container_args.extend(vllm_args_list)
+
+            if host == head:
+                vllm_head_args = container_args
+
+            if use_ray:
+                if host == head:
+                    entrypoint_cmd = ["ray", "start", "--head", "--port=6379", "--block"]
+                else:
+                    entrypoint_cmd = ["ray", "start", f"--address={head_ip}:6379", "--block"]
+            else:
+                entrypoint_cmd = container_args
 
             docker_cmd = [
                 "docker", "run", "-d",
@@ -579,22 +619,39 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
                 "-v", vol_mount,
                 "-v", patch_mount,
                 "-v", compat_mount
-            ] + env_flags + [image_tag] + container_args
+            ] + env_flags + [image_tag] + entrypoint_cmd
 
             res = run_ssh(ip, "tetrel", docker_cmd, timeout=60)
             if res.returncode != 0:
                 return {"status": "error", "message": f"Docker run failed on {host}: {res.stderr}"}
 
+        if use_ray and vllm_head_args:
+            print("[+] Waiting for Ray cluster to register worker nodes (max 60s)...")
+            worker_hosts = [k for k, v in HOSTS.items() if v["role"] == "worker"]
+            worker_ip = HOSTS[worker_hosts[0]]["ip"] if worker_hosts else ""
+            
+            for _ in range(30):
+                check_ray = run_ssh(head_ip, "tetrel", ["docker", "exec", "vllm-head", "ray", "status"], timeout=10)
+                if check_ray.returncode == 0 and (worker_ip in check_ray.stdout or "2 active nodes" in check_ray.stdout or "Healthy: 2" in check_ray.stdout):
+                    break
+                time.sleep(2)
+            
+            # Exec vllm inside the head node and pipe output to stdout so it appears in `docker logs vllm-head`
+            exec_str = " ".join(shlex.quote(arg) for arg in vllm_head_args)
+            vllm_exec_cmd = ["docker", "exec", "-d", "vllm-head", "bash", "-c", f"{exec_str} > /proc/1/fd/1 2>&1"]
+            run_ssh(head_ip, "tetrel", vllm_exec_cmd, timeout=30)
+
     time.sleep(4)
     for host in target_hosts:
         ip = HOSTS[host]["ip"]
-        check_res = run_ssh(ip, "tetrel", ["docker", "ps", "-a", "--format", "{{.Names}}"], timeout=5)
+        check_res = run_ssh(ip, "tetrel", ["docker", "ps", "--filter", "status=running", "--format", "{{.Names}}"], timeout=10)
         running = [c.strip() for c in check_res.stdout.splitlines() if c.strip() in ["vllm-standalone", "vllm-head", "vllm-worker"]]
+        
         if not running:
             target_role = "vllm-standalone" if nodes == 1 else ("vllm-head" if host == head else "vllm-worker")
-            log_res = run_ssh(ip, "tetrel", ["docker", "logs", "--tail", "30", target_role], timeout=5)
+            log_res = run_ssh(ip, "tetrel", ["docker", "logs", "--tail", "50", target_role], timeout=10)
             err_log = log_res.stdout.strip() or log_res.stderr.strip() or "No logs captured."
-            return {"status": "error", "message": f"Container '{target_role}' crashed on {host}.\nLogs:\n{err_log}"}
+            return {"status": "error", "message": f"Container '{target_role}' crashed on {host} immediately after startup.\nLogs:\n{err_log}"}
 
     if wait or run_benchmark:
         head_ip = HOSTS[head]["ip"]
@@ -622,7 +679,7 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
     if host not in HOSTS: return {"logs": ["Invalid target host specified."]}
     
     ip = HOSTS[host]["ip"]
-    res = run_ssh(ip, "tetrel", ["docker", "ps", "-a", "--format", "{{.Names}}"], timeout=5)
+    res = run_ssh(ip, "tetrel", ["docker", "ps", "-a", "--format", "{{.Names}}"], timeout=10)
     if res.returncode != 0: return {"logs": ["Failed to connect to host."]}
 
     containers = [c.strip() for c in res.stdout.strip().splitlines() if c.strip() in ["vllm-standalone", "vllm-head", "vllm-worker"]]
