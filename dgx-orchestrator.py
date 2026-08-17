@@ -563,7 +563,10 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
                 "--master-port", "29500",
                 "--gpu-memory-utilization", str(gpu_util),
                 "--max-model-len", str(max_model_len)
-            ] + vllm_args_list
+            ]
+            if node_rank > 0 and "--headless" not in vllm_args_list:
+                container_args.append("--headless")
+            container_args.extend(vllm_args_list)
 
             docker_cmd = [
                 "docker", "run", "-d",
