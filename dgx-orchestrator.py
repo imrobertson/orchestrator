@@ -47,6 +47,7 @@ HOSTS = {
 }
 
 NETWORK_STATE_FILE = BASE_DIR / ".network_mode"
+ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9?]*[ -/]*[@-~])')
 
 
 # --- Core Helpers ---
@@ -179,17 +180,19 @@ def parse_iso_time(ts_str: str) -> float:
         return time.time()
 
 def detect_model_stage(ip: str, user: str, c_name: str) -> str:
-    """Inspects recent log output from bottom to top so the active phase takes priority."""
-    res = run_ssh(ip, user, ["docker", "logs", "--tail", "150", c_name], timeout=10)
-    lines = [l.strip() for l in (res.stdout + res.stderr).splitlines() if l.strip()]
+    """Inspects recent log output with ANSI stripping and case insensitivity."""
+    res = run_ssh(ip, user, ["docker", "logs", "--tail", "250", c_name], timeout=10)
+    raw_text = res.stdout + res.stderr
+    clean_text = ANSI_ESCAPE.sub('', raw_text)
+    lines = [l.strip().lower() for l in clean_text.splitlines() if l.strip()]
 
     for line in reversed(lines):
-        if any(k in line for k in ["Loading weights", "safetensors", "shard", "Loading model"]):
-            return "NOT READY - LOADING SHARDS"
-        if any(k in line for k in ["Warming up", "KV cache", "graph", "mHC warmup", "profiling"]):
+        if any(k in line for k in ["warming up", "warmup", "kv cache", "cuda graph", "mhc", "profiling", "capturing", "graph capture"]):
             return "NOT READY - WARMUP"
-        if any(k in line for k in ["TileLang", "DeepGEMM", "kernel", "compiling", "JIT"]):
+        if any(k in line for k in ["tilelang", "deepgemm", "kernel", "compiling", "jit", "tuning", "building"]):
             return "NOT READY - COMPILING KERNELS"
+        if any(k in line for k in ["loading weights", "safetensors", "shard", "loading model", "checkpoint"]):
+            return "NOT READY - LOADING SHARDS"
 
     return "NOT READY - INITIALIZING"
 
@@ -201,7 +204,6 @@ def record_load_time(model: str, topo_key: str, duration_sec: int):
         except Exception: data = {}
     key = f"{model}::{topo_key}"
     
-    # Avoid recording duplicate exact entries from continuous health polls
     existing = data.get(key, [])
     if existing and existing[-1] == duration_sec:
         return
@@ -467,41 +469,9 @@ def execute_sync() -> dict:
         results[host] = "Synced models.yaml" if res.returncode == 0 else f"Failed: {res.stderr.strip()}"
     return {"status": "success", "details": results}
 
-def ensure_container_patch(target_hosts: list):
-    patch_path = BASE_DIR / "vllm_gb10_patch.py"
-    patch_content = """import os, sys
-main_mod = sys.modules.get("__main__")
-if main_mod and not hasattr(main_mod, "launcher"):
-    setattr(main_mod, "launcher", lambda *args, **kwargs: None)
-
-target = "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py"
-if os.path.exists(target):
-    try:
-        with open(target, "r") as f:
-            content = f.read()
-        old_str = "return Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16"
-        new_str = "return Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8"
-        if old_str in content:
-            content = content.replace(old_str, new_str)
-            with open(target, "w") as f:
-                f.write(content)
-    except Exception:
-        pass
-"""
-    if not patch_path.exists() or patch_path.read_text() != patch_content:
-        patch_path.write_text(patch_content)
-        patch_path.chmod(0o664)
-
-    escaped_patch = shlex.quote(patch_content)
-    for host in target_hosts:
-        ip = HOSTS[host]["ip"]
-        cmd = ["bash", "-c", f"mkdir -p /opt/dgx-cluster-control && echo {escaped_patch} > /opt/dgx-cluster-control/vllm_gb10_patch.py"]
-        run_ssh(ip, "tetrel", cmd, timeout=10)
-
 def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False) -> dict:
     deploy_start_time = time.time()
     target_hosts = ["spark-4", "spark-3"] if nodes == 2 else [head]
-    ensure_container_patch(target_hosts)
     
     catalog_resp = load_model_catalog()
     models_catalog = catalog_resp.get("catalog", {}).get("models", {})
@@ -541,7 +511,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
     image_tag = model_config.get("image", default_img)
 
     vol_mount = "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
-    patch_mount = "/opt/dgx-cluster-control/vllm_gb10_patch.py:/usr/local/lib/python3.12/dist-packages/sitecustomize.py"
     compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"
     
     head_ip = HOSTS[head]["ip"]
@@ -571,7 +540,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
             "--net=host", "--ipc=host", "--shm-size=16gb",
             "--gpus", "all",
             "-v", vol_mount,
-            "-v", patch_mount,
             "-v", compat_mount
         ] + env_flags + [image_tag] + container_args
 
@@ -651,7 +619,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
                 "--device", "/dev/infiniband:/dev/infiniband",
                 "--gpus", "all",
                 "-v", vol_mount,
-                "-v", patch_mount,
                 "-v", compat_mount
             ] + env_flags + [image_tag] + entrypoint_cmd
 
@@ -719,13 +686,23 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
     if not containers: return {"logs": ["No active vLLM containers on this node."]}
 
     c_name = containers[0]
-    log_res = run_ssh(ip, "tetrel", ["docker", "logs", "--tail", str(tail), c_name], timeout=10)
+    # Fetch a larger tail buffer from Docker to compensate for filtered health/metrics requests
+    fetch_tail = max(tail * 5, 400)
+    log_res = run_ssh(ip, "tetrel", ["docker", "logs", "--tail", str(fetch_tail), c_name], timeout=10)
     
     raw_logs = log_res.stdout.splitlines() if log_res.returncode == 0 else log_res.stderr.splitlines()
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-    clean_logs = [ansi_escape.sub('', line) for line in raw_logs]
+    clean_logs = [ANSI_ESCAPE.sub('', line) for line in raw_logs]
 
-    return {"logs": clean_logs if clean_logs else ["Log buffer empty."]}
+    # Suppress HTTP health check and Prometheus metrics polling requests
+    filtered_logs = [
+        line for line in clean_logs 
+        if not any(endpoint in line for endpoint in ["GET /health", "GET /metrics"])
+    ]
+
+    # Retain the exact requested line depth from the filtered log buffer
+    final_logs = filtered_logs[-tail:] if len(filtered_logs) > tail else filtered_logs
+
+    return {"logs": final_logs if final_logs else ["Log buffer empty."]}
 
 def interactive_menu():
     print("=== [ TETREL SECURITY ] DGX Cluster Orchestrator ===")

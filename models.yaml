@@ -69,57 +69,55 @@ models:
   # ============================================================================
   # DEEPSEEK FAMILY
   # ============================================================================
-  deepseek-v4-flash:
-    hf_path: deepseek-ai/DeepSeek-V4-Flash-0731
+models:
+  deepseek-v4-flash-dspark:
+    hf_path: deepseek-ai/DeepSeek-V4-Flash-DSpark
     image: eugr/spark-vllm-b12x:latest
-    gpu_util: 0.70
+    gpu_util: 0.82
     topologies:
       2_node:
-        max_model_len: 65536
+        max_model_len: 32768
         tp_size: 2
         pp_size: 1
         env_vars:
           - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
           - OMP_NUM_THREADS=16
-          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
-          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
           - NCCL_CUMEM_ENABLE=0
           - NCCL_IB_GID_INDEX=3
           - NCCL_SOCKET_IFNAME=enp1s0f0np0
           - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
+          --attention-backend B12X_ATTN --moe-backend b12x
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
           --enable-ep-weight-filter --enforce-eager --tokenizer-mode deepseek_v4
           --distributed-executor-backend ray
+          --speculative-config dspark --num-speculative-tokens 5
+          --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
+          --block-size 256 --enable-expert-parallel
 
   deepseek-v4-flash-nvfp4:
-    hf_path: Rarri/DeepSeek-V4-Flash-0731-NVFP4
+    hf_path: deepseek-ai/DeepSeek-V4-Flash-NVFP4
     image: eugr/spark-vllm-b12x:latest
-    gpu_util: 0.70
+    gpu_util: 0.82
     topologies:
       2_node:
-        max_model_len: 65536
+        max_model_len: 32768
         tp_size: 2
         pp_size: 1
         env_vars:
           - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
-          - VLLM_USE_BREAKABLE_CUDAGRAPH=0
-          - DG_JIT_USE_NVRTC=0
           - OMP_NUM_THREADS=16
-          - TORCHINDUCTOR_AUTOGRAD_CACHE=0
-          - TORCHINDUCTOR_FX_GRAPH_CACHE=0
           - NCCL_CUMEM_ENABLE=0
           - NCCL_IB_GID_INDEX=3
           - NCCL_SOCKET_IFNAME=enp1s0f0np0
           - GLOO_SOCKET_IFNAME=enp1s0f0np0
         vllm_args: >-
+          --quantization modelopt_fp4 --attention-backend B12X_ATTN --moe-backend b12x
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
-          --enable-ep-weight-filter
-          --attention-config '{"use_fp4_indexer_cache": true}'
-          --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4
-          --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
-          --compilation-config '{"mode": 0}' --enforce-eager
+          --enable-ep-weight-filter --enforce-eager --tokenizer-mode deepseek_v4
           --distributed-executor-backend ray
+          --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
+          --block-size 256 --enable-expert-parallel
 
   deepseek-r1-distill-qwen-32b:
     hf_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B

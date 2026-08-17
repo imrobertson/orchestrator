@@ -23,7 +23,7 @@
             flex-direction: column; 
             height: 100vh; 
             box-sizing: border-box;
-            overflow: hidden; /* Locks body scroll so log box dynamically expands */
+            overflow: hidden;
         }
         
         /* Header */
@@ -48,7 +48,7 @@
             display: grid;
             grid-template-columns: 2fr 1fr;
             gap: 15px;
-            flex-shrink: 0; /* Prevents telemetry cards from shrinking */
+            flex-shrink: 0;
         }
         .hosts-grid {
             display: grid;
@@ -113,13 +113,23 @@
         .btn-danger { background: #dc2626; margin-top: 8px; }
         .btn-danger:hover:not(:disabled) { background: #b91c1c; }
 
+        /* Status Toast Line */
+        .status-toast {
+            margin-top: 8px;
+            font-size: 12px;
+            font-family: monospace;
+            text-align: center;
+            min-height: 18px;
+            transition: opacity 0.3s ease;
+        }
+
         /* Logs Section - Fills remaining screen space with min 300px height */
         .log-section {
             margin-top: 15px;
             flex-grow: 1;
             display: flex;
             flex-direction: column;
-            min-height: 300px; /* Minimum guaranteed log box height */
+            min-height: 300px;
             min-width: 0;
         }
         .log-card { 
@@ -217,6 +227,7 @@
             <div style="margin-top: auto;">
                 <button id="deployBtn" class="btn" onclick="triggerDeploy()">Deploy Model</button>
                 <button id="teardownBtn" class="btn btn-danger" onclick="triggerTeardown()">Teardown Runtimes</button>
+                <div id="statusToast" class="status-toast"></div>
             </div>
         </div>
     </div>
@@ -243,6 +254,21 @@
 
     function stripAnsiCodes(str) {
         return str.replace(/[\u001b\u009b]\[[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqv-y]/g, '');
+    }
+
+    function showStatusToast(msg, isError = false) {
+        const toast = document.getElementById('statusToast');
+        if (!toast) return;
+        toast.style.color = isError ? '#f87171' : '#38bdf8';
+        toast.innerText = msg;
+        toast.style.opacity = '1';
+
+        setTimeout(() => {
+            if (toast.innerText === msg) {
+                toast.style.opacity = '0';
+                setTimeout(() => { if (toast.style.opacity === '0') toast.innerText = ''; }, 300);
+            }
+        }, 6000);
     }
 
     async function fetchStatus() {
@@ -336,7 +362,7 @@
             });
             fetchStatus();
         } catch(e) {
-            alert('Failed to toggle network mode.');
+            showStatusToast('Failed to toggle network mode.', true);
         }
     }
 
@@ -428,12 +454,12 @@
             
             if (!response.ok) {
                 const errData = await response.json();
-                alert(`Deployment Error: ${errData.detail || response.statusText}`);
+                showStatusToast(`Deployment Error: ${errData.detail || response.statusText}`, true);
             } else {
-                alert('Deployment sequence initiated successfully!');
+                showStatusToast('✓ Deployment sequence initiated');
             }
         } catch(e) {
-            alert('Deployment request failed.');
+            showStatusToast('Deployment request failed.', true);
         } finally {
             btn.innerText = origText;
             btn.disabled = false;
@@ -450,9 +476,9 @@
 
         try {
             await fetch(`${API_BASE}/teardown`, {method: 'POST'});
-            alert('Teardown sequence initiated.');
+            showStatusToast('✓ Teardown sequence initiated');
         } catch(e) {
-            alert('Teardown request failed.');
+            showStatusToast('Teardown request failed.', true);
         } finally {
             btn.innerText = origText;
             btn.disabled = false;
