@@ -76,11 +76,9 @@ def resolve_user_identity_key() -> str:
 
 def get_hf_token() -> str:
     """Extracts HuggingFace authentication token with safe fallbacks and warnings."""
-    # Priority 1: Check active environment variable
     if "HF_TOKEN" in os.environ and os.environ["HF_TOKEN"].strip():
         return os.environ["HF_TOKEN"].strip()
     
-    # Priority 2: Check the local .secrets file
     secrets_file = BASE_DIR / ".secrets"
     if secrets_file.exists():
         try:
@@ -92,7 +90,6 @@ def get_hf_token() -> str:
         except Exception:
             pass
 
-    # Priority 3: Fallback to the user's personal huggingface-cli login cache
     hf_token_file = Path.home() / ".cache" / "huggingface" / "token"
     if hf_token_file.exists():
         try:
@@ -100,9 +97,7 @@ def get_hf_token() -> str:
         except Exception:
             pass
 
-    # Safe Fallback: Warn the user but do not crash the script
     print("[!] Warning: No HF_TOKEN found in env, .secrets, or ~/.cache. Gated models may fail to download.")
-    print("[!] -> Fix: Run 'export HF_TOKEN=your_token' before running this script.")
     return ""
 
 def run_ssh(ip: str, user: str, command_list: list, capture: bool = True, timeout: int = 10) -> subprocess.CompletedProcess:
@@ -184,7 +179,6 @@ def parse_iso_time(ts_str: str) -> float:
 
 def detect_model_stage(ip: str, user: str, c_name: str) -> str:
     """Inspects recent log output from bottom to top so the active phase takes priority."""
-    # Extended tail to 150 to prevent Ray/Compilation output from pushing initialization status out of bounds
     res = run_ssh(ip, user, ["docker", "logs", "--tail", "150", c_name], timeout=10)
     lines = [l.strip() for l in (res.stdout + res.stderr).splitlines() if l.strip()]
 
@@ -199,10 +193,6 @@ def detect_model_stage(ip: str, user: str, c_name: str) -> str:
     return "NOT READY - INITIALIZING"
 
 def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
-    """
-    Calculates historical moving average of container startup times.
-    Returns (estimated_seconds, has_historical_data).
-    """
     default_est = 700 if "deepseek" in model.lower() else 180
     if not LOAD_TIMES_PATH.exists():
         return default_est, False
@@ -215,8 +205,28 @@ def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
         pass
     return default_est, False
 
+
+def get_vllm_metrics(head_ip: str = "10.0.14.43", port: int = 8000) -> dict:
+    """Scrapes vLLM Prometheus endpoint for system throughput (TPS) and request concurrency."""
+    metrics = {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
+    try:
+        url = f"http://{head_ip}:{port}/metrics"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=1.5) as response:
+            content = response.read().decode("utf-8")
+            for line in content.splitlines():
+                if line.startswith("#"): continue
+                if "vllm:avg_generation_throughput_tok_per_s" in line:
+                    metrics["tps"] = round(float(line.split()[-1]), 1)
+                elif "vllm:num_requests_running" in line:
+                    metrics["running_requests"] = int(float(line.split()[-1]))
+                elif "vllm:num_requests_waiting" in line:
+                    metrics["waiting_requests"] = int(float(line.split()[-1]))
+    except Exception:
+        pass
+    return metrics
+
 def get_cluster_status() -> dict:
-    """Returns state map of Docker daemons, models, health, and telemetry across nodes."""
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
         try:
@@ -226,10 +236,15 @@ def get_cluster_status() -> dict:
 
     cluster_ready = check_vllm_health(HOSTS["spark-4"]["ip"])
 
+    vllm_metrics = get_vllm_metrics(HOSTS["spark-4"]["ip"]) if cluster_ready else {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
+
     status_data = {
         "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S EST"),
         "network_mode": "Working in OFFLINE mode" if offline_mode else "Working in ONLINE mode",
         "cluster_ready": cluster_ready,
+        "system_tps": vllm_metrics["tps"],
+        "running_requests": vllm_metrics["running_requests"],
+        "waiting_requests": vllm_metrics["waiting_requests"],
         "hosts": {}
     }
 
@@ -265,7 +280,6 @@ def get_cluster_status() -> dict:
                             except Exception:
                                 loaded_model = "Active Container"
                         else:
-                            # Fallback model extraction for Ray detached execution where CMD is 'ray start'
                             ps_res = run_ssh(ip, user, ["docker", "exec", c_name, "ps", "aux"], timeout=10)
                             if ps_res.returncode == 0 and "--model" in ps_res.stdout:
                                 try:
@@ -294,7 +308,6 @@ def get_cluster_status() -> dict:
                     model_status = "READY"
                 else:
                     model_status = detect_model_stage(ip, user, active_container)
-                    
                     time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
                     if time_res.returncode == 0 and time_res.stdout.strip():
                         start_ts = parse_iso_time(time_res.stdout.strip())
@@ -347,7 +360,6 @@ def get_cluster_status() -> dict:
     return status_data
 
 def load_model_catalog() -> dict:
-    """Loads models.yaml and enforces global offline overrides."""
     if not MODELS_YAML_PATH.exists():
         return {"catalog": {"models": {}}}
     try:
@@ -383,7 +395,6 @@ def load_model_catalog() -> dict:
         return {"error": str(e), "catalog": {"models": {}}}
 
 def record_load_time(model: str, topo_key: str, duration_sec: int):
-    """Saves verified startup telemetry only upon successful HTTP health check."""
     if duration_sec > 1800 or duration_sec < 60: return
     data = {}
     if LOAD_TIMES_PATH.exists():
@@ -396,7 +407,6 @@ def record_load_time(model: str, topo_key: str, duration_sec: int):
     except Exception: pass
 
 def execute_teardown(target_hosts: list = None) -> dict:
-    """Forcefully destroys existing vLLM containers."""
     results = {}
     hosts_to_clean = target_hosts if target_hosts else list(HOSTS.keys())
     for host in hosts_to_clean:
@@ -407,7 +417,6 @@ def execute_teardown(target_hosts: list = None) -> dict:
     return results
 
 def authorize_user_key(public_key_path: str) -> dict:
-    """Safe key authorization preventing double-escaped SSH execution bugs."""
     key_file = Path(public_key_path).expanduser()
     if not key_file.exists():
         return {"status": "error", "message": f"Key file not found: {public_key_path}"}
@@ -424,7 +433,6 @@ def authorize_user_key(public_key_path: str) -> dict:
     return {"status": "success", "details": results}
 
 def execute_sync() -> dict:
-    """Pushes local models.yaml state to all remote cluster nodes."""
     results = {}
     if not MODELS_YAML_PATH.exists():
         return {"status": "error", "message": "models.yaml missing locally."}
@@ -438,7 +446,6 @@ def execute_sync() -> dict:
     return {"status": "success", "details": results}
 
 def ensure_container_patch(target_hosts: list):
-    """Distributes the python container patch to remote nodes."""
     patch_path = BASE_DIR / "vllm_gb10_patch.py"
     patch_content = """import os, sys
 main_mod = sys.modules.get("__main__")
@@ -470,7 +477,6 @@ if os.path.exists(target):
         run_ssh(ip, "tetrel", cmd, timeout=10)
 
 def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False) -> dict:
-    """Orchestrates container deployment across 1-node or 2-node topologies."""
     deploy_start_time = time.time()
     target_hosts = ["spark-4", "spark-3"] if nodes == 2 else [head]
     ensure_container_patch(target_hosts)
@@ -501,7 +507,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
     except Exception:
         vllm_args_list = vllm_args_raw.split()
 
-    # Detect if Ray multi-node is explicitly requested in models.yaml vllm_args
     use_ray = (nodes > 1) and ("--distributed-executor-backend" in vllm_args_list) and ("ray" in vllm_args_list)
 
     execute_teardown(target_hosts=target_hosts)
@@ -578,33 +583,41 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
             for ev in topo_config.get("env_vars", []):
                 env_flags.extend(["-e", ev])
 
-            container_args = [
-                "python3", "-m", "vllm.entrypoints.openai.api_server",
-                "--model", hf_path,
-                "--tensor-parallel-size", str(tp_size),
-                "--pipeline-parallel-size", str(pp_size),
-                "--nnodes", str(nodes),
-                "--node-rank", str(node_rank),
-                "--master-addr", head_ip,
-                "--master-port", "29500",
-                "--gpu-memory-utilization", str(gpu_util),
-                "--max-model-len", str(max_model_len)
-            ]
-            
-            # vLLM V0 multi-node requires worker nodes to run headless
-            if not use_ray and node_rank > 0 and "--headless" not in vllm_args_list:
-                container_args.append("--headless")
-            
-            container_args.extend(vllm_args_list)
+            # CRITICAL FIX: Omit --nnodes, --node-rank, --master-addr when using Ray
+            if use_ray:
+                container_args = [
+                    "python3", "-m", "vllm.entrypoints.openai.api_server",
+                    "--model", hf_path,
+                    "--tensor-parallel-size", str(tp_size),
+                    "--pipeline-parallel-size", str(pp_size),
+                    "--gpu-memory-utilization", str(gpu_util),
+                    "--max-model-len", str(max_model_len)
+                ] + vllm_args_list
+            else:
+                container_args = [
+                    "python3", "-m", "vllm.entrypoints.openai.api_server",
+                    "--model", hf_path,
+                    "--tensor-parallel-size", str(tp_size),
+                    "--pipeline-parallel-size", str(pp_size),
+                    "--nnodes", str(nodes),
+                    "--node-rank", str(node_rank),
+                    "--master-addr", head_ip,
+                    "--master-port", "29500",
+                    "--gpu-memory-utilization", str(gpu_util),
+                    "--max-model-len", str(max_model_len)
+                ]
+                if node_rank > 0 and "--headless" not in vllm_args_list:
+                    container_args.append("--headless")
+                container_args.extend(vllm_args_list)
 
             if host == head:
                 vllm_head_args = container_args
 
             if use_ray:
                 if host == head:
-                    entrypoint_cmd = ["ray", "start", "--head", "--port=6379", "--block"]
+                    entrypoint_cmd = ["ray", "start", "--head", "--port=6379", "--num-gpus=1", "--block"]
                 else:
-                    entrypoint_cmd = ["ray", "start", f"--address={head_ip}:6379", "--block"]
+                    entrypoint_cmd = ["ray", "start", f"--address={head_ip}:6379", "--num-gpus=1", "--block"]
             else:
                 entrypoint_cmd = container_args
 
@@ -636,7 +649,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
                     break
                 time.sleep(2)
             
-            # Exec vllm inside the head node and pipe output to stdout so it appears in `docker logs vllm-head`
             exec_str = " ".join(shlex.quote(arg) for arg in vllm_head_args)
             vllm_exec_cmd = ["docker", "exec", "-d", "vllm-head", "bash", "-c", f"{exec_str} > /proc/1/fd/1 2>&1"]
             run_ssh(head_ip, "tetrel", vllm_exec_cmd, timeout=30)
@@ -694,7 +706,7 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
 def interactive_menu():
     print("=== [ TETREL SECURITY ] DGX Cluster Orchestrator ===")
     status = get_cluster_status()
-    print(f"Server Time: {status['server_time']} | Mode: {status['network_mode']} | vLLM API Ready: {status['cluster_ready']}\n")
+    print(f"Server Time: {status['server_time']} | Mode: {status['network_mode']} | API: {'READY' if status['cluster_ready'] else 'OFFLINE'} | TPS: {status.get('system_tps', 0.0)} tok/s | Streams: {status.get('running_requests', 0)} active ({status.get('waiting_requests', 0)} queued)\n")
 
     for h, data in status["hosts"].items():
         tele = data.get("telemetry", {})
