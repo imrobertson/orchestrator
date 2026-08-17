@@ -486,6 +486,15 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
     if topo_key not in topologies:
         return {"status": "error", "message": f"Topology '{topo_key}' not supported for model '{model}'."}
 
+    # Fetch live cluster offline state to explicitly bind to docker arguments
+    offline_mode = False
+    if NETWORK_STATE_FILE.exists():
+        try:
+            offline_mode = "OFFLINE" in NETWORK_STATE_FILE.read_text().strip()
+        except Exception:
+            pass
+    offline_val = "1" if offline_mode else "0"
+
     topo_config = topologies[topo_key]
     hf_path = model_config.get("hf_path", model)
     gpu_util = model_config.get("gpu_util", 0.70)
@@ -520,12 +529,15 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
         ip = HOSTS[head]["ip"]
         env_flags = [
             "-e", "PYTHONUNBUFFERED=1",
-            "-e", "NVIDIA_DISABLE_REQUIRE=true"
+            "-e", "NVIDIA_DISABLE_REQUIRE=true",
+            "-e", f"HF_HUB_OFFLINE={offline_val}",
+            "-e", f"TRANSFORMERS_OFFLINE={offline_val}"
         ]
         if hf_token: env_flags.extend(["-e", f"HF_TOKEN={hf_token}"])
 
         for ev in topo_config.get("env_vars", []):
-            env_flags.extend(["-e", ev])
+            if not ev.startswith("HF_HUB_OFFLINE=") and not ev.startswith("TRANSFORMERS_OFFLINE="):
+                env_flags.extend(["-e", ev])
 
         container_args = [
             "python3", "-m", "vllm.entrypoints.openai.api_server",
@@ -566,12 +578,15 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
                 "-e", "NCCL_BUFFSIZE=16777216",
                 "-e", "NCCL_NSOCKS_PER_THREAD=4",
                 "-e", "NCCL_SOCKET_DRV_BUFFSIZE=2097152",
-                "-e", "NCCL_CUMEM_ENABLE=0"
+                "-e", "NCCL_CUMEM_ENABLE=0",
+                "-e", f"HF_HUB_OFFLINE={offline_val}",
+                "-e", f"TRANSFORMERS_OFFLINE={offline_val}"
             ]
             if hf_token: env_flags.extend(["-e", f"HF_TOKEN={hf_token}"])
 
             for ev in topo_config.get("env_vars", []):
-                env_flags.extend(["-e", ev])
+                if not ev.startswith("HF_HUB_OFFLINE=") and not ev.startswith("TRANSFORMERS_OFFLINE="):
+                    env_flags.extend(["-e", ev])
 
             if use_ray:
                 container_args = [

@@ -1,5 +1,5 @@
-# ==============================================================================
-# TETREL SECURITY - DGX CLUSTER MODEL INVENTORY
+
+## ============================================================================== TETREL SECURITY - DGX CLUSTER MODEL INVENTORY
 # ==============================================================================
 # RUNTIME ASSUMPTIONS:
 # - Hardware: Dual DGX Spark (Grace Blackwell GB10, LPDDR5x Unified Memory).
@@ -26,8 +26,8 @@
 # GLOBAL BEHAVIOR FLAGS
 # Set to 1 to force offline mode across all models. Set to 0 to parse per-stanza.
 # ------------------------------------------------------------------------------
-GLOBAL_HF_HUB_OFFLINE: 1
-GLOBAL_TRANSFORMERS_OFFLINE: 1
+GLOBAL_HF_HUB_OFFLINE: 0
+GLOBAL_TRANSFORMERS_OFFLINE: 0
 default_image: "nvcr.io/nvidia/vllm:26.07-py3"
 
 
@@ -70,8 +70,8 @@ models:
   # DEEPSEEK FAMILY
   # ============================================================================
 models:
-  deepseek-v4-flash-dspark:
-    hf_path: deepseek-ai/DeepSeek-V4-Flash-DSpark
+  deepseek-v4-flash:
+    hf_path: deepseek-ai/DeepSeek-V4-Flash
     image: eugr/spark-vllm-b12x:latest
     gpu_util: 0.82
     topologies:
@@ -89,14 +89,13 @@ models:
         vllm_args: >-
           --attention-backend B12X_ATTN --moe-backend b12x
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
-          --enable-ep-weight-filter --enforce-eager --tokenizer-mode deepseek_v4
+          --enforce-eager --tokenizer-mode deepseek_v4
           --distributed-executor-backend ray
-          --speculative-config dspark --num-speculative-tokens 5
           --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
-          --block-size 256 --enable-expert-parallel
-
-  deepseek-v4-flash-nvfp4:
-    hf_path: deepseek-ai/DeepSeek-V4-Flash-NVFP4
+          --block-size 256
+ 
+   deepseek-v4-flash-nvfp4:
+    hf_path: nvidia/DeepSeek-V4-Flash-NVFP4
     image: eugr/spark-vllm-b12x:latest
     gpu_util: 0.82
     topologies:
@@ -114,11 +113,11 @@ models:
         vllm_args: >-
           --quantization modelopt_fp4 --attention-backend B12X_ATTN --moe-backend b12x
           --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
-          --enable-ep-weight-filter --enforce-eager --tokenizer-mode deepseek_v4
+          --enforce-eager --tokenizer-mode deepseek_v4
           --distributed-executor-backend ray
           --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4
-          --block-size 256 --enable-expert-parallel
-
+          --block-size 256
+  
   deepseek-r1-distill-qwen-32b:
     hf_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
     gpu_util: 0.70

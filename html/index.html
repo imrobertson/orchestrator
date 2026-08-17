@@ -287,12 +287,14 @@
             if (data.network_mode === "Working in OFFLINE mode") {
                 currentOfflineState = true;
                 netBadge.innerHTML = '🔒 OFFLINE MODE';
+                netBadge.title = 'Click to toggle. Note: Network changes only apply to new deployments, not currently running models.';
                 netBadge.style.color = '#f87171';
                 netBadge.style.borderColor = '#991b1b';
                 netBadge.style.background = '#450a0a';
             } else {
                 currentOfflineState = false;
                 netBadge.innerHTML = '🌐 ONLINE MODE';
+                netBadge.title = 'Click to toggle. Note: Network changes only apply to new deployments, not currently running models.';
                 netBadge.style.color = '#34d399';
                 netBadge.style.borderColor = '#065f46';
                 netBadge.style.background = '#022c22';
@@ -352,7 +354,7 @@
     async function toggleNetworkMode() {
         const nextState = !currentOfflineState;
         const targetModeStr = nextState ? "Working in OFFLINE mode" : "Working in ONLINE mode";
-        if(!confirm(`Switch cluster network state to: "${targetModeStr}"?`)) return;
+        if(!confirm(`Switch cluster network state to: "${targetModeStr}"?\n\nNote: This will only affect new deployments. Running models will not be changed.`)) return;
 
         try {
             await fetch(`${API_BASE}/toggle-network`, {
