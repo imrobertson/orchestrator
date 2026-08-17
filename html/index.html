@@ -89,8 +89,8 @@
             width: 100%; 
             margin-bottom: 12px; 
             box-sizing: border-box; 
-            font-size: 14px; /* Prevents iOS Zoom */
-            min-height: 44px; /* Touch target size */
+            font-size: 14px;
+            min-height: 44px;
         }
         
         /* Buttons */
@@ -112,13 +112,13 @@
         .btn-danger { background: #dc2626; margin-top: 8px; }
         .btn-danger:hover:not(:disabled) { background: #b91c1c; }
 
-        /* Logs Section (Flex-Grow to fill bottom) */
+        /* Logs Section */
         .log-section {
             flex-grow: 1;
             display: flex;
             flex-direction: column;
             margin-top: 15px;
-            min-height: 0; /* Critical for flex scrolling */
+            min-height: 0;
         }
         .log-card { margin: 0; flex-grow: 1; padding: 15px; }
         .log-header-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; margin-bottom: 10px; }
@@ -138,7 +138,6 @@
             word-wrap: break-word; 
         }
 
-        /* Mobile & Tablet Responsiveness */
         @media (max-width: 1024px) {
             body { height: auto; min-height: 100vh; overflow-y: auto; }
             .dashboard-top { grid-template-columns: 1fr; }
@@ -160,7 +159,11 @@
             </h1>
             <div id="netBadge" class="net-badge" style="margin-top: 6px;" onclick="toggleNetworkMode()">Checking Network...</div>
         </div>
-        <div class="clock" id="serverClock">Connecting...</div>
+        <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <div class="clock" id="speedoMeter" style="border-color: var(--accent); color: var(--accent);">SPEED: 0.0 tok/s</div>
+            <div class="clock" id="streamThreads">THREADS: 0 active</div>
+            <div class="clock" id="serverClock">Connecting...</div>
+        </div>
     </header>
 
     <div class="dashboard-top">
@@ -225,6 +228,12 @@
             const res = await fetch(`${API_BASE}/status`);
             const data = await res.json();
             document.getElementById('serverClock').innerText = `Server Time: ${data.server_time}`;
+            if (document.getElementById('speedoMeter')) {
+                document.getElementById('speedoMeter').innerText = `SPEED: ${data.system_tps || 0.0} tok/s`;
+            }
+            if (document.getElementById('streamThreads')) {
+                document.getElementById('streamThreads').innerText = `THREADS: ${data.running_requests || 0} active (${data.waiting_requests || 0} queued)`;
+            }
             
             const netBadge = document.getElementById('netBadge');
             if (data.network_mode === "Working in OFFLINE mode") {
@@ -263,7 +272,7 @@
 
                 let telemetryHtml = '';
                 if (info.telemetry && info.telemetry.gpu_temp_c !== undefined) {
-                    telemetryHtml = `🌡️ ${info.telemetry.gpu_temp_c}°C &nbsp;|&nbsp; ⚡ ${info.telemetry.gpu_util_pct}% &nbsp;|&nbsp; 💾 ${info.telemetry.mem_used_mb}/${info.telemetry.mem_total_mb} MB`;
+                    telemetryHtml = `TEMP: ${info.telemetry.gpu_temp_c}°C &nbsp;|&nbsp; GPU: ${info.telemetry.gpu_util_pct}% &nbsp;|&nbsp; MEM: ${info.telemetry.mem_used_mb}/${info.telemetry.mem_total_mb} MB`;
                 } else {
                     telemetryHtml = `Telemetry Unavailable`;
                 }
@@ -357,12 +366,8 @@
             const data = await res.json();
             const logBox = document.getElementById('logBox');
             
-            // Detect if the user is currently looking at the bottom of the logs
             const isScrolledToBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 20;
-            
             logBox.innerText = data.logs.join('\n');
-            
-            // Snap back to the bottom only if they were already there
             if (isScrolledToBottom) {
                 logBox.scrollTop = logBox.scrollHeight;
             }

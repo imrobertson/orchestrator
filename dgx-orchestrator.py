@@ -205,7 +205,6 @@ def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
         pass
     return default_est, False
 
-
 def get_vllm_metrics(head_ip: str = "10.0.14.43", port: int = 8000) -> dict:
     """Scrapes vLLM Prometheus endpoint for system throughput (TPS) and request concurrency."""
     metrics = {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
@@ -235,7 +234,6 @@ def get_cluster_status() -> dict:
             pass
 
     cluster_ready = check_vllm_health(HOSTS["spark-4"]["ip"])
-
     vllm_metrics = get_vllm_metrics(HOSTS["spark-4"]["ip"]) if cluster_ready else {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
 
     status_data = {
@@ -583,7 +581,6 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
             for ev in topo_config.get("env_vars", []):
                 env_flags.extend(["-e", ev])
 
-            # CRITICAL FIX: Omit --nnodes, --node-rank, --master-addr when using Ray
             if use_ray:
                 container_args = [
                     "python3", "-m", "vllm.entrypoints.openai.api_server",
@@ -713,7 +710,7 @@ def interactive_menu():
         temp = f"{tele.get('gpu_temp_c', 'N/A')}°C" if 'gpu_temp_c' in tele else "N/A"
         util = f"{tele.get('gpu_util_pct', 'N/A')}%" if 'gpu_util_pct' in tele else "N/A"
         mem = f"{tele.get('mem_used_mb', 'N/A')}/{tele.get('mem_total_mb', 'N/A')} MB" if 'mem_used_mb' in tele else "N/A"
-        print(f"[{h}] Docker: {data['docker_status']} | Container: {data['container_name']} ({data['container_state']}) | Model: {data['active_model']} | Status: {data['model_status']} | ETA: {data['eta_display']} | Temp: {temp} | Util: {util} | Memory: {mem}")
+        print(f"[{h}] Docker: {data['docker_status']} | Container: {data['container_name']} ({data['container_state']}) | Model: {data['active_model']} | Status: {data['model_status']} | ETA: {data['eta_display']} | TEMP: {temp} | GPU: {util} | MEM: {mem}")
     print("-" * 85)
 
     catalog_data = load_model_catalog().get("catalog", {}).get("models", {})
