@@ -188,42 +188,10 @@ model without touching a shared file, and a clean seam for borrowing (or
 diverging from) eugr's tested recipes.
 
 **Changes:**
-- Design the recipe schema (draft below) — borrows eugr's field name
-  `recipe_version` (not `schema_version` — matching their exact naming means
-  a recipe copied wholesale from `recipes/eugr/` drops in with zero
-  translation) and their `cluster_only` / `solo_only` flags, since those
-  catch real configuration errors (deploying a topology combo that doesn't
-  exist) before deploy time instead of after.
-- **Two validation failure modes, confirmed from eugr's actual
-  `run-recipe.py`, worth copying exactly:** a `recipe_version` your loader
-  doesn't recognize is a **soft warning** ("some features may not work
-  correctly") that still proceeds — recipes shouldn't become unusable just
-  because the loader is a version behind. A `cluster_only`/`solo_only`
-  mismatch is a **hard error** that refuses to deploy, with the exact
-  actionable message shape eugr uses:
-  ```
-  Error: Recipe 'X' requires cluster mode.
-  This model is too large to run on a single node.
-
-  Options:
-    1. Deploy with --nodes 2
-    2. ...
-  ```
-  Your current `_execute_deployment_impl` just returns `"Topology '2_node'
-  not supported for model X"` — worth upgrading to this shape while you're
-  already touching this validation path.
-- **Design note — recorded here because a future reader diffing your
-  recipes against a borrowed eugr recipe will notice the shape doesn't
-  match, and should know it's deliberate, not drift:** eugr's real recipes
-  have no `tp_size`/`pp_size` fields at all. Node count is derived
-  downstream (in `launch-cluster.sh`) by parsing `-tp`/`-pp`/`-dp` back out
-  of the rendered command string, so there's exactly one source of truth
-  (the command) at the cost of a regex doing topology inference. Your
-  schema keeps `tp_size`/`pp_size`/`max_model_len` as explicit typed fields
-  per topology instead, with `vllm_args` remaining the free-text escape
-  hatch for everything else — more redundant, but it's the version a Phase
-  4 allocator can query numerically without parsing anything. Deliberate
-  divergence, not an oversight.
+- Design the recipe schema (draft below) — borrows eugr's `schema_version`
+  and `cluster_only` / `solo_only` flags, since those catch real
+  configuration errors (deploying a topology combo that doesn't exist)
+  before deploy time instead of after.
 - Split `recipes/` into `eugr/` and `local/`. `eugr/` is a periodic,
   read-only-by-convention sync from eugr's `recipes/` directory for models
   where their tested build/flags are the right answer — pin to a specific
@@ -231,20 +199,14 @@ diverging from) eugr's tested recipes.
   everything you write yourselves, including forks of an `eugr/` recipe
   that need a tweak. The loader refuses to start if a name collides between
   the two directories, rather than silently picking one.
-- Add an optional `mods:` field to the recipe schema now — a flat list of
-  mod directory paths (e.g. `mods/fix-glm4-moe`), matching eugr's actual
-  format exactly (confirmed against their real recipes and `run-recipe.py`,
-  not guessed from a forum post as in an earlier pass of this doc). Each mod
-  is a directory (or zip) containing a `run.sh` entrypoint plus whatever
-  supporting files it needs. `common/docker_ops.py` gets a
-  `apply_mod_to_container()` equivalent: copy the mod directory into the
-  container (via `scp` + `docker cp` for a remote host, same as your
-  existing SSH plumbing), then `docker exec ... bash -c "cd <path> &&
-  ./run.sh"` before the main `vllm serve` launch — same idea as eugr's,
-  just driven by your off-node SSH call instead of their local/SSH dual
-  path. Doesn't need real content on day one; the field existing means
-  you're not doing a second schema migration when the first model actually
-  needs a patch.
+- Add an optional `mods:` field to the recipe schema now (empty list is
+  fine to start) — this is the extension point for eugr's compatibility-fix
+  pattern (runtime patches for model-specific bugs). `common/docker_ops.py`
+  folds any listed mod commands into the container's startup command,
+  executed the same way you already wrap the Ray-head `vllm serve` command
+  in a `bash -c` string. Doesn't need real content on day one; the field
+  existing means you're not doing a second schema migration when the first
+  model actually needs a patch.
 - Add capability fields to the schema now too (`task`, `context_class`,
   `latency_class`) — unpopulated or best-guess values are fine. Phase 4's
   allocator is the first thing that reads them for real.
@@ -297,24 +259,6 @@ universe rather than a fact about your current hardware.
 - Recipe topology keys generalize from `1_node`/`2_node` to whatever node
   counts actually apply (`4_node`, etc.) — this needs no schema change,
   just more keys, since the schema was never restricted to exactly two.
-- **Networking depends on how the new Sparks get physically wired, decide
-  before writing code.** Per eugr's `NETWORKING.md`: TP works best at
-  power-of-2 node counts (2/4/8); a 3-node (or non-power-of-2) mesh is
-  mainly useful for pipeline/data parallelism instead. Two wiring options
-  once you're past a pair:
-  - **A proper switch** (e.g. Mikrotik CRS8xx-DDQ) — each Spark connects to
-    the switch like today's pair, `cluster_config.yaml`'s `network:` block
-    stays basically as-is, just with more `hosts:` entries.
-  - **A cable mesh with no switch** — needs a different NIC wiring per
-    node (port 0 on one Spark to port 1 on the next) and different NCCL
-    settings than the current pair uses: `NCCL_IB_MERGE_NICS=0`,
-    `NCCL_NET_PLUGIN=none`, `NCCL_IB_SUBNET_AWARE_ROUTING=1`, plus a
-    dedicated out-of-band interface for coordination traffic (their 3-node
-    example uses the onboard 10GbE port, not the ConnectX mesh links).
-  Add a `network.topology: switched | mesh` field to `cluster_config.yaml`
-  now (even unused) so this isn't a third schema migration — same
-  "decide the field early, populate it late" principle as the recipe
-  capability fields in Phase 2.
 
 **Verification:** same `--dry-run` diffing pattern as Phase 1, plus this is
 the first phase worth actually load-testing two concurrent independent
@@ -385,12 +329,7 @@ system is now multi-user:
 ## Recipe schema (draft)
 
 ```yaml
-recipe_version: "1"   # matches eugr's field name exactly, so a recipe copied
-                       # wholesale from recipes/eugr/ needs no translation.
-                       # An unrecognized version is a soft warning at load
-                       # time (recipe still runs) - not a hard failure. That's
-                       # a different failure mode than cluster_only/solo_only
-                       # below, which DO hard-fail; don't conflate the two.
+schema_version: 1
 name: qwen-2.5-coder-32b
 hf_path: Qwen/Qwen2.5-Coder-32B-Instruct
 image: nvcr.io/nvidia/vllm:26.07-py3   # omit to use cluster_config's default_image
@@ -403,12 +342,9 @@ capability:
   context_class: 32k
   latency_class: standard
 
-# Optional runtime patches applied before `vllm serve` starts. Each entry is
-# a path to a mods/<name>/ directory containing a run.sh entrypoint (plus
-# whatever supporting files it needs) - confirmed against eugr's actual
-# mods mechanism, not the curl+patch one-liner assumed in an earlier pass
-# of this doc. common/docker_ops.py copies the directory into the container
-# and runs `cd <path> && ./run.sh` before the main vllm serve launch.
+# Optional runtime patches applied before `vllm serve` starts. Empty until
+# a model actually needs one — see eugr's mods/ directory for the pattern
+# (curl+patch, pip install, etc.) this is modeled on.
 mods: []
 
 topologies:
@@ -422,9 +358,8 @@ topologies:
     vllm_args: >-
       --trust-remote-code --kv-cache-dtype fp8 --enable-chunked-prefill
   2_node:
-    cluster_only: true   # mirrors eugr's cluster_only/solo_only flags -
-                          # hard-fails at deploy time with an actionable
-                          # message (see Phase 2), not a silent fallback
+    cluster_only: true   # mirrors eugr's cluster_only/solo_only flags —
+                          # fails loudly at load time, not at deploy time
     max_model_len: 131072
     tp_size: 1
     pp_size: 2
@@ -436,15 +371,6 @@ topologies:
       --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
       --enable-chunked-prefill
 ```
-
-**Why this schema keeps explicit `tp_size`/`pp_size` instead of deriving
-node count from parsed vLLM flags the way eugr's real recipes do:** see the
-design note in Phase 2 above. Short version - eugr's way has zero
-redundancy but requires regex-parsing rendered command text to know the
-topology; this schema is more redundant but lets Phase 4's allocator query
-node requirements numerically without parsing anything. Deliberate,
-recorded here so it doesn't look like an oversight next to a borrowed
-`recipes/eugr/*.yaml` file that does it differently.
 
 ## `cluster_config.yaml` (draft)
 
@@ -484,9 +410,6 @@ hosts:
   # down IPs/aliases as you plan the rack-out without them being live.
 
 network:
-  topology: switched   # switched | mesh - unused until Phase 3, but the
-                        # field exists now so adding it isn't a schema
-                        # migration later. See NETWORKING.md notes in Phase 3.
   interface: enp1s0f0np0
   nccl_ib_hca: rocep1s0f0
 ```
@@ -530,6 +453,34 @@ racked, with zero effect on current behavior.
   than now.
 - **Recipe pruning.** Confirm which of the current 14 cataloged models are
   actually in active use before migrating all of them in Phase 2.
+- **`cluster_only` enforcement — deferred pending exact semantics.** The
+  field exists in the schema today (`common/recipes.py::TopologyConfig`)
+  and round-trips through `load_recipes()`, but is deliberately inert: it's
+  never read by `build_catalog_response()` or by `dgx-orchestrator.py`'s
+  deploy path, same treatment as `capability`/`mods`. Confirmed (re-reading
+  this doc's own line 361 comment) that enforcement belongs in the
+  **recipe loader, at load time** — not in `_execute_deployment_impl` at
+  deploy time, which was floated and is wrong for this design. Two things
+  block writing that check now rather than it being pure laziness:
+    - eugr's `cluster_only`/`solo_only` are whole-recipe flags checked
+      against a node count *derived* from parsed `-tp`/`-pp`/`-dp` flags
+      (see `EUGR-REFERENCE-NOTES.md`). We deliberately diverge — node
+      count is the explicit `topologies` dict key — so the exact
+      "mismatch" condition a load-time check should assert isn't yet
+      pinned down for our schema; it may end up being closer to an
+      internal-consistency check (Phase 3, N>2 nodes, is where
+      `cluster_only` stops being redundant with "is this the `2_node`
+      key" and starts meaning something new: "consumes the whole current
+      cluster, not just a subset").
+    - We only have `cluster_only`, not eugr's `solo_only` — see
+      `EUGR-REFERENCE-NOTES.md`'s "Borrow directly" list, which names
+      both. Worth adding `solo_only` to the schema at the same time we
+      pin down the validation rule, rather than a second migration.
+  Real eugr recipes (a few have been offered for direct testing) should
+  resolve this concretely rather than guessing from docs. `verify_recipe_equivalence.py`
+  needs a matching update *whenever* either field starts appearing in the
+  catalog response (same treatment as the `hosts` exclusion it already
+  has) — flagging here so that change isn't made in isolation later.
 
 ## Suggested immediate next step
 

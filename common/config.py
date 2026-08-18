@@ -50,6 +50,11 @@ class ClusterConfig(BaseModel):
     container_names: dict[str, str]
     hosts: dict[str, HostConfig]
     network: NetworkConfig
+    # Cluster-wide offline-mode switches, toggled by /api/toggle-network.
+    # Injected into every recipe topology's env_vars at catalog-build time
+    # by common/recipes.py::build_catalog_response() -- never per-model.
+    global_hf_hub_offline: int = 0
+    global_transformers_offline: int = 0
 
 
 @functools.lru_cache(maxsize=None)

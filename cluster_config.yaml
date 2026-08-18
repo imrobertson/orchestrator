@@ -3,6 +3,13 @@ ssh_key_name: id_dgx_orchestrator
 default_image: nvcr.io/nvidia/vllm:26.07-py3
 gpu_util_ceiling: 0.75
 
+# Cluster-wide offline-mode switches. Set to 1 to force offline mode across
+# all models; toggled at runtime by /api/toggle-network. Moved here from
+# models.yaml's GLOBAL_HF_HUB_OFFLINE / GLOBAL_TRANSFORMERS_OFFLINE as part
+# of the Phase 2 recipes migration -- see common/recipes.py.
+global_hf_hub_offline: 0
+global_transformers_offline: 0
+
 ports:
   vllm_api: 8000
   orchestrator_api: 5001

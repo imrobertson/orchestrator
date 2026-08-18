@@ -1,0 +1,60 @@
+# Adapted from eugr/spark-vllm-docker's recipes/diffusion-gemma-bf16.yaml.
+# NOT yet added to recipes/local/ -- this is a worked translation example
+# for review, not a live catalog entry. See the two TODOs below before it
+# becomes one.
+recipe_version: "1"
+name: diffusion-gemma-bf16
+hf_path: google/diffusiongemma-26B-A4B-it
+
+# TODO(image): eugr's `container: vllm-node` is a logical name resolved by
+# their own build-and-copy.sh pipeline, not a registry ref -- we have no
+# equivalent mapping. Left unset here (falls back to cluster_config.yaml's
+# default_image, nvcr.io/nvidia/vllm:26.07-py3) as a *guess*, not a
+# confirmed-safe choice: this is a diffusion model (--diffusion-config,
+# --load-format fastsafetensors), a materially different code path from
+# the autoregressive models our default image is proven against. Needs a
+# human to confirm the stock image actually supports diffusion serving
+# before this is used for a real deploy.
+# image: <unresolved>
+
+gpu_util: 0.8  # eugr defaults.gpu_memory_utilization
+
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+
+# TODO(mods): eugr's `mods: [mods/diffusiongemma]` is dropped here, not
+# translated -- our mods: mechanism is schema-only so far (see
+# ARCHITECTURE-MIGRATION-PLAN.md Phase 2: "Doesn't need real content on
+# day one"), no run.sh-equivalent execution path exists yet. Whatever
+# mods/diffusiongemma/run.sh actually does was not reviewed as part of
+# this translation. Treat this recipe as INCOMPLETE, not just
+# unoptimized, until that mod's contents are read and either ported or
+# confirmed unnecessary.
+mods: []
+
+topologies:
+  1_node:
+    max_model_len: 262144
+    tp_size: 1
+    pp_size: 1
+    env_vars: []
+    # --host/--port dropped: our orchestrator's api_server invocation
+    # never sets them for any existing recipe (relies on vLLM's own
+    # defaults, which match eugr's 0.0.0.0:8000 defaults anyway).
+    # --max-model-len and --gpu-memory-utilization dropped: the
+    # orchestrator already constructs both itself from this file's
+    # top-level gpu_util and this topology's max_model_len -- including
+    # them here would duplicate the flag, exactly the risk flagged in
+    # EUGR-REFERENCE-NOTES.md.
+    vllm_args: >-
+      --trust-remote-code --enable-auto-tool-choice --tool-call-parser gemma4
+      --load-format fastsafetensors --attention-backend TRITON_ATTN
+      --enable-prefix-caching --max-num-seqs 10
+      --diffusion-config '{"canvas_length":256}'
+      --override-generation-config '{"max_new_tokens": null}'
+      --reasoning-parser gemma4
+      --default-chat-template-kwargs '{"enable_thinking": false}'
+      --chat-template fixed_chat_template.jinja
+      --moe-backend triton
