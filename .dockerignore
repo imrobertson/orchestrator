@@ -1,0 +1,35 @@
+# --------------------------------------------------------------------------
+# Secrets & credentials - never let these end up in a Docker image layer.
+# COPY . . in the Dockerfile would otherwise bake them in even though the
+# runtime bind mount masks them - anyone with `docker history`/`docker save`
+# access to the built image, or a registry push, could still extract them
+# from layer history after they're later deleted from the source directory.
+# --------------------------------------------------------------------------
+.secrets
+id_dgx_orchestrator
+id_dgx_orchestrator.pub
+*.pem
+*.key
+
+# --------------------------------------------------------------------------
+# Runtime-generated state - written back into the bind-mounted repo dir at
+# container runtime, not part of the image, and no reason to bake in
+# whatever happened to exist on disk at build time.
+# --------------------------------------------------------------------------
+load_times.json
+benchmark_ledger.csv
+benchmark_results.txt
+.network_mode
+
+# --------------------------------------------------------------------------
+# VCS / editor / Python cruft
+# --------------------------------------------------------------------------
+.git
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
