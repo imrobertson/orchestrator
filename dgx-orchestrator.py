@@ -482,10 +482,14 @@ def execute_sync() -> dict:
         results[host] = "Synced models.yaml" if res.returncode == 0 else f"Failed: {res.stderr.strip()}"
     return {"status": "success", "details": results}
 
-def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False) -> dict:
+def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
     """Actual deployment logic. Callers must hold CLUSTER_OP_LOCK before calling this -
-    use execute_deployment() below."""
+    use execute_deployment() below. dry_run=True builds every docker run command exactly
+    as a real deploy would but never calls run_ssh (or anything else that touches a host):
+    no teardown, no GPU clock lock, no ray registration, no post-deploy verification, no
+    wait/benchmark. Returns the per-host docker run argument lists instead of deploying."""
     deploy_start_time = time.time()
+    docker_run_commands: dict = {}
 
     # nodes must be exactly 1 or 2 - anything else used to silently fall through
     # to single-node behavior (the `else [head]` branch below), which meant a
@@ -536,11 +540,12 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
     use_ray = (nodes > 1) and ("--distributed-executor-backend" in vllm_args_list) and ("ray" in vllm_args_list)
 
-    _execute_teardown_impl(target_hosts=target_hosts)
+    if not dry_run:
+        _execute_teardown_impl(target_hosts=target_hosts)
 
-    for h in target_hosts:
-        ip = HOSTS[h]["ip"]
-        run_ssh(ip, None, ["sudo", "nvidia-smi", "-lgc", "300,1800"], timeout=10)
+        for h in target_hosts:
+            ip = HOSTS[h]["ip"]
+            run_ssh(ip, None, ["sudo", "nvidia-smi", "-lgc", "300,1800"], timeout=10)
 
     default_img = catalog_resp.get("catalog", {}).get("default_image", load_cluster_config().default_image)
     image_tag = model_config.get("image", default_img)
@@ -581,8 +586,10 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             "-v", compat_mount
         ] + env_flags + [image_tag] + container_args
 
-        res = run_ssh(ip, None, docker_cmd, timeout=60)
-        if res.returncode != 0:
+        res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
+        if dry_run:
+            docker_run_commands[head] = docker_cmd
+        elif res.returncode != 0:
             return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
     else:
         vllm_head_args = None
@@ -664,11 +671,13 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                 "-v", compat_mount
             ] + env_flags + [image_tag] + entrypoint_cmd
 
-            res = run_ssh(ip, None, docker_cmd, timeout=60)
-            if res.returncode != 0:
+            res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
+            if dry_run:
+                docker_run_commands[host] = docker_cmd
+            elif res.returncode != 0:
                 return {"status": "error", "message": f"Docker run failed on {host}: {res.stderr}"}
 
-        if use_ray and vllm_head_args:
+        if use_ray and vllm_head_args and not dry_run:
             print("[+] Waiting for Ray cluster to register worker nodes (max 60s)...")
             worker_hosts = [k for k, v in HOSTS.items() if v["role"] == "worker"]
             worker_ip = HOSTS[worker_hosts[0]]["ip"] if worker_hosts else ""
@@ -682,6 +691,15 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             exec_str = " ".join(shlex.quote(arg) for arg in vllm_head_args)
             vllm_exec_cmd = ["docker", "exec", "-d", ContainerRole.HEAD, "bash", "-c", f"{exec_str} > /proc/1/fd/1 2>&1"]
             run_ssh(head_ip, None, vllm_exec_cmd, timeout=30)
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "message": f"Dry-run for {model} across {nodes} node(s) - no SSH connections made, nothing executed.",
+            "targets": target_hosts,
+            "head": head,
+            "docker_run_commands": docker_run_commands,
+        }
 
     time.sleep(4)
     for host in target_hosts:
@@ -721,10 +739,14 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         "head": head
     }
 
-def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False) -> dict:
+def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
     """Public entry point. Acquires CLUSTER_OP_LOCK so two deploys (or a deploy
     and a teardown) can never interleave and leave the cluster in a half-started,
-    dashboard-doesn't-match-reality state."""
+    dashboard-doesn't-match-reality state. dry_run=True is a pure computation - it
+    never calls run_ssh or mutates any cluster state - so it skips the lock
+    entirely and can safely run concurrently with a real deploy in progress."""
+    if dry_run:
+        return _execute_deployment_impl(model, nodes, head, user_id, wait=wait, run_benchmark=run_benchmark, dry_run=True)
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
     if not acquired:
         return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
@@ -838,6 +860,7 @@ if HAS_FASTAPI:
         user_id: str = "dashboard_user"
         wait: bool = False
         run_benchmark: bool = False
+        dry_run: bool = False
 
     class NetworkToggleRequest(BaseModel):
         offline: bool
@@ -853,8 +876,8 @@ if HAS_FASTAPI:
 
     @app.post("/api/deploy")
     def api_deploy(req: DeployRequest):
-        res = execute_deployment(req.model, req.nodes, req.head, req.user_id, wait=req.wait, run_benchmark=req.run_benchmark)
-        if res.get("status") != "success": raise HTTPException(status_code=400, detail=res.get("message", "Deployment failed"))
+        res = execute_deployment(req.model, req.nodes, req.head, req.user_id, wait=req.wait, run_benchmark=req.run_benchmark, dry_run=req.dry_run)
+        if res.get("status") not in ("success", "dry_run"): raise HTTPException(status_code=400, detail=res.get("message", "Deployment failed"))
         return res
 
     @app.post("/api/teardown")
@@ -885,6 +908,7 @@ def main():
     deploy_parser.add_argument("--head", default="spark-4")
     deploy_parser.add_argument("--wait", action="store_true", help="Block until HTTP /health passes")
     deploy_parser.add_argument("--benchmark", action="store_true", help="Automatically run benchmark.py when ready")
+    deploy_parser.add_argument("--dry-run", action="store_true", help="Print the docker run command(s) this deploy would send, without SSHing or executing anything")
     deploy_parser.add_argument("-y", "--yes", action="store_true")
 
     logs_parser = subparsers.add_parser("logs")
@@ -908,6 +932,7 @@ def main():
     cli_deploy.add_argument("--head", default="spark-4")
     cli_deploy.add_argument("--wait", action="store_true")
     cli_deploy.add_argument("--benchmark", action="store_true")
+    cli_deploy.add_argument("--dry-run", action="store_true", help="Print the docker run command(s) this deploy would send, without SSHing or executing anything")
     cli_deploy.add_argument("-y", "--yes", action="store_true")
 
     cli_logs = cli_sub.add_parser("logs")
@@ -928,7 +953,7 @@ def main():
 
     elif subcommand == "status": print(json.dumps(get_cluster_status(), indent=2))
     elif subcommand == "teardown": print(json.dumps(execute_teardown(), indent=2))
-    elif subcommand == "deploy": print(json.dumps(execute_deployment(args.model, args.nodes, args.head, os.environ.get("USER") or getpass.getuser(), wait=getattr(args, "wait", False), run_benchmark=getattr(args, "benchmark", False)), indent=2))
+    elif subcommand == "deploy": print(json.dumps(execute_deployment(args.model, args.nodes, args.head, os.environ.get("USER") or getpass.getuser(), wait=getattr(args, "wait", False), run_benchmark=getattr(args, "benchmark", False), dry_run=getattr(args, "dry_run", False)), indent=2))
     elif subcommand == "logs": print("\n".join(get_container_logs(args.host, args.tail).get("logs", [])))
     elif subcommand == "authorize-key": print(json.dumps(authorize_user_key(args.key), indent=2))
     elif subcommand == "sync": print(json.dumps(execute_sync(), indent=2))

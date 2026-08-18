@@ -1,4 +1,13 @@
 ## ==============================================================================
+# NOTE (Phase 1, cluster_config.yaml migration):
+# Host inventory and network configuration no longer live in this file - see
+# cluster_config.yaml, loaded via common/config.py. This file is scheduled
+# for replacement entirely by per-model recipes/*.yaml in the next migration
+# phase (Phase 2); until then it remains the source of truth for model
+# metadata and topology tunables only.
+## ==============================================================================
+
+## ==============================================================================
 # TETREL SECURITY - DGX CLUSTER MODEL INVENTORY
 # ==============================================================================
 # RUNTIME ASSUMPTIONS:
@@ -30,36 +39,6 @@ GLOBAL_HF_HUB_OFFLINE: 0
 GLOBAL_TRANSFORMERS_OFFLINE: 0
 default_image: "nvcr.io/nvidia/vllm:26.07-py3"
 
-
-# ------------------------------------------------------------------------------
-# 1. HOST INVENTORY & MULTI-INTERFACE NETWORK MATRIX
-# ------------------------------------------------------------------------------
-hosts:
-  spark-9dbe:
-    aliases:
-      - "spark-4"
-      - "4"
-    ssh_user: "tetrel"
-    compute_dir: "/opt/dgx-cluster-control"
-    volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
-    networks:
-      management:
-        wired: "10.0.14.43"
-        wireless: "10.0.14.44"
-      backplane: "192.168.99.2"
-
-  spark-6e63:
-    aliases:
-      - "spark-3"
-      - "3"
-    ssh_user: "tetrel"
-    compute_dir: "/opt/dgx-cluster-control"
-    volume_mount: "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
-    networks:
-      management:
-        wired: "10.0.14.41"
-        wireless: "10.0.14.42"
-      backplane: "192.168.99.1"
 
 # ------------------------------------------------------------------------------
 # 2. MODEL METADATA & TOPOLOGY TUNABLES
