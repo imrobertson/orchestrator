@@ -1,0 +1,166 @@
+"""
+Unified SSH transport for the DGX orchestrator tooling.
+
+Consolidates run_ssh / resolve_user_identity_key / get_hf_token, which
+previously existed as two near-verbatim-but-drifted copies in
+dgx-orchestrator.py and cache_cluster_assets.py. Both call sites can use
+this single implementation without behavioral change:
+
+  - dgx-orchestrator.py wants capture=True (default), a short
+    connect_timeout (5s), no TTY, and a short overall timeout (10s) -
+    dead hosts must fail fast, not hang.
+  - cache_cluster_assets.py wants capture=False so `docker pull` / model
+    download progress bars stream live to the terminal, tty=True so the
+    remote process gets a pseudo-TTY to render those bars, a longer
+    connect_timeout (10s), and long overall timeouts (1800-3600s) for
+    slow transfers.
+
+Only dgx-orchestrator.py should ever SSH into the Sparks; that invariant
+is unaffected by this module existing, since it's still dgx-orchestrator.py
+(and cache_cluster_assets.py, its asset-prefetch sibling) calling into it.
+"""
+
+from __future__ import annotations
+
+import os
+import shlex
+import shutil
+import subprocess
+from pathlib import Path
+
+from common.config import load_cluster_config
+
+# Mirrors common/config.py's BASE_DIR resolution: this file lives in
+# common/, so the repo root is one level up. BASE_DIR can still be
+# overridden via the BASE_DIR env var, same as dgx-orchestrator.py and
+# cache_cluster_assets.py.
+BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent.parent))
+
+
+def resolve_user_identity_key() -> str:
+    """
+    OpenSSH strictness (0600) workaround for shared keys (0640).
+    Auto-stages a copy of the shared key into ~/.ssh/<ssh_key_name> to
+    prevent permission denied errors when routing cluster commands.
+
+    The shared key's filename is sourced from cluster_config.yaml's
+    ssh_key_name (previously the hardcoded "id_dgx_orchestrator" string
+    in dgx-orchestrator.py); all other behavior, including the BASE_DIR
+    resolution and the id_ed25519 / shared-key fallbacks, is identical.
+    """
+    key_name = load_cluster_config().ssh_key_name
+    shared_key_path = BASE_DIR / key_name
+
+    user_ssh_dir = Path.home() / ".ssh"
+    user_ssh_dir.mkdir(parents=True, exist_ok=True)
+    target_key = user_ssh_dir / key_name
+
+    if shared_key_path.exists():
+        try:
+            if not target_key.exists() or target_key.stat().st_mtime < shared_key_path.stat().st_mtime:
+                shutil.copy2(shared_key_path, target_key)
+                os.chmod(target_key, 0o600)
+            return str(target_key)
+        except Exception:
+            pass
+
+    default_key = user_ssh_dir / "id_ed25519"
+    if default_key.exists():
+        return str(default_key)
+
+    return str(shared_key_path)
+
+
+def get_hf_token() -> str:
+    """Extracts HuggingFace authentication token with safe fallbacks and warnings."""
+    if "HF_TOKEN" in os.environ and os.environ["HF_TOKEN"].strip():
+        return os.environ["HF_TOKEN"].strip()
+
+    secrets_file = BASE_DIR / ".secrets"
+    if secrets_file.exists():
+        try:
+            for line in secrets_file.read_text().splitlines():
+                if line.startswith("HF_TOKEN="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except PermissionError:
+            print(f"[!] Warning: You do not have permission to read {secrets_file}. Checking local cache...")
+        except Exception:
+            pass
+
+    hf_token_file = Path.home() / ".cache" / "huggingface" / "token"
+    if hf_token_file.exists():
+        try:
+            return hf_token_file.read_text().strip()
+        except Exception:
+            pass
+
+    print("[!] Warning: No HF_TOKEN found in env, .secrets, or ~/.cache. Gated models may fail to download.")
+    return ""
+
+
+def run_ssh(
+    ip: str,
+    user: str | None = None,
+    command_list: list | None = None,
+    capture: bool = True,
+    timeout: int = 10,
+    tty: bool = False,
+    connect_timeout: int = 5,
+) -> subprocess.CompletedProcess:
+    """
+    Executes remote commands via SSH with quoted token evaluation.
+
+    user=None resolves to ssh_user from cluster_config.yaml; an explicit
+    user argument always wins.
+
+    capture=True runs with capture_output=True, text=True (the
+    orchestrator's default: callers parse res.stdout). capture=False runs
+    with NO capture kwargs at all, so output streams live to the caller's
+    terminal (the asset-cache path: docker pull / snapshot_download
+    progress bars). This distinction is load-bearing and must not be
+    collapsed.
+
+    tty=True inserts -t as the first argument after ssh, allocating a
+    pseudo-TTY (needed for progress bars to render over SSH).
+
+    connect_timeout populates -o ConnectTimeout=N; timeout is the overall
+    subprocess timeout passed to subprocess.run.
+    """
+    if user is None:
+        user = load_cluster_config().ssh_user
+    if command_list is None:
+        command_list = []
+
+    key_path = resolve_user_identity_key()
+    quoted_remote_cmd = " ".join(shlex.quote(str(arg)) for arg in command_list)
+
+    ssh_cmd = ["ssh"]
+    if tty:
+        ssh_cmd.append("-t")  # Allocate pseudo-TTY for progress bars
+
+    ssh_cmd.extend([
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", f"ConnectTimeout={connect_timeout}",
+        # Reuse one TCP+auth handshake per host across calls instead of
+        # paying a fresh SSH negotiation every time. dgx-config already
+        # cleans up /tmp/cm-* sockets on every invocation - this is what
+        # actually creates the sockets it was cleaning up.
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=60s",
+        "-o", "ControlPath=/tmp/cm-%C",
+        "-i", key_path,
+        f"{user}@{ip}",
+        quoted_remote_cmd,
+    ])
+
+    try:
+        if capture:
+            res = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
+        else:
+            res = subprocess.run(ssh_cmd, timeout=timeout)
+        return res
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args=ssh_cmd, returncode=124, stdout="", stderr="Command execution timed out.")
+    except Exception as e:
+        return subprocess.CompletedProcess(args=ssh_cmd, returncode=1, stdout="", stderr=str(e))

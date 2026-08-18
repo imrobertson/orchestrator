@@ -1,0 +1,36 @@
+ssh_user: tetrel
+ssh_key_name: id_dgx_orchestrator
+default_image: nvcr.io/nvidia/vllm:26.07-py3
+gpu_util_ceiling: 0.75
+
+ports:
+  vllm_api: 8000
+  orchestrator_api: 5001
+  ray: 6379
+  master: 29500
+
+container_names:
+  standalone: vllm-standalone
+  head: vllm-head
+  worker: vllm-worker
+
+hosts:
+  spark-4:
+    alias: spark-9dbe
+    role: head
+    management_ip: 10.0.14.43
+    backplane_ip: 192.168.99.2
+    volume_mount: /home/tetrel/.cache/huggingface:/root/.cache/huggingface
+    active: true
+  spark-3:
+    alias: spark-6e63
+    role: worker
+    management_ip: 10.0.14.41
+    backplane_ip: 192.168.99.1
+    volume_mount: /home/tetrel/.cache/huggingface:/root/.cache/huggingface
+    active: true
+
+network:
+  topology: switched
+  interface: enp1s0f0np0
+  nccl_ib_hca: rocep1s0f0
