@@ -30,6 +30,7 @@ import yaml
 
 from common.config import legacy_hosts_dict, load_cluster_config
 from common.constants import ContainerRole
+from common.recipes import build_catalog_response
 from common.ssh import get_hf_token, resolve_user_identity_key, run_ssh
 
 try:
@@ -395,7 +396,13 @@ def get_cluster_status() -> dict:
 
     return status_data
 
-def load_model_catalog() -> dict:
+def _load_model_catalog_legacy() -> dict:
+    """
+    Original models.yaml-parsing implementation. Kept intact, unmodified,
+    as the USE_LEGACY_CATALOG=1 rollback path -- see load_model_catalog()
+    below. This is the burn-in escape hatch: flipping the env var falls
+    back to this exact behavior with no code change or redeploy.
+    """
     if not MODELS_YAML_PATH.exists():
         return {"catalog": {"models": {}}}
     try:
@@ -429,6 +436,22 @@ def load_model_catalog() -> dict:
         return {"catalog": config}
     except Exception as e:
         return {"error": str(e), "catalog": {"models": {}}}
+
+def load_model_catalog() -> dict:
+    """
+    Public entry point. Name, signature, and return shape are unchanged --
+    every existing call site (get_cluster_status, _execute_deployment_impl,
+    interactive_menu, and the /api/catalog route) keeps calling this exact
+    function with no changes required there.
+
+    Defaults to the recipes/ path via build_catalog_response(). Set
+    USE_LEGACY_CATALOG=1 to fall back to _load_model_catalog_legacy() (the
+    original models.yaml parsing, preserved above) without any code change
+    or redeploy -- this is the rollback lever during burn-in.
+    """
+    if os.environ.get("USE_LEGACY_CATALOG") == "1":
+        return _load_model_catalog_legacy()
+    return build_catalog_response()
 
 def _execute_teardown_impl(target_hosts: list = None) -> dict:
     """Actual teardown logic. Callers must hold CLUSTER_OP_LOCK before calling this -

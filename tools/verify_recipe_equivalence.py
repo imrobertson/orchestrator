@@ -134,10 +134,10 @@ def run_catalog_structure_comparison(mod, old_load_model_catalog) -> list[str]:
             cluster_config_variant = _write_cluster_config_with_flags(tmp_dir, hf, tf)
 
             mod.MODELS_YAML_PATH = models_yaml_variant
-            old_resp = old_load_model_catalog()
-
             config_mod.CLUSTER_CONFIG_PATH = cluster_config_variant
             config_mod.load_cluster_config.cache_clear()
+
+            old_resp = old_load_model_catalog()
             new_resp = build_catalog_response()
 
             if "error" in old_resp:

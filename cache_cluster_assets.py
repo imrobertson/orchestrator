@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 
 from common.config import legacy_hosts_dict
+from common.recipes import build_catalog_response
 from common.ssh import get_hf_token, resolve_user_identity_key, run_ssh
 
 BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
@@ -21,8 +22,12 @@ MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 
 HOSTS = legacy_hosts_dict()
 
-def extract_manifest() -> tuple[set, dict]:
+def _extract_manifest_legacy() -> tuple[set, dict]:
     """
+    Original models.yaml-parsing implementation. Kept intact, unmodified,
+    as the USE_LEGACY_CATALOG=1 rollback path -- see extract_manifest()
+    below.
+
     Returns (all_images, repo_to_image).
 
     repo_to_image maps each HF repo to the SPECIFIC model image it should be
@@ -64,6 +69,62 @@ def extract_manifest() -> tuple[set, dict]:
                 repo_to_image.setdefault(match.group(1), model_image)
 
     return images, repo_to_image
+
+def _extract_manifest_from_recipes() -> tuple[set, dict]:
+    """
+    recipes/-backed implementation. Reads the same catalog shape
+    dgx-orchestrator.py's load_model_catalog() has always returned (via
+    build_catalog_response()) instead of parsing models.yaml directly, but
+    preserves _extract_manifest_legacy()'s per-model image-override logic
+    and speculative-decoding draft-model handling exactly -- same field
+    names (hf_path, image, topologies, vllm_args), same traversal, same
+    --speculative-model regex, same repo_to_image.setdefault() semantics.
+    """
+    resp = build_catalog_response()
+    if "error" in resp:
+        sys.exit(f"[-] Error loading recipe catalog: {resp['error']}")
+
+    config = resp["catalog"]
+
+    default_img = config.get("default_image", "nvcr.io/nvidia/vllm:26.07-py3")
+    images = {default_img}
+    repo_to_image = {}
+
+    models = config.get("models", {})
+    for m_name, m_data in models.items():
+        if not isinstance(m_data, dict):
+            continue
+
+        model_image = m_data.get("image", default_img)
+        images.add(model_image)
+
+        if "hf_path" in m_data:
+            repo_to_image.setdefault(m_data["hf_path"], model_image)
+
+        topologies = m_data.get("topologies", {})
+        for _, topo_data in topologies.items():
+            vllm_args = topo_data.get("vllm_args", "")
+            match = re.search(r'--speculative-model\s+([^\s]+)', vllm_args)
+            if match:
+                # Speculative-decoding draft models ride along with their
+                # parent model's image, since they're loaded by the same process.
+                repo_to_image.setdefault(match.group(1), model_image)
+
+    return images, repo_to_image
+
+def extract_manifest() -> tuple[set, dict]:
+    """
+    Public entry point. Name and return shape are unchanged -- main()'s
+    call site keeps calling this exact function.
+
+    Defaults to the recipes/ path. Set USE_LEGACY_CATALOG=1 to fall back
+    to _extract_manifest_legacy() (the original models.yaml parsing,
+    preserved above) without any code change or redeploy -- same rollback
+    lever as dgx-orchestrator.py's load_model_catalog().
+    """
+    if os.environ.get("USE_LEGACY_CATALOG") == "1":
+        return _extract_manifest_legacy()
+    return _extract_manifest_from_recipes()
 
 def prefetch_docker_images(images: set):
     print("\n" + "="*80)
