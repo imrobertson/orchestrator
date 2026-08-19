@@ -265,6 +265,24 @@ models:
           --language-model-only --reasoning-parser qwen3 --enable-auto-tool-choice 
           --tool-call-parser qwen3_coder --compilation-config '{"mode": 0}'
           --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":5}'
+  
+  qwen-3.8-27b-nvfp4-sqk:
+    hf_path: unsloth/Qwen3.8-27B-NVFP4
+    image: eugr/spark-vllm-b12x:latest
+    gpu_util: 0.70
+    topologies:
+      1_node:
+        max_model_len: 262144
+        tp_size: 1
+        pp_size: 1
+        env_vars:
+          - OMP_NUM_THREADS=16
+          - VLLM_CPU_OMP_THREADS=16
+        vllm_args: >-
+          --trust-remote-code --kv-cache-dtype fp8 --language-model-only
+          --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+          --compilation-config '{"mode": 0}'
+          --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":5}'
 
   qwen-3.6-27b-nvfp4:
     hf_path: sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
