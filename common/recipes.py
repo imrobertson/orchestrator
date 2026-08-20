@@ -18,6 +18,16 @@ them apart means a change to one schema can't accidentally ripple into the
 other's validation, and it mirrors the existing split between
 cluster_config.yaml and recipes/.
 
+A recipe's catalog key is its filename stem -- and *only* its filename
+stem. Earlier versions of this schema also carried a `name:` field inside
+the YAML that was required to match the filename, which meant a model had
+two names that could silently drift apart (a typo in one is a working
+recipe with a broken registration, invisible until someone reads the
+catalog and finds the wrong key -- or, worse, since a bad recipe raises out
+of load_recipes() entirely, invisible until the WHOLE catalog goes empty).
+There is no `name:` field anymore: the filename is authoritative, so
+there's nothing left to disagree with it.
+
 IMPORTANT -- this module builds the catalog response fresh on every call to
 build_catalog_response(). load_recipes() is cached (recipe files rarely
 change at runtime), but the env_vars lists inside each TopologyConfig must
@@ -79,8 +89,10 @@ class TopologyConfig(BaseModel):
 
 
 class RecipeConfig(BaseModel):
+    # No `name` field -- the catalog key is the filename stem, set by
+    # load_recipes() below, not anything carried inside the YAML. See the
+    # module docstring for why.
     recipe_version: str
-    name: str
     hf_path: str
     image: Optional[str] = None
     gpu_util: float
@@ -111,13 +123,6 @@ def _load_single_recipe(path: Path) -> RecipeConfig:
     except ValidationError as exc:
         raise ValueError(f"Recipe file {path} failed validation: {exc}") from exc
 
-    stem = path.stem
-    if recipe.name != stem:
-        raise ValueError(
-            f"Recipe filename mismatch: {path} declares name '{recipe.name}' "
-            f"but the filename stem is '{stem}'; they must match"
-        )
-
     if recipe.recipe_version not in SUPPORTED_RECIPE_VERSIONS:
         print(
             f"Warning: {path} has unrecognized recipe_version "
@@ -138,15 +143,16 @@ def _load_recipes_impl() -> dict[str, RecipeConfig]:
             continue
         for path in sorted(directory.glob("*.yaml")):
             recipe = _load_single_recipe(path)
-            if recipe.name in found:
-                _other_recipe, other_path = found[recipe.name]
+            stem = path.stem
+            if stem in found:
+                _other_recipe, other_path = found[stem]
                 raise ValueError(
-                    f"Recipe name collision for '{recipe.name}': "
+                    f"Recipe name collision for '{stem}': "
                     f"{other_path} and {path}"
                 )
-            found[recipe.name] = (recipe, path)
+            found[stem] = (recipe, path)
 
-    return {name: recipe for name, (recipe, _path) in found.items()}
+    return {stem: recipe for stem, (recipe, _path) in found.items()}
 
 
 @functools.lru_cache(maxsize=1)
@@ -158,7 +164,9 @@ def load_recipes(bypass_cache: bool = False) -> dict[str, RecipeConfig]:
     """
     Load and validate every recipe under recipes/local/ and recipes/eugr/.
 
-    Returns a dict keyed by model name (== recipe.name == filename stem).
+    Returns a dict keyed by filename stem (e.g. "recipes/local/foo.yaml" ->
+    key "foo"). A name collision between local/ and eugr/ (same stem in
+    both) still raises -- see _load_recipes_impl().
 
     Cached across calls (recipe files are read from disk once per process).
     Pass bypass_cache=True to force a fresh read and invalidate the cache --
@@ -179,7 +187,13 @@ def build_catalog_response() -> dict:
     implementation detail, and must not change.
 
     On any load error, returns {"error": <str>, "catalog": {"models": {}}}
-    rather than raising, matching the existing loader's failure mode.
+    rather than raising, matching the existing loader's failure mode. Note
+    this means one malformed recipe file still fails the WHOLE catalog, not
+    just that recipe -- removing the name/filename mismatch class of error
+    (see module docstring) shrinks how often that can happen, but doesn't
+    change this failure mode. Containing that blast radius (skip-and-warn
+    per bad recipe instead of failing everything) is a separate, deliberately
+    unmade change.
     """
     try:
         cluster_cfg = load_cluster_config()

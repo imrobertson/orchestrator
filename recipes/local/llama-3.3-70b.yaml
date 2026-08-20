@@ -1,5 +1,4 @@
 recipe_version: '1'
-name: llama-3.3-70b
 hf_path: meta-llama/Llama-3.3-70B-Instruct
 gpu_util: 0.7
 capability:

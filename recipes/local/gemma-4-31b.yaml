@@ -1,5 +1,4 @@
 recipe_version: '1'
-name: gemma-4-31b
 hf_path: google/gemma-4-31B-it-FP8
 gpu_util: 0.75
 capability:

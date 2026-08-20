@@ -1,5 +1,4 @@
 recipe_version: '1'
-name: muse-glimmer-30b
 hf_path: meta-models/Muse-Glimmer-30B
 image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.75

@@ -1,5 +1,4 @@
 recipe_version: '1'
-name: qwen-3.6-27b-nvfp4
 hf_path: sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
 gpu_util: 0.7
 capability:

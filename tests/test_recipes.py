@@ -33,6 +33,9 @@ def _fresh_cluster_config():
 
 def test_load_recipes_count():
     recipes = load_recipes(bypass_cache=True)
+    # NOTE: this count reflects whatever's currently in recipes/local +
+    # recipes/eugr and needs updating whenever a recipe is added/removed --
+    # it's a tripwire against silent catalog shrinkage, not a fixed target.
     assert len(recipes) == 16, f"expected 16 models, got {len(recipes)}"
     print(f"PASS: load_recipes() returns {len(recipes)} models")
 
@@ -49,6 +52,14 @@ def test_topology_count():
 
 
 def test_local_eugr_collision_raises():
+    """
+    Two recipe files with the SAME FILENAME STEM in local/ and eugr/ must
+    still raise -- this is the one real collision case now that there's no
+    separate `name:` field to also collide on. Previously this test used
+    matching `name:` values inside two differently-purposed fixtures; now
+    the filename stem alone is what collides, so both fixtures just need
+    the same filename.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         local_dir = tmp_path / "local"
@@ -58,7 +69,6 @@ def test_local_eugr_collision_raises():
 
         recipe_yaml = """
 recipe_version: "1"
-name: dupe-model
 hf_path: someorg/dupe-model
 gpu_util: 0.7
 topologies:
@@ -84,10 +94,10 @@ topologies:
             except ValueError as exc:
                 error_raised = True
                 error_message = str(exc)
-            assert error_raised, "duplicate name across local/ and eugr/ should raise"
+            assert error_raised, "duplicate filename stem across local/ and eugr/ should raise"
             assert str(local_path) in error_message, f"error should name {local_path}: {error_message}"
             assert str(eugr_path) in error_message, f"error should name {eugr_path}: {error_message}"
-            print("PASS: local/eugr name collision raises, naming both paths")
+            print("PASS: local/eugr filename collision raises, naming both paths")
         finally:
             recipes_mod.RECIPES_DIR = original_dir
             load_recipes(bypass_cache=True)
@@ -102,7 +112,6 @@ def test_unknown_recipe_version_warns_but_loads():
 
         recipe_yaml = """
 recipe_version: "99"
-name: future-model
 hf_path: someorg/future-model
 gpu_util: 0.7
 topologies:
@@ -126,45 +135,12 @@ topologies:
             load_recipes(bypass_cache=True)
 
 
-def test_filename_name_mismatch_raises():
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        local_dir = tmp_path / "local"
-        local_dir.mkdir()
-        (tmp_path / "eugr").mkdir()
-
-        recipe_yaml = """
-recipe_version: "1"
-name: wrong-name
-hf_path: someorg/mismatched
-gpu_util: 0.7
-topologies:
-  1_node:
-    max_model_len: 4096
-    tp_size: 1
-    pp_size: 1
-    env_vars: []
-    vllm_args: "--trust-remote-code"
-"""
-        bad_path = local_dir / "actual-filename.yaml"
-        bad_path.write_text(recipe_yaml)
-
-        original_dir = recipes_mod.RECIPES_DIR
-        recipes_mod.RECIPES_DIR = tmp_path
-        try:
-            error_raised = False
-            error_message = ""
-            try:
-                load_recipes(bypass_cache=True)
-            except ValueError as exc:
-                error_raised = True
-                error_message = str(exc)
-            assert error_raised, "filename/name mismatch should raise"
-            assert str(bad_path) in error_message, f"error should name {bad_path}: {error_message}"
-            print("PASS: filename/name mismatch raises, naming the file")
-        finally:
-            recipes_mod.RECIPES_DIR = original_dir
-            load_recipes(bypass_cache=True)
+# NOTE: test_filename_name_mismatch_raises() previously lived here. It
+# tested that a `name:` field disagreeing with its filename raised an
+# error. That scenario is now structurally impossible -- RecipeConfig no
+# longer has a `name` field, so there's nothing left inside the YAML that
+# could disagree with the filename. See common/recipes.py's module
+# docstring for the rationale. Removed rather than kept-but-vacuous.
 
 
 def test_offline_flags_both_zero_no_injection():
@@ -227,7 +203,6 @@ def test_offline_flag_filters_existing_entry_not_duplicates():
 
         recipe_yaml = """
 recipe_version: "1"
-name: offline-flag-model
 hf_path: someorg/offline-flag-model
 gpu_util: 0.7
 topologies:
@@ -282,7 +257,6 @@ def test_cluster_only_is_parsed_but_not_exposed_in_catalog():
 
         recipe_yaml = """
 recipe_version: "1"
-name: cluster-only-model
 hf_path: someorg/cluster-only-model
 gpu_util: 0.7
 topologies:
@@ -323,7 +297,6 @@ if __name__ == "__main__":
     test_topology_count()
     test_local_eugr_collision_raises()
     test_unknown_recipe_version_warns_but_loads()
-    test_filename_name_mismatch_raises()
     test_offline_flags_both_zero_no_injection()
     test_offline_flags_both_one_inject_exactly_once()
     test_offline_flag_filters_existing_entry_not_duplicates()

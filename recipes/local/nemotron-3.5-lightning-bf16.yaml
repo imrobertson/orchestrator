@@ -1,5 +1,4 @@
 recipe_version: '1'
-name: nemotron-3.5-lightning-bf16
 hf_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
 gpu_util: 0.7
 capability:

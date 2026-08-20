@@ -16,6 +16,11 @@ are emitted empty/null on every recipe (unused until later phases -- see
 "A note on scope" in PHASE-2-PROMPTS.md). default_image and the two
 GLOBAL_* offline flags are cluster-wide and are NOT copied into recipes;
 they now live in cluster_config.yaml.
+
+Recipes carry no `name:` field -- the filename stem is the catalog key.
+An earlier version of this script emitted `name: <model>` into every
+recipe, which required it to always match the filename; common/recipes.py
+no longer has anywhere to put that field, so it isn't emitted here either.
 """
 
 from __future__ import annotations
@@ -55,9 +60,12 @@ def _vllm_args_value(raw: str):
 
 
 def build_recipe_dict(name: str, model_data: dict) -> dict:
+    # `name` is used only to look up model_data and to compute the output
+    # filename in main() below -- it is deliberately NOT written into the
+    # recipe dict. The filename stem is the catalog key; see the module
+    # docstring.
     recipe: dict = {
         "recipe_version": RECIPE_VERSION,
-        "name": name,
         "hf_path": model_data["hf_path"],
     }
     if "image" in model_data:

@@ -1,5 +1,4 @@
 recipe_version: '1'
-name: qwen-3.8-27b-nvfp4
 hf_path: unsloth/Qwen3.8-27B-NVFP4
 gpu_util: 0.7
 capability:

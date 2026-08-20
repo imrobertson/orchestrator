@@ -1,5 +1,4 @@
 recipe_version: '1'
-name: qwen-2.5-coder-32b
 hf_path: Qwen/Qwen2.5-Coder-32B-Instruct
 gpu_util: 0.7
 capability:

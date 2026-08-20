@@ -1,5 +1,4 @@
 recipe_version: '1'
-name: deepseek-v4-flash
 hf_path: deepseek-ai/DeepSeek-V4-Flash
 image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.82
