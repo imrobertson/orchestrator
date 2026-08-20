@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 # --- Path resolution (mirrors the BASE_DIR pattern used by the existing
 # scripts, e.g. dgx-orchestrator.py: Path(os.getenv("BASE_DIR", <repo root>))).
@@ -41,6 +41,22 @@ class NetworkConfig(BaseModel):
     nccl_ib_hca: str
 
 
+class TuningConfig(BaseModel):
+    """
+    Deploy-time tuning knobs previously hardcoded as literals inside
+    dgx-orchestrator.py's _execute_deployment_impl(). All fields have
+    defaults matching those old hardcoded values, so a cluster_config.yaml
+    that omits the `tuning:` section entirely (e.g. an older file, or a
+    test fixture) keeps working exactly as before with no change required.
+    """
+    shm_size_1node: str = "16gb"
+    shm_size_2node: str = "64gb"
+    gpu_clock_lock: str = "300,1800"
+    deploy_wait_timeout_sec: int = 900
+    deploy_poll_interval_sec: int = 15
+    jit_cache_maxsize_bytes: int = 10_737_418_240  # 10GB
+
+
 class ClusterConfig(BaseModel):
     ssh_user: str
     ssh_key_name: str
@@ -55,6 +71,10 @@ class ClusterConfig(BaseModel):
     # by common/recipes.py::build_catalog_response() -- never per-model.
     global_hf_hub_offline: int = 0
     global_transformers_offline: int = 0
+    # See TuningConfig above. default_factory (not a bare instance) so each
+    # ClusterConfig that omits `tuning:` gets its own TuningConfig() rather
+    # than sharing one mutable default across every load.
+    tuning: TuningConfig = Field(default_factory=TuningConfig)
 
 
 @functools.lru_cache(maxsize=None)

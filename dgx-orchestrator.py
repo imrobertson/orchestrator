@@ -11,7 +11,7 @@ of multi-node LLM serving over a 100GbE backplane via NCCL.
 
 import argparse
 import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
 import json
 import os
@@ -58,6 +58,31 @@ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9?]*[ -/]*[@-~])')
 CLUSTER_OP_LOCK = threading.Lock()
 CLUSTER_OP_LOCK_TIMEOUT = 5  # seconds to wait before giving up and reporting "busy"
 
+# --- Global Thread Pool ---
+# Reusing threads prevents exhaustion from aggressive frontend polling
+WORKER_POOL = ThreadPoolExecutor(max_workers=len(HOSTS) * 2)
+
+# --- Status Call Bounding ---
+# Root cause of the dashboard "hang": _finalize_host_status() makes several
+# SEQUENTIAL SSH round trips per host (docker inspect, log tail, telemetry).
+# If a host is unreachable, each round trip pays its own full timeout before
+# the next one starts, so a single poll against one bad host can take
+# 20-30s+. get_cluster_status() previously had no overall deadline, and
+# nothing stopped concurrent HTTP requests from each kicking off a full
+# independent fan-out - under frequent polling, requests piled up faster
+# than they drained. Reusing the thread pool (above) stopped OS thread
+# exhaustion, but does nothing about this backlog. Two things fix the
+# backlog itself:
+#   1. STATUS_CALL_TIMEOUT_SEC: a hard wall-clock ceiling on the whole call.
+#   2. Single-flight caching below: concurrent callers share one in-flight
+#      computation instead of each starting their own redundant fan-out.
+STATUS_CALL_TIMEOUT_SEC = 12  # generous vs. the 5-10s per-SSH-call timeouts
+
+_STATUS_LOCK = threading.Lock()
+_STATUS_INFLIGHT: Future | None = None
+_STATUS_CACHE: dict | None = None
+_STATUS_CACHE_TS = 0.0
+_STATUS_CACHE_TTL_SEC = 2  # dedupe bursts of near-simultaneous polls
 
 # --- Core Helpers ---
 def get_lightweight_telemetry(ip: str, user: str) -> dict:
@@ -138,6 +163,12 @@ def detect_model_stage(ip: str, user: str, c_name: str) -> str:
 # would never get recorded - so its ETA stayed pinned to the generic
 # 700s/180s default forever instead of learning the real number over time.
 MAX_RECORDABLE_LOAD_SEC = 7200  # 2 hours
+
+# See the BUGFIX comment in _finalize_host_status() for why this exists:
+# guards record_load_time() from being called more than once per container
+# instance during the poll-based (as opposed to deploy-time) recording path.
+_RECORDED_LOAD_STARTS: dict[str, float] = {}
+_RECORDED_LOAD_STARTS_LOCK = threading.Lock()
 
 def record_load_time(model: str, topo_key: str, duration_sec: int):
     if duration_sec > MAX_RECORDABLE_LOAD_SEC or duration_sec < 60: return
@@ -291,8 +322,27 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
             time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
             if time_res.returncode == 0 and time_res.stdout.strip():
                 start_ts = parse_iso_time(time_res.stdout.strip())
-                elapsed = int(time.time() - start_ts)
-                record_load_time(matched_key, topo_key, elapsed)
+                # BUGFIX: this used to call record_load_time() on every single
+                # status poll while the container sat READY and serving, not
+                # just once when it first became ready. Since `elapsed` grows
+                # with every poll, load_times.json entries grew unboundedly
+                # (e.g. climbing in fixed poll-interval steps forever) instead
+                # of capturing the one true cold-start duration. _execute_
+                # deployment_impl() already records the accurate figure once
+                # via wait_for_cluster_ready() when wait=True; this poll-based
+                # path exists as a fallback for models started outside that
+                # flow, so it must also record at most once per container
+                # instance. Track (host, container) -> the StartedAt we've
+                # already recorded for; a changed StartedAt means a new
+                # container instance (restart/redeploy) worth recording again.
+                record_key = f"{host}:{active_container}"
+                with _RECORDED_LOAD_STARTS_LOCK:
+                    already_recorded = _RECORDED_LOAD_STARTS.get(record_key) == start_ts
+                    if not already_recorded:
+                        _RECORDED_LOAD_STARTS[record_key] = start_ts
+                if not already_recorded:
+                    elapsed = int(time.time() - start_ts)
+                    record_load_time(matched_key, topo_key, elapsed)
         elif cluster_ready:
             # Serving endpoint is healthy, but this host is a 2-node worker
             # (no HTTP endpoint of its own) riding along with the real head.
@@ -336,7 +386,37 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
         "telemetry": telemetry
     }
 
-def get_cluster_status() -> dict:
+def _collect_bounded(futures: list, host_order: list, deadline: float, label: str) -> dict:
+    """
+    Waits on `futures` (each tagged by position with host_order) up to the
+    given absolute `deadline` (a time.monotonic() value), rather than
+    blocking on as_completed() with no bound. A host whose future hasn't
+    resolved by the deadline is reported as unreachable/timed-out instead of
+    stalling the whole status call - this is what actually stops one bad
+    host from making every poll (and everything queued behind it) hang.
+    """
+    results = {}
+    for host, fut in zip(host_order, futures):
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            results[host] = fut.result(timeout=remaining)
+        except Exception:
+            # concurrent.futures.TimeoutError (deadline hit) or any exception
+            # raised inside the worker - either way, don't propagate and
+            # don't block; represent this host as unreachable so the rest of
+            # the response can still return promptly.
+            print(f"[!] {label} timed out or failed for host '{host}' - reporting unreachable.")
+            results[host] = None
+    return results
+
+def _compute_cluster_status_impl() -> dict:
+    """
+    Does the actual SSH fan-out and assembly. Callers should go through
+    get_cluster_status() below, which adds the hard wall-clock ceiling and
+    single-flight de-duplication - calling this directly bypasses both.
+    """
+    call_deadline = time.monotonic() + STATUS_CALL_TIMEOUT_SEC
+
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
         try:
@@ -348,10 +428,15 @@ def get_cluster_status() -> dict:
     # to be two sequential per-host round trips (a dedicated
     # discover_serving_host() pass, then the "docker ps -a" inside the main
     # loop) done one host at a time - now it's one round trip per host, both
-    # hosts in parallel.
-    with ThreadPoolExecutor(max_workers=len(HOSTS)) as ex:
-        futures = [ex.submit(_discover_host_container, host, meta) for host, meta in HOSTS.items()]
-        container_info = {info["host"]: info for info in (f.result() for f in as_completed(futures))}
+    # hosts in parallel. Bounded by call_deadline (see _collect_bounded) so a
+    # single unreachable host can't stall this phase past the overall budget.
+    host_order = list(HOSTS.keys())
+    futures_phase1 = [WORKER_POOL.submit(_discover_host_container, host, meta) for host, meta in HOSTS.items()]
+    phase1_results = _collect_bounded(futures_phase1, host_order, call_deadline, "Phase 1 discovery")
+    container_info = {
+        host: (res if res is not None else {"host": host, "reachable": False})
+        for host, res in phase1_results.items()
+    }
 
     # Figure out which host is actually serving BEFORE health-checking it.
     # Do not assume spark-4 - a 1-node deploy may have been pinned to spark-3.
@@ -382,19 +467,74 @@ def get_cluster_status() -> dict:
 
     # Phase 2: finalize each host's status (telemetry, ETA, model-stage
     # detection) concurrently, now that cluster_ready/serving_host are known.
-    with ThreadPoolExecutor(max_workers=len(HOSTS)) as ex:
-        futures = [
-            ex.submit(_finalize_host_status, host, meta, container_info.get(host, {}), cluster_ready, serving_host, catalog_models)
-            for host, meta in HOSTS.items()
-        ]
-        results = dict(f.result() for f in as_completed(futures))
+    # Bounded the same way as Phase 1 - this is the phase most exposed to a
+    # slow/unreachable host, since it makes the most sequential SSH calls.
+    futures_phase2 = [
+        WORKER_POOL.submit(_finalize_host_status, host, meta, container_info.get(host, {}), cluster_ready, serving_host, catalog_models)
+        for host, meta in HOSTS.items()
+    ]
+    phase2_results = _collect_bounded(futures_phase2, host_order, call_deadline, "Phase 2 finalize")
 
     # Assemble in HOSTS' original order rather than thread-completion order,
-    # so the dashboard's host cards don't jump around between polls.
+    # so the dashboard's host cards don't jump around between polls. A None
+    # here means this host's future didn't resolve within the deadline.
     for host in HOSTS:
-        status_data["hosts"][host] = results[host]
+        result = phase2_results.get(host)
+        if result is None:
+            status_data["hosts"][host] = {
+                "ip": HOSTS[host]["ip"], "docker_status": "TIMEOUT", "container_name": "None",
+                "container_state": "NONE", "active_model": "None", "model_status": "NONE",
+                "eta_seconds": 0, "eta_display": "N/A", "telemetry": {}
+            }
+        else:
+            _, host_status = result
+            status_data["hosts"][host] = host_status
 
     return status_data
+
+def get_cluster_status() -> dict:
+    """
+    Public entry point. Every existing call site (interactive_menu, the
+    /api/status route, etc.) keeps calling this exact function with no
+    changes required there.
+
+    Wraps _compute_cluster_status_impl() with single-flight de-duplication:
+    if a computation is already in progress when this is called, callers
+    share that one in-flight result instead of each starting an independent,
+    redundant SSH fan-out. A short TTL cache also absorbs bursts of
+    near-simultaneous polls (e.g. multiple open dashboard tabs) landing just
+    after the in-flight call finishes. Combined with STATUS_CALL_TIMEOUT_SEC
+    bounding each computation, this is what actually prevents the polling
+    backlog that looked like a hung dashboard - see the comments on
+    STATUS_CALL_TIMEOUT_SEC / _STATUS_LOCK above for the full rationale.
+    """
+    global _STATUS_INFLIGHT, _STATUS_CACHE, _STATUS_CACHE_TS
+
+    with _STATUS_LOCK:
+        now = time.monotonic()
+        if _STATUS_CACHE is not None and (now - _STATUS_CACHE_TS) < _STATUS_CACHE_TTL_SEC:
+            return _STATUS_CACHE
+
+        if _STATUS_INFLIGHT is None or _STATUS_INFLIGHT.done():
+            _STATUS_INFLIGHT = WORKER_POOL.submit(_compute_cluster_status_impl)
+        inflight = _STATUS_INFLIGHT
+
+    try:
+        result = inflight.result(timeout=STATUS_CALL_TIMEOUT_SEC + 2)
+    except Exception as e:
+        print(f"[!] get_cluster_status(): in-flight computation failed or timed out: {e}")
+        # Fall back to the last good cache rather than propagating a 500 to
+        # the dashboard, if we have one.
+        with _STATUS_LOCK:
+            if _STATUS_CACHE is not None:
+                return _STATUS_CACHE
+        raise
+
+    with _STATUS_LOCK:
+        _STATUS_CACHE = result
+        _STATUS_CACHE_TS = time.monotonic()
+
+    return result
 
 def _load_model_catalog_legacy() -> dict:
     """
@@ -563,30 +703,58 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
     use_ray = (nodes > 1) and ("--distributed-executor-backend" in vllm_args_list) and ("ray" in vllm_args_list)
 
+    tuning = load_cluster_config().tuning
+
     if not dry_run:
         _execute_teardown_impl(target_hosts=target_hosts)
 
         for h in target_hosts:
             ip = HOSTS[h]["ip"]
-            run_ssh(ip, None, ["sudo", "nvidia-smi", "-lgc", "300,1800"], timeout=10)
+            run_ssh(ip, None, ["sudo", "nvidia-smi", "-lgc", tuning.gpu_clock_lock], timeout=10)
 
     default_img = catalog_resp.get("catalog", {}).get("default_image", load_cluster_config().default_image)
     image_tag = model_config.get("image", default_img)
 
     compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"
-    
+
+    def _jit_cache_mounts_and_env(vol_mount: str) -> tuple[list[str], list[str]]:
+        """
+        Triton/CUDA JIT-compile cache: mounted -v args and matching -e vars.
+        Without a persistent cache dir, every fresh container pays full
+        kernel-compile time on its first request (this is what
+        detect_model_stage()'s "NOT READY - COMPILING KERNELS" stage is
+        catching in the logs). Derives the host-side cache directory as
+        siblings of the existing HF cache dir (from cluster_config.yaml's
+        per-host volume_mount, e.g. "/home/tetrel/.cache/huggingface:...")
+        rather than a hardcoded path, so this tracks whatever host user/path
+        convention cluster_config.yaml already uses instead of assuming
+        "tetrel" specifically.
+        """
+        host_hf_dir = vol_mount.split(":", 1)[0]
+        host_cache_root = str(Path(host_hf_dir).parent)  # e.g. /home/tetrel/.cache
+        triton_mount = f"{host_cache_root}/triton_cache:/root/.triton_cache"
+        cuda_mount = f"{host_cache_root}/nv_compute_cache:/root/.nv/ComputeCache"
+        mounts = ["-v", triton_mount, "-v", cuda_mount]
+        env = [
+            "-e", "TRITON_CACHE_DIR=/root/.triton_cache",
+            "-e", "CUDA_CACHE_PATH=/root/.nv/ComputeCache",
+            "-e", f"CUDA_CACHE_MAXSIZE={tuning.jit_cache_maxsize_bytes}",
+        ]
+        return mounts, env
+
     head_ip = HOSTS[head]["ip"]
     hf_token = get_hf_token()
 
     if nodes == 1:
         ip = HOSTS[head]["ip"]
         vol_mount = load_cluster_config().hosts[head].volume_mount
+        jit_mounts, jit_env = _jit_cache_mounts_and_env(vol_mount)
         env_flags = [
             "-e", "PYTHONUNBUFFERED=1",
             "-e", "NVIDIA_DISABLE_REQUIRE=true",
             "-e", f"HF_HUB_OFFLINE={offline_val}",
             "-e", f"TRANSFORMERS_OFFLINE={offline_val}"
-        ]
+        ] + jit_env
         if hf_token: env_flags.extend(["-e", f"HF_TOKEN={hf_token}"])
 
         for ev in topo_config.get("env_vars", []):
@@ -603,11 +771,11 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         docker_cmd = [
             "docker", "run", "-d",
             "--name", ContainerRole.STANDALONE,
-            "--net=host", "--ipc=host", "--shm-size=16gb",
+            "--net=host", "--ipc=host", f"--shm-size={tuning.shm_size_1node}",
             "--gpus", "all",
             "-v", vol_mount,
             "-v", compat_mount
-        ] + env_flags + [image_tag] + container_args
+        ] + jit_mounts + env_flags + [image_tag] + container_args
 
         res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
         if dry_run:
@@ -616,9 +784,18 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
     else:
         vllm_head_args = None
+        # These already exist in cluster_config.yaml's ports: block but were
+        # previously ignored - the deploy code hardcoded 29500/6379 as
+        # literals instead of reading them, so editing ports.master or
+        # ports.ray in the config silently did nothing.
+        cluster_ports = load_cluster_config().ports
+        master_port = str(cluster_ports.get("master", 29500))
+        ray_port = str(cluster_ports.get("ray", 6379))
+
         for host in target_hosts:
             ip = HOSTS[host]["ip"]
             vol_mount = load_cluster_config().hosts[host].volume_mount
+            jit_mounts, jit_env = _jit_cache_mounts_and_env(vol_mount)
             role_name = ContainerRole.HEAD if host == head else ContainerRole.WORKER
             node_rank = 0 if host == head else 1
 
@@ -638,7 +815,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                 "-e", "NCCL_CUMEM_ENABLE=0",
                 "-e", f"HF_HUB_OFFLINE={offline_val}",
                 "-e", f"TRANSFORMERS_OFFLINE={offline_val}"
-            ]
+            ] + jit_env
             if hf_token: env_flags.extend(["-e", f"HF_TOKEN={hf_token}"])
 
             for ev in topo_config.get("env_vars", []):
@@ -663,7 +840,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                     "--nnodes", str(nodes),
                     "--node-rank", str(node_rank),
                     "--master-addr", head_ip,
-                    "--master-port", "29500",
+                    "--master-port", master_port,
                     "--gpu-memory-utilization", str(gpu_util),
                     "--max-model-len", str(max_model_len)
                 ]
@@ -676,23 +853,23 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
             if use_ray:
                 if host == head:
-                    entrypoint_cmd = ["ray", "start", "--head", "--port=6379", "--num-gpus=1", "--block"]
+                    entrypoint_cmd = ["ray", "start", "--head", f"--port={ray_port}", "--num-gpus=1", "--block"]
                 else:
-                    entrypoint_cmd = ["ray", "start", f"--address={head_ip}:6379", "--num-gpus=1", "--block"]
+                    entrypoint_cmd = ["ray", "start", f"--address={head_ip}:{ray_port}", "--num-gpus=1", "--block"]
             else:
                 entrypoint_cmd = container_args
 
             docker_cmd = [
                 "docker", "run", "-d",
                 "--name", role_name,
-                "--net=host", "--ipc=host", "--shm-size=64gb",
+                "--net=host", "--ipc=host", f"--shm-size={tuning.shm_size_2node}",
                 "--privileged",
                 "--cap-add", "IPC_LOCK",
                 "--device", "/dev/infiniband:/dev/infiniband",
                 "--gpus", "all",
                 "-v", vol_mount,
                 "-v", compat_mount
-            ] + env_flags + [image_tag] + entrypoint_cmd
+            ] + jit_mounts + env_flags + [image_tag] + entrypoint_cmd
 
             res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
             if dry_run:
@@ -738,7 +915,11 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
     if wait or run_benchmark:
         head_ip = HOSTS[head]["ip"]
-        is_ready = wait_for_cluster_ready(head_ip=head_ip, timeout_sec=900)
+        is_ready = wait_for_cluster_ready(
+            head_ip=head_ip,
+            timeout_sec=tuning.deploy_wait_timeout_sec,
+            poll_interval=tuning.deploy_poll_interval_sec,
+        )
         
         if is_ready:
             total_duration = int(time.time() - deploy_start_time)
