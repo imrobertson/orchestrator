@@ -21,6 +21,33 @@ container_names:
   head: vllm-head
   worker: vllm-worker
 
+# Deploy-time tuning knobs previously hardcoded as literals inside
+# dgx-orchestrator.py's _execute_deployment_impl(). Centralized here so
+# they can be adjusted without a code change/redeploy of the orchestrator
+# itself, same rationale as `ports:` above. See common/config.py's
+# TuningConfig for defaults used if this section is omitted entirely
+# (keeps older cluster_config.yaml files working unmodified).
+tuning:
+  # --shm-size passed to `docker run` for 1-node (standalone) vs 2-node
+  # (head/worker) deploys. Previously hardcoded 16gb / 64gb respectively.
+  shm_size_1node: 16gb
+  shm_size_2node: 64gb
+
+  # Value passed to `nvidia-smi -lgc <min>,<max>` before every deploy, to
+  # pin GPU clocks for consistent benchmarking. Previously hardcoded
+  # "300,1800".
+  gpu_clock_lock: "300,1800"
+
+  # wait_for_cluster_ready()'s budget/cadence when a deploy is called with
+  # --wait or --benchmark. Previously hardcoded timeout_sec=900,
+  # poll_interval=15 at the call site in _execute_deployment_impl.
+  deploy_wait_timeout_sec: 900
+  deploy_poll_interval_sec: 15
+
+  # CUDA_CACHE_MAXSIZE (bytes) for the Triton/CUDA JIT-compile cache mounted
+  # into every deployed container -- see _jit_cache_mounts_and_env().
+  jit_cache_maxsize_bytes: 10737418240  # 10GB
+
 hosts:
   spark-4:
     alias: spark-9dbe
