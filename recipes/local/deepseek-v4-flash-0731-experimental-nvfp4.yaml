@@ -20,9 +20,10 @@ topologies:
     - NCCL_IB_GID_INDEX=3
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
+    - VLLM_USE_V1=0
     vllm_args: >-
       --quantization modelopt_fp4 --attention-backend B12X_ATTN --moe-backend flashinfer_b12x 
-      --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype nvfp4_ds_mla --enforce-eager 
+      --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager 
       --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4 
       --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256 
       --max-num-seqs 2 --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","moe_backend":"b12x"}'

@@ -1,11 +1,9 @@
 # DGX Spark Cluster — Architecture & Migration Plan
 
-Companion document to `README-REVIEW.md`. That file is a status snapshot of
-fixes already applied and issues already identified. This one is the plan
-for where the system goes next: a phased path from the current
-`models.yaml`-monolith design to a config-driven, recipe-based, N-node-ready
-control plane — without a big-bang rewrite, because this runs daily for you
-and a few team members now.
+This is the plan for where the system goes next: a phased path from the
+original `models.yaml`-monolith design to a config-driven, recipe-based,
+N-node-ready control plane — without a big-bang rewrite, because this runs
+daily for you and a few team members now.
 
 This supersedes the rough "Phase A / B / C" sketch from earlier discussion.
 Splitting out recipe migration as its own phase (Phase 2 below) made more
@@ -37,8 +35,8 @@ a monolith — the earlier Phase A splits into Phases 1 and 3 here.
    built yet**, so we don't pay for a second migration later. Example: the
    recipe schema gets capability fields (task, context class, latency class)
    in Phase 2, populated with real matching logic only in Phase 4.
-5. **Multi-user changes the risk calculus.** `README-REVIEW.md` filed
-   "no auth on the API" as lowest priority under single-user assumptions.
+5. **Multi-user changes the risk calculus.** "No auth on the API" was
+   originally filed as lowest priority under a single-user assumption.
    That assumption is no longer true — see Open Decisions.
 6. **Don't build or test N-node execution logic against hardware that
    doesn't exist yet.** Design the schema to not block it; defer the actual
@@ -87,19 +85,34 @@ part of Phase 4's allocator work.
 
 ```
 cluster_config.yaml          single source of truth: hosts, ports, ssh,
-                              network interfaces, container naming
+                              network interfaces, container naming, and
+                              deploy-time tuning knobs (shm_size, GPU clock
+                              lock, JIT cache size -- landed ahead of
+                              schedule, see Phase 5 note)
 recipes/
-  eugr/*.yaml                  periodic read-only sync from eugr's recipes/
-  local/*.yaml                 your own — new models, forks of eugr's recipes
+  eugr/*.yaml                   hand-reviewed, hand-promoted translations of
+                                 eugr recipes -- NOT an automated sync
+                                 target (see EUGR-REFERENCE-NOTES.md); the
+                                 actual raw sync + translation pipeline is
+                                 eugr-samples/ -> tools/translate_eugr_recipes.py
+                                 -> recipes/_translated_from_eugr/ -> human
+                                 review -> here or recipes/local/
+  local/*.yaml                  your own -- new models, forks of eugr's
+                                 recipes, hand-authored from scratch
 common/
-  config.py                    loads + validates cluster_config.yaml and
-                                the recipes/ directory (pydantic schemas)
+  config.py                    loads + validates cluster_config.yaml
+                                (pydantic schemas) -- landed
+  recipes.py                    loads + validates recipes/{local,eugr}/*.yaml
+                                (pydantic schemas) -- landed
   ssh.py                        run_ssh, key resolution, HF token lookup
-                                (one implementation, not three)
+                                (one implementation, not three) -- landed
   constants.py                  ContainerRole enum, etc. — no bare string
                                 literals for container names anywhere else
+                                -- landed
   docker_ops.py                 docker run command builders, testable
-                                without SSH or live hardware
+                                without SSH or live hardware -- not yet
+                                extracted; still inline in
+                                _execute_deployment_impl
 dgx-orchestrator.py            imports common/, owns all cluster contact —
                               stays the only thing that ever touches the
                               Sparks over SSH, stays off-node
@@ -129,8 +142,8 @@ before touching anything that runs against production hardware.
 **Changes:**
 - `git tag pre-migration-known-good` on the current working state.
 - Add a `.dockerignore` excluding `.secrets`, `id_dgx_orchestrator`,
-  `.git`, `load_times.json`, `benchmark_ledger.csv`, `__pycache__/` — this
-  was already flagged in `README-REVIEW.md` and costs nothing to do now.
+  `.git`, `load_times.json`, `benchmark_ledger.csv`, `__pycache__/` — a
+  cheap, already-identified fix that costs nothing to do now.
 - Add a `--dry-run` flag to `execute_deployment` that builds and prints the
   full `docker run` argument list without SSHing or executing anything.
   This is the single most useful tool for the phases that follow: it lets
@@ -140,6 +153,9 @@ before touching anything that runs against production hardware.
 - Write a 10-line smoke-test script: hits `/api/status`, asserts both hosts
   report `reachable`, asserts the catalog loads and is non-empty. Run it
   after every phase below as a go/no-go gate.
+
+**Status: landed.** `--dry-run` exists on `execute_deployment` /
+`_execute_deployment_impl`, `tools/smoke_test.py` exists.
 
 **Verification / rollback:** trivial — nothing here changes runtime
 behavior, only adds tooling.
@@ -167,6 +183,8 @@ dicts (plus `benchmark.py`'s partial fourth copy) become one load call.
 - Both scripts import from `common/` instead of defining their own `HOSTS`.
   `benchmark.py`'s `DEFAULT_HOST_IP` becomes `cluster_config.hosts["spark-4"].management_ip`.
 
+**Status: landed.**
+
 **Verification / rollback:** for every model in the current catalog, run
 `--dry-run deploy` before and after the refactor and diff the resulting
 `docker run` arg lists — they must be identical. Then do one real deploy of
@@ -188,10 +206,10 @@ model without touching a shared file, and a clean seam for borrowing (or
 diverging from) eugr's tested recipes.
 
 **Changes:**
-- Design the recipe schema (draft below) — borrows eugr's `schema_version`
-  and `cluster_only` / `solo_only` flags, since those catch real
-  configuration errors (deploying a topology combo that doesn't exist)
-  before deploy time instead of after.
+- Design the recipe schema (draft below) — borrows eugr's
+  `recipe_version` and `cluster_only` / `solo_only` flags, since those
+  catch real configuration errors (deploying a topology combo that doesn't
+  exist) before deploy time instead of after.
 - Split `recipes/` into `eugr/` and `local/`. `eugr/` is a periodic,
   read-only-by-convention sync from eugr's `recipes/` directory for models
   where their tested build/flags are the right answer — pin to a specific
@@ -221,6 +239,59 @@ diverging from) eugr's tested recipes.
 - Before hand-writing 14 recipe files: confirm which of the current 14
   catalog models are actually still in active use. No reason to migrate
   cruft.
+- **[New, 2026-08-20] `mods:` execution — a real deliverable now, not a
+  placeholder.** This was previously "doesn't need real content on day
+  one" plus an open decision on the mechanism (see the old Open Decisions
+  entry, now removed below). Decided: adapt eugr's `mods/<name>/run.sh`
+  pattern directly — a mod is a directory containing a `run.sh`, applied
+  via `docker exec <container> bash -c "$(cat run.sh)"` (or an equivalent
+  copy-in-and-run, whichever proves simpler against real hardware) right
+  after the container reaches `RUNNING`, before the health-check poll
+  starts. This is the same "adapt, driven by our off-node SSH call instead
+  of their local/SSH dual path" idea `EUGR-REFERENCE-NOTES.md`'s
+  "Borrow / adapt / skip" section already named — this entry is what turns
+  that stated intent into an actual scoped task with a landing spot
+  (Phase 2, since it needs no N-node hardware and no allocator, just the
+  recipe schema this phase already builds). Concretely:
+  - `recipe.mods: list[str]` already exists in the schema and already
+    round-trips through `load_recipes()` — no schema change needed, just
+    execution.
+  - Mod content itself (the actual `run.sh` files) is expected to come
+    from the same `eugr-samples/` → translate → review pipeline as
+    recipes, not hand-written from scratch — `EUGR-REFERENCE-NOTES.md`'s
+    "If we pull more" list already prioritizes `mods/drop-caches/run.sh`
+    and `mods/gpu-mem-util-gb/run.sh` as directly relevant to the Phase 5
+    OOM-watchdog gap; those are the first two real candidates to port,
+    not hypothetical.
+  - Ordering matters for correctness, not just tidiness: mods run after
+    the container is confirmed `RUNNING` (so there's something to `exec`
+    into) but before `wait_for_cluster_ready()` starts polling `/health`
+    (so a mod that needs to run before the model finishes loading — e.g.
+    a cache-clearing mod — actually gets the chance to).
+  - Verification: same `--dry-run` pattern as everything else in this
+    plan doesn't fully cover this, since `--dry-run` explicitly never
+    touches a host — mod application needs its own smoke test once the
+    first real mod is ported (apply a no-op mod, confirm the exec
+    happened via container logs).
+
+**Status: mostly landed, with one piece corrected after landing.** Recipe
+schema, `recipes/{local,eugr}` split, and the dual-load burn-in period all
+shipped. One thing shipped differently than this draft originally
+specified and is worth recording rather than quietly forgetting: **the
+recipe schema originally included a `name:` field (see the old schema
+draft below, now corrected) that was required to match the filename
+stem.** That redundancy caused a real production incident — a recipe's
+`name:` drifted out of sync with its filename during an unrelated merge,
+and because `build_catalog_response()` fails closed on any single bad
+recipe, the *entire* model catalog silently went empty (confirmed via the
+dashboard's "Select Model" dropdown showing nothing). Fixed by removing
+`name:` entirely — the filename stem is now the only identifier, so
+there's structurally nothing left for it to disagree with. See
+`common/recipes.py`'s module docstring and `EUGR-REFERENCE-NOTES.md`'s
+2026-08-20 update for the full account. The schema draft later in this
+document reflects the corrected, current shape — the version further down
+that still shows a `name:` line and `schema_version:` (vs. the actual
+`recipe_version:`) is stale and is fixed in this same edit.
 
 **Verification / rollback:** the dual-load comparison above is the
 verification. Rollback is trivial during burn-in — `models.yaml` still
@@ -232,6 +303,13 @@ volume mounts, ssh user, etc. — recipes describe the model, not the host).
 
 **Risk:** medium — this is the phase with the most hand-migration (14 model
 configs → 14 files), so it's the one most worth the dual-load safety net.
+Confirmed higher-touch than expected in one respect: single-point-of-
+failure risk from `build_catalog_response()`'s fail-everything-on-one-bad-
+recipe behavior turned out to be real, not theoretical — see the incident
+noted above. That failure mode itself is **not yet fixed** (only its one
+trigger, the `name:` field, is gone) — containing the blast radius of a
+future malformed recipe (skip-and-warn per-file instead of failing the
+whole catalog) remains an open item, moved to Phase 5 below.
 
 ---
 
@@ -255,7 +333,7 @@ universe rather than a fact about your current hardware.
   reason.
 - `execute_teardown`'s always-nukes-everything behavior → accept a
   `target_hosts` param at the API/CLI level (the function already accepts
-  it internally; this was already flagged in `README-REVIEW.md`).
+  it internally — this is a pre-identified gap, not new).
 - Recipe topology keys generalize from `1_node`/`2_node` to whatever node
   counts actually apply (`4_node`, etc.) — this needs no schema change,
   just more keys, since the schema was never restricted to exactly two.
@@ -307,9 +385,9 @@ alongside them.
 ## Phase 5 — Ongoing hardening backlog
 *Interleave opportunistically, not blocking, not strictly ordered.*
 
-Everything already catalogued in `README-REVIEW.md`'s "Known issues"
-section belongs here. Highlighting the ones worth moving up given the
-system is now multi-user:
+Ongoing hardening items, not urgent enough to block a phase but worth not
+losing track of. Highlighting the ones worth moving up given the system is
+now multi-user:
 
 - **Auth on `/api/deploy`, `/api/teardown`, `/api/toggle-network`, and the
   wide-open + likely-invalid CORS config.** Filed as lowest priority under
@@ -319,18 +397,65 @@ system is now multi-user:
 - **Per-user attribution.** The shared `tetrel` SSH identity means
   `auth.log` on the Sparks can't distinguish which teammate ran what — only
   the unauthenticated, self-reported `user_id` field does that today.
+- **[New, 2026-08-20] Contain `build_catalog_response()`'s blast radius.**
+  One malformed recipe currently fails the *entire* catalog, not just
+  itself (see the Phase 2 status note above for the incident this caused).
+  Removing the `name:`/filename mismatch closed the one trigger we hit,
+  but the underlying all-or-nothing failure mode is still there and will
+  bite again the next time any recipe fails validation for any other
+  reason. Fix: catch per-recipe validation errors inside the load loop,
+  skip and warn (recipe name + reason) instead of propagating, return a
+  catalog with everything *except* the bad file(s) rather than an empty
+  one.
+- **[New, 2026-08-20] `get_cluster_status()` polling hang + duplicate
+  load-time recording — landed, but the pattern is worth generalizing.**
+  Fixed: single-flight de-duplication + a hard per-call timeout
+  (`STATUS_CALL_TIMEOUT_SEC`) so one unreachable host can't stall the
+  whole status endpoint, plus `record_load_time()` no longer fires on
+  every poll while a container sits idle-but-ready (it was recording an
+  ever-growing "load time" once per poll interval instead of once at
+  actual readiness). Backlog item: `execute_deployment`'s SSH-heavy paths
+  (teardown, GPU clock lock, per-host docker run) have no equivalent
+  per-call timeout ceiling yet — same class of risk (one unreachable host
+  stalling an otherwise-independent operation), not yet audited the same
+  way `get_cluster_status()` was.
+- **[New, 2026-08-20] `EUGR_CONTAINER_IMAGE_MAP` maintenance.**
+  `tools/translate_eugr_recipes.py`'s one manual-decision point — an
+  unmapped `container:` value blocks translating that one recipe until a
+  human adds an entry. Low-touch (per `EUGR-REFERENCE-NOTES.md`'s
+  2026-08-20 update, eugr's own docs now steer new recipes toward the
+  no-mapping-needed default), but worth a standing reminder here rather
+  than only living in a script comment.
 - Lower urgency, same backlog: `BackgroundTasks` for the blocking deploy
   path, per-model load-time defaults in the recipe instead of hardcoded in
   Python, `authorize-key` dedup, non-root Dockerfile user, pinned `nginx`
   tag, a `HEALTHCHECK`.
+- **[New, 2026-08-20] Vestigial file cleanup.** `docker-compose.cluster.yml`
+  / `docker-compose.standalone.yml` (dead — nothing reads them,
+  `_execute_deployment_impl` builds `docker run` commands directly),
+  `patch.py` (a stale one-shot find/replace script targeting code that has
+  since changed shape — its target strings no longer match, so it's
+  already inert), and a stray zero-byte file. Low-priority housekeeping,
+  noted here so it isn't lost.
 
 ---
 
 ## Recipe schema (draft)
 
+**Corrected 2026-08-20** — the version of this draft below previously
+showed `schema_version:` and a `name:` field. Neither matches what
+actually shipped: the real field is `recipe_version:` (not
+`schema_version:`), and `name:` was removed entirely after the incident
+described in the Phase 2 status note above — the recipe's catalog key is
+its filename stem, and only its filename stem. This draft is now the
+actual current shape (matches `common/recipes.py::RecipeConfig` and
+`recipes/local/*.yaml` on disk), not aspirational.
+
 ```yaml
-schema_version: 1
-name: qwen-2.5-coder-32b
+recipe_version: 1
+# No `name:` field -- the filename (e.g. this file being
+# qwen-2.5-coder-32b.yaml) IS the catalog key. See the correction note
+# above for why that's deliberate, not an omission.
 hf_path: Qwen/Qwen2.5-Coder-32B-Instruct
 image: nvcr.io/nvidia/vllm:26.07-py3   # omit to use cluster_config's default_image
 gpu_util: 0.70
@@ -343,8 +468,12 @@ capability:
   latency_class: standard
 
 # Optional runtime patches applied before `vllm serve` starts. Empty until
-# a model actually needs one — see eugr's mods/ directory for the pattern
-# (curl+patch, pip install, etc.) this is modeled on.
+# a model actually needs one -- see eugr's mods/ directory for the pattern
+# (curl+patch, pip install, etc.) this is modeled on. Execution mechanism
+# (docker exec of a mod's run.sh, after RUNNING / before the health-check
+# poll) is a scheduled Phase 2 deliverable as of 2026-08-20 -- see that
+# phase's "mods: execution" entry above, not just a schema placeholder
+# anymore.
 mods: []
 
 topologies:
@@ -358,8 +487,14 @@ topologies:
     vllm_args: >-
       --trust-remote-code --kv-cache-dtype fp8 --enable-chunked-prefill
   2_node:
-    cluster_only: true   # mirrors eugr's cluster_only/solo_only flags —
-                          # fails loudly at load time, not at deploy time
+    cluster_only: true   # mirrors eugr's cluster_only/solo_only flags --
+                          # fails loudly at load time, not at deploy time.
+                          # Confirmed 2026-08-20 against real eugr recipes
+                          # that this field is genuinely whole-recipe on
+                          # their side (not per-topology like it is here)
+                          # -- see EUGR-REFERENCE-NOTES.md and the Open
+                          # Decisions entry below. Still inert on our side;
+                          # not yet enforced anywhere.
     max_model_len: 131072
     tp_size: 1
     pp_size: 2
@@ -373,6 +508,13 @@ topologies:
 ```
 
 ## `cluster_config.yaml` (draft)
+
+**Status: landed, plus more than originally drafted.** The `tuning:` block
+below (`shm_size`, GPU clock lock, deploy wait/poll timeouts, JIT cache
+size) wasn't in the original draft — added 2026-08-20 once those values
+were found hardcoded as literals inside `_execute_deployment_impl` during
+an unrelated debugging session. Documenting here since this file is meant
+to track drift between plan and reality, not just the plan.
 
 ```yaml
 ssh_user: tetrel
@@ -391,6 +533,18 @@ container_names:
   standalone: vllm-standalone
   head: vllm-head
   worker: vllm-worker
+
+# Added 2026-08-20, not in the original draft -- see the status note
+# above. Defaults match what used to be hardcoded, so this section being
+# entirely absent from an older config file is still valid (all fields
+# have defaults in common/config.py's TuningConfig).
+tuning:
+  shm_size_1node: 16gb
+  shm_size_2node: 64gb
+  gpu_clock_lock: "300,1800"
+  deploy_wait_timeout_sec: 900
+  deploy_poll_interval_sec: 15
+  jit_cache_maxsize_bytes: 10737418240
 
 hosts:
   spark-4:
@@ -440,53 +594,98 @@ racked, with zero effect on current behavior.
 ## Open decisions
 
 - **API auth, now that it's multi-user.** Token auth on `/api/deploy` and
-  `/api/teardown` was explicitly deprioritized in `README-REVIEW.md` under
-  a single-user assumption. Worth deciding now whether that assumption
-  still holds, and if not, whether to fold a minimal shared-token check
-  into Phase 1 rather than leaving it in the Phase 5 backlog indefinitely.
-- **`eugr/` recipe sync cadence.** How often to re-pull eugr's `recipes/`
-  into `recipes/eugr/`, and whether that's a manual occasional task or
-  something scripted.
-- **Mods execution mechanism.** Whether `mods:` commands get wrapped in the
-  same `bash -c` pattern already used for the Ray-head exec, or something
-  more structured — fine to decide when the first real mod is needed rather
-  than now.
+  `/api/teardown` was originally deprioritized under a single-user
+  assumption. Worth deciding now whether that assumption still holds, and
+  if not, whether to fold a minimal shared-token check into Phase 1 rather
+  than leaving it in the Phase 5 backlog indefinitely.
+- **`eugr/` recipe sync cadence — partially resolved 2026-08-20.** The
+  mechanism now exists and is real, not hypothetical:
+  `eugr-samples/` (raw, unmodified sync target) →
+  `tools/translate_eugr_recipes.py --write` (mechanical translation,
+  never touches `recipes/local/` or `recipes/eugr/` directly) →
+  `recipes/_translated_from_eugr/` (staging output) → human review → the
+  reviewed file is moved into `recipes/local/` or `recipes/eugr/` by
+  hand. What's still genuinely undecided is *cadence* — how often someone
+  re-pulls `imrobertson/spark-vllm-docker-experiments` into
+  `eugr-samples/` and re-runs the translator. Manual/occasional remains
+  fine for now given the mods/`run.sh` porting work (Phase 2) is a bigger
+  near-term priority than sync frequency.
 - **Recipe pruning.** Confirm which of the current 14 cataloged models are
   actually in active use before migrating all of them in Phase 2.
-- **`cluster_only` enforcement — deferred pending exact semantics.** The
-  field exists in the schema today (`common/recipes.py::TopologyConfig`)
-  and round-trips through `load_recipes()`, but is deliberately inert: it's
-  never read by `build_catalog_response()` or by `dgx-orchestrator.py`'s
-  deploy path, same treatment as `capability`/`mods`. Confirmed (re-reading
-  this doc's own line 361 comment) that enforcement belongs in the
-  **recipe loader, at load time** — not in `_execute_deployment_impl` at
-  deploy time, which was floated and is wrong for this design. Two things
-  block writing that check now rather than it being pure laziness:
-    - eugr's `cluster_only`/`solo_only` are whole-recipe flags checked
-      against a node count *derived* from parsed `-tp`/`-pp`/`-dp` flags
-      (see `EUGR-REFERENCE-NOTES.md`). We deliberately diverge — node
-      count is the explicit `topologies` dict key — so the exact
-      "mismatch" condition a load-time check should assert isn't yet
-      pinned down for our schema; it may end up being closer to an
-      internal-consistency check (Phase 3, N>2 nodes, is where
-      `cluster_only` stops being redundant with "is this the `2_node`
-      key" and starts meaning something new: "consumes the whole current
-      cluster, not just a subset").
-    - We only have `cluster_only`, not eugr's `solo_only` — see
+- **`cluster_only` enforcement — still deferred, now with real evidence
+  instead of a guess.** The field exists in the schema today
+  (`common/recipes.py::TopologyConfig`) and round-trips through
+  `load_recipes()`, but is deliberately inert: never read by
+  `build_catalog_response()` or by `dgx-orchestrator.py`'s deploy path,
+  same treatment as `capability`/`mods`. Confirmed (re-reading this doc's
+  own Phase 2 section) that enforcement belongs in the **recipe loader, at
+  load time** — not in `_execute_deployment_impl` at deploy time, which
+  was floated and is wrong for this design. As of 2026-08-20 we have real
+  eugr recipes confirming the exact shape of the mismatch this check would
+  need to catch (not a guess anymore):
+    - eugr's `cluster_only`/`solo_only` are whole-recipe flags, confirmed
+      across 5 real files including two (`nemotron-3_5-lightning`,
+      `qwen3-coder-next-fp8`) where both are `false`/absent and the same
+      recipe is valid at *both* node counts. Our schema nests
+      `cluster_only` per-topology instead (see the corrected draft
+      above) — deliberately, since that's more expressive (a recipe could
+      in principle want `1_node` cluster-only'd out and `2_node` not,
+      which their whole-recipe flag can't express at all), but it does
+      mean our version of "enforce this" is a genuinely different check
+      than theirs, not a port of theirs.
+    - We still only have `cluster_only`, not eugr's `solo_only` — see
       `EUGR-REFERENCE-NOTES.md`'s "Borrow directly" list, which names
-      both. Worth adding `solo_only` to the schema at the same time we
-      pin down the validation rule, rather than a second migration.
-  Real eugr recipes (a few have been offered for direct testing) should
-  resolve this concretely rather than guessing from docs. `verify_recipe_equivalence.py`
-  needs a matching update *whenever* either field starts appearing in the
-  catalog response (same treatment as the `hosts` exclusion it already
-  has) — flagging here so that change isn't made in isolation later.
+      both, and the two solo-only real recipes
+      (`diffusion-gemma-bf16`, `diffusion-gemma-nvfp4-thinking`) that
+      would exercise it. Worth adding `solo_only` to the schema at the
+      same time the validation rule gets pinned down, rather than a
+      second migration.
+  Still not blocking anything today, still fine to leave inert — but the
+  "resolve concretely rather than guessing from docs" instruction from the
+  previous version of this note has been satisfied; what's left is
+  deciding the actual rule and writing it, whenever that becomes a
+  priority. `verify_recipe_equivalence.py` needs a matching update
+  *whenever* either field starts appearing in the catalog response (same
+  treatment as the `hosts` exclusion it already has) — flagging here so
+  that change isn't made in isolation later.
+- **Mods execution mechanism — resolved 2026-08-20, moved to Phase 2.**
+  Previously listed here as undecided ("whether `mods:` commands get
+  wrapped in the same `bash -c` pattern already used for the Ray-head
+  exec, or something more structured -- fine to decide when the first real
+  mod is needed"). Decided: yes, adapt the `bash -c` / `docker exec`
+  pattern directly, same idea as the Ray-head exec. This is no longer an
+  open decision -- see Phase 2's "mods: execution" entry above for the
+  concrete scope (ordering relative to the health-check poll, where mod
+  content is sourced from, what verification looks like).
+- **Schema adoption — resolved 2026-08-20, not an open question
+  anymore.** Whether to adopt eugr's flat `defaults:` + `command:`
+  template shape as our own live schema (instead of maintaining a
+  separate structured schema and translating at the boundary) came up
+  directly. Decided no. Full reasoning lives in
+  `EUGR-REFERENCE-NOTES.md`'s 2026-08-20 update section rather than
+  duplicated here -- short version: their shape is optimized for a human
+  interactively overriding CLI flags with nobody watching a template-
+  rendering failure in real time; ours is optimized for a control plane
+  where nobody's watching a given deploy at all, so the same looseness
+  that helps them is a liability for us. Recorded here mainly so this
+  doesn't get re-litigated from scratch next time someone notices how
+  much of the eugr translation turned out to be mechanical.
 
 ## Suggested immediate next step
 
-Phase 0 is intentionally small and non-disruptive: a git tag, a
-`.dockerignore`, and a `--dry-run` flag. All three can happen this week
-without touching anything that runs against the live cluster, and the
-`--dry-run` flag is what makes every later phase mechanically verifiable
-instead of "looks right, deploy it and see." Worth doing before Phase 1
-starts, regardless of how the rest of the timeline shakes out.
+**Update 2026-08-20:** Phase 0 and Phase 1 are done. Phase 2 is mostly
+done (recipe schema, `recipes/{local,eugr}` split, dual-load burn-in all
+shipped) with one real deliverable still open and now concretely scoped
+rather than vague: **the `mods:` execution mechanism** (see Phase 2's new
+entry above) — porting `mods/drop-caches` and `mods/gpu-mem-util-gb` from
+the real eugr repo is the natural first real-world test of it, and both
+are already independently useful for the Phase 5 OOM-watchdog gap. That's
+the recommended next concrete piece of work, ahead of starting Phase 3
+(which is hardware-gated anyway) or Phase 4 (which explicitly depends on
+Phase 3).
+
+Original Phase 0 framing, kept for history: it was intentionally small and
+non-disruptive — a git tag, a `.dockerignore`, and a `--dry-run` flag. All
+three happened without touching anything that runs against the live
+cluster, and the `--dry-run` flag turned out to be exactly as useful as
+hoped for verifying every phase since.

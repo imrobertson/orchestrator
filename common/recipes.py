@@ -64,7 +64,7 @@ _TOPOLOGY_OUTPUT_FIELDS = ("max_model_len", "tp_size", "pp_size", "env_vars", "v
 
 
 class CapabilityConfig(BaseModel):
-    """Unused for now -- populated in Phase 4. See PHASE-2-PROMPTS.md."""
+    """Unused for now -- populated in Phase 4. See docs/PHASE-2-PROMPTS.md."""
 
     task: Optional[str] = None
     context_class: Optional[str] = None

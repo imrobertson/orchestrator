@@ -5,7 +5,7 @@ Plain-assert tests for common/recipes.py. Run with:
 
 Assumes tools/convert_models_yaml.py has already been run so
 recipes/local/*.yaml exists (the Phase 2A verification steps run the
-conversion first -- see PHASE-2-PROMPTS.md).
+conversion first -- see docs/PHASE-2-PROMPTS.md).
 """
 
 import shutil

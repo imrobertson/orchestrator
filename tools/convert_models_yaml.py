@@ -13,7 +13,7 @@ loader actually being correct -- it's a dumb, auditable transcription.
 
 Per-model recipes carry only what varies per model. `capability` and `mods`
 are emitted empty/null on every recipe (unused until later phases -- see
-"A note on scope" in PHASE-2-PROMPTS.md). default_image and the two
+"A note on scope" in docs/PHASE-2-PROMPTS.md). default_image and the two
 GLOBAL_* offline flags are cluster-wide and are NOT copied into recipes;
 they now live in cluster_config.yaml.
 

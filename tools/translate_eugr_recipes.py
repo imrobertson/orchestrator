@@ -5,7 +5,7 @@ imrobertson/spark-vllm-docker-experiments) into our RecipeConfig schema
 (recipes/local/*.yaml shape -- see common/recipes.py).
 
 Confirmed against real recipe files, not just the eugr recipes/README.md
-spec (see EUGR-REFERENCE-NOTES.md for the original field-by-field review).
+spec (see docs/EUGR-REFERENCE-NOTES.md for the original field-by-field review).
 This script encodes that review as executable logic instead of prose.
 
 WHY THIS ISN'T A BLIND SYNC
@@ -62,7 +62,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_IN_DIR = REPO_ROOT / "eugr-samples"
 DEFAULT_OUT_DIR = REPO_ROOT / "recipes" / "_translated_from_eugr"
 
-# Confirmed real mapping, built from EUGR-REFERENCE-NOTES.md's manual
+# Confirmed real mapping, built from docs/EUGR-REFERENCE-NOTES.md's manual
 # confirmation and recipes/local/deepseek-v4-flash.yaml already pointing at
 # this same image. "vllm-node" (their default) needs NO entry here -- it
 # maps to omitting `image:` entirely, which falls back to
@@ -81,7 +81,7 @@ EUGR_DEFAULT_CONTAINER = "vllm-node"
 # itself (see dgx-orchestrator.py) from recipe fields other than
 # vllm_args -- these must NOT also appear in the translated vllm_args, or
 # the rendered docker run command would carry the same flag twice (the
-# exact risk called out in EUGR-REFERENCE-NOTES.md). Matched against the
+# exact risk called out in docs/EUGR-REFERENCE-NOTES.md). Matched against the
 # rendered command's flag tokens, not the raw template text, so this
 # works regardless of how EUGR phrases the substitution.
 ORCHESTRATOR_INJECTED_FLAGS = {
@@ -129,7 +129,7 @@ def _topologies_to_emit(data: dict) -> list[str]:
 def _render_command(command_template: str, defaults: dict, warnings: list[str]) -> str:
     """
     str.format(**defaults) is the exact mechanism EUGR's own run-recipe.py
-    uses (confirmed in EUGR-REFERENCE-NOTES.md) -- including the `{{` / `}}`
+    uses (confirmed in docs/EUGR-REFERENCE-NOTES.md) -- including the `{{` / `}}`
     -> literal brace behavior around JSON blobs, which str.format() already
     does natively. No custom escaping logic needed here; this is not an
     approximation of their templating, it's the same one.
