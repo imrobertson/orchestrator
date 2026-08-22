@@ -13,27 +13,27 @@
             --text-muted: #94a3b8;
             --accent: #38bdf8;
         }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
-            background: var(--bg-dark); 
-            color: var(--text-main); 
-            margin: 0; 
-            padding: 15px; 
-            display: flex; 
-            flex-direction: column; 
-            height: 100vh; 
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-main);
+            margin: 0;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
             box-sizing: border-box;
             overflow: hidden;
         }
         
         /* Header */
-        header { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            border-bottom: 1px solid var(--border-color); 
-            padding-bottom: 10px; 
-            margin-bottom: 15px; 
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            margin-bottom: 15px;
             flex-shrink: 0;
             flex-wrap: wrap;
             gap: 10px;
@@ -43,7 +43,7 @@
         .net-badge { font-size: 12px; padding: 4px 10px; border-radius: 6px; font-weight: bold; cursor: pointer; display: inline-block; transition: all 0.2s ease; border: 1px solid transparent; }
         .net-badge:hover { filter: brightness(1.2); }
 
-        /* Top Layout: Anchored Hosts + Deployer */
+        /* Top Layout */
         .dashboard-top {
             display: grid;
             grid-template-columns: 2fr 1fr;
@@ -57,12 +57,12 @@
         }
 
         /* Cards */
-        .card { 
-            background: var(--bg-card); 
-            border: 1px solid var(--border-color); 
-            border-radius: 8px; 
-            padding: 15px; 
-            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); 
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
             display: flex;
             flex-direction: column;
         }
@@ -81,100 +81,121 @@
 
         /* Forms & Inputs */
         label { font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px; font-weight: 500; }
-        select, input { 
-            background: var(--bg-dark); 
-            color: white; 
-            border: 1px solid #475569; 
-            padding: 10px; 
-            border-radius: 6px; 
-            width: 100%; 
-            margin-bottom: 12px; 
-            box-sizing: border-box; 
-            font-size: 14px;
-            min-height: 44px;
+        select, input {
+            background: var(--bg-dark);
+            color: white;
+            border: 1px solid #475569;
+            padding: 8px;
+            border-radius: 6px;
+            width: 100%;
+            margin-bottom: 10px;
+            box-sizing: border-box;
+            font-size: 13px;
+            min-height: 38px;
         }
+
+        /* Recipe Metadata Strip */
+        .recipe-meta-strip {
+            background: var(--bg-dark);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 8px;
+            margin-bottom: 10px;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+            text-align: center;
+        }
+        .meta-item { display: flex; flex-direction: column; }
+        .meta-label { font-size: 9px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; margin-bottom: 2px; }
+        .meta-value { font-family: monospace; font-size: 12px; color: var(--accent); font-weight: bold; }
+
+        .recipe-yaml-drawer { margin-bottom: 10px; font-size: 11px; }
+        .recipe-yaml-drawer summary { cursor: pointer; color: var(--accent); font-size: 11px; font-weight: bold; user-select: none; }
+        .recipe-yaml-drawer pre { background: var(--bg-dark); padding: 8px; border-radius: 4px; max-height: 120px; overflow-y: auto; font-size: 10px; color: #cbd5e1; margin-top: 4px; font-family: monospace; }
         
         /* Buttons */
-        .btn { 
-            background: #0284c7; 
-            color: white; 
-            border: none; 
-            padding: 12px; 
-            border-radius: 6px; 
-            cursor: pointer; 
-            font-weight: bold; 
-            font-size: 14px;
-            transition: background 0.2s; 
-            width: 100%; 
-            min-height: 44px;
+        .btn {
+            background: #0284c7;
+            color: white;
+            border: none;
+            padding: 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 13px;
+            transition: background 0.2s;
+            width: 100%;
+            min-height: 40px;
         }
         .btn:hover:not(:disabled) { background: #0369a1; }
         .btn:disabled { background: #475569; color: var(--text-muted); cursor: not-allowed; }
-        .btn-danger { background: #dc2626; margin-top: 8px; }
+        .btn-danger { background: #dc2626; margin-top: 6px; }
         .btn-danger:hover:not(:disabled) { background: #b91c1c; }
 
-        /* Status Toast Line */
+        /* Toast Line */
         .status-toast {
-            margin-top: 8px;
-            font-size: 12px;
+            margin-top: 6px;
+            font-size: 11px;
             font-family: monospace;
             text-align: center;
-            min-height: 18px;
+            min-height: 16px;
             transition: opacity 0.3s ease;
         }
 
-        /* Logs Section - Fills remaining screen space with min 300px height */
+        /* Logs Section */
         .log-section {
             margin-top: 15px;
             flex-grow: 1;
             display: flex;
             flex-direction: column;
-            min-height: 300px;
+            min-height: 250px;
             min-width: 0;
         }
-        .log-card { 
-            margin: 0; 
-            padding: 15px; 
-            flex-grow: 1; 
-            display: flex; 
-            flex-direction: column; 
-            min-height: 0; 
+        .log-card {
+            margin: 0;
+            padding: 15px;
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
         }
-        .log-header-row { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            border-bottom: 1px solid var(--border-color); 
-            padding-bottom: 10px; 
-            margin-bottom: 10px; 
+        .log-header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+            margin-bottom: 10px;
             flex-shrink: 0;
         }
         .log-header-row h2 { margin: 0; border: none; padding: 0; }
         .log-header-row select { width: auto; min-height: 32px; padding: 4px 10px; margin: 0; font-size: 12px; }
         
-        pre#logBox { 
-            background: var(--bg-dark); 
-            padding: 12px; 
-            border-radius: 6px; 
-            font-size: 12px; 
-            color: #cbd5e1; 
-            margin: 0; 
+        pre#logBox {
+            background: var(--bg-dark);
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            color: #cbd5e1;
+            margin: 0;
             flex-grow: 1;
-            overflow-y: auto; 
-            white-space: pre-wrap; 
-            word-wrap: break-word; 
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
             font-family: monospace;
         }
 
         @media (max-width: 1024px) {
             body { height: auto; min-height: 100vh; overflow-y: auto; }
             .dashboard-top { grid-template-columns: 1fr; }
-            .log-section { height: 450px; min-height: 300px; flex-grow: 0; }
+            .log-section { height: 400px; min-height: 250px; flex-grow: 0; }
         }
         @media (max-width: 650px) {
             .hosts-grid { grid-template-columns: 1fr; }
             header { flex-direction: column; align-items: flex-start; }
             .clock { align-self: flex-start; margin-top: 5px; }
+            .recipe-meta-strip { grid-template-columns: 1fr 1fr; gap: 8px; }
         }
     </style>
 </head>
@@ -203,7 +224,7 @@
             <h2>Model Deployer</h2>
             
             <label>Select Model:</label>
-            <select id="modelSelect" onchange="updateTopologyOptions()"></select>
+            <select id="modelSelect" onfocus="fetchCatalog()" onchange="updateTopologyOptions()"></select>
             
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
                 <div>
@@ -220,6 +241,31 @@
                     </select>
                 </div>
             </div>
+
+            <!-- Recipe Metadata Strip -->
+            <div id="recipeMetaCard" class="recipe-meta-strip">
+                <div class="meta-item">
+                    <span class="meta-label">Context / Max Seqs</span>
+                    <span id="metaContextSeq" class="meta-value">--</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Load Time</span>
+                    <span id="metaLoadTime" class="meta-value">--</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Output Speed</span>
+                    <span id="metaTps" class="meta-value">--</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Precision / Dtype</span>
+                    <span id="metaPrecision" class="meta-value">--</span>
+                </div>
+            </div>
+
+            <details class="recipe-yaml-drawer">
+                <summary>Inspect Recipe YAML</summary>
+                <pre><code id="rawYamlViewer">Select a recipe...</code></pre>
+            </details>
             
             <label>User ID / Auditor:</label>
             <input type="text" id="userIdInput" value="dashboard_user">
@@ -375,9 +421,15 @@
             globalCatalog = data.catalog.models || {};
             
             const select = document.getElementById('modelSelect');
+            const currentSelected = select.value;
             select.innerHTML = '';
+            
             for (const modelKey of Object.keys(globalCatalog)) {
                 select.innerHTML += `<option value="${modelKey}">${modelKey}</option>`;
+            }
+            
+            if (currentSelected && globalCatalog[currentSelected]) {
+                select.value = currentSelected;
             }
             updateTopologyOptions();
         } catch (e) {
@@ -390,12 +442,16 @@
         const nodesSelect = document.getElementById('nodesSelect');
         const topologies = globalCatalog[model]?.topologies || {};
         
+        const currentNodes = nodesSelect.value;
         nodesSelect.innerHTML = '';
         if (topologies['1_node']) {
             nodesSelect.innerHTML += `<option value="1">1 Node</option>`;
         }
         if (topologies['2_node']) {
             nodesSelect.innerHTML += `<option value="2">2 Node</option>`;
+        }
+        if (currentNodes && nodesSelect.querySelector(`option[value="${currentNodes}"]`)) {
+            nodesSelect.value = currentNodes;
         }
         updateHeadNodeVisibility();
     }
@@ -408,6 +464,30 @@
         } else {
             headContainer.style.visibility = 'visible';
         }
+        updateRecipeMetadata();
+    }
+
+    function updateRecipeMetadata() {
+        const modelKey = document.getElementById('modelSelect').value;
+        const nodes = document.getElementById('nodesSelect').value;
+        const recipe = globalCatalog[modelKey];
+        if (!recipe) return;
+
+        const topoKey = nodes === "2" ? "2_node" : "1_node";
+        const top = recipe.topologies?.[topoKey] || {};
+
+        const ctxK = top.max_model_len ? `${Math.round(top.max_model_len / 1024)}k` : "N/A";
+        const maxSeqs = top.max_num_seqs || "Uncapped";
+        document.getElementById('metaContextSeq').innerText = `${ctxK} / ${maxSeqs}`;
+
+        document.getElementById('metaLoadTime').innerText = top.avg_load_display || "N/A";
+        document.getElementById('metaTps').innerText = top.historical_tps || "N/A";
+
+        const precision = recipe.precision_label || "BF16";
+        const kvDtype = top.kv_dtype || "AUTO KV";
+        document.getElementById('metaPrecision').innerText = `${precision} / ${kvDtype}`;
+
+        document.getElementById('rawYamlViewer').textContent = JSON.stringify(recipe, null, 2);
     }
 
     async function fetchLogs() {
@@ -490,6 +570,7 @@
     fetchCatalog();
     fetchStatus();
     fetchLogs();
+    setInterval(fetchCatalog, 15000);
     setInterval(fetchStatus, 4000);
     setInterval(fetchLogs, 5000);
 </script>

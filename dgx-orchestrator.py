@@ -46,6 +46,7 @@ except ImportError:
 BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
 MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 LOAD_TIMES_PATH = BASE_DIR / "load_times.json"
+BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
 
 HOSTS = legacy_hosts_dict()
 
@@ -53,30 +54,14 @@ NETWORK_STATE_FILE = BASE_DIR / ".network_mode"
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9?]*[ -/]*[@-~])')
 
 # --- Cluster Operation Lock ---
-# Guards deploy/teardown so two operations (e.g. a double-click, or a CLI call
-# racing a dashboard click) can never interleave and corrupt cluster state.
 CLUSTER_OP_LOCK = threading.Lock()
-CLUSTER_OP_LOCK_TIMEOUT = 5  # seconds to wait before giving up and reporting "busy"
+CLUSTER_OP_LOCK_TIMEOUT = 5  # seconds
 
 # --- Global Thread Pool ---
-# Reusing threads prevents exhaustion from aggressive frontend polling
 WORKER_POOL = ThreadPoolExecutor(max_workers=len(HOSTS) * 2)
 
 # --- Status Call Bounding ---
-# Root cause of the dashboard "hang": _finalize_host_status() makes several
-# SEQUENTIAL SSH round trips per host (docker inspect, log tail, telemetry).
-# If a host is unreachable, each round trip pays its own full timeout before
-# the next one starts, so a single poll against one bad host can take
-# 20-30s+. get_cluster_status() previously had no overall deadline, and
-# nothing stopped concurrent HTTP requests from each kicking off a full
-# independent fan-out - under frequent polling, requests piled up faster
-# than they drained. Reusing the thread pool (above) stopped OS thread
-# exhaustion, but does nothing about this backlog. Two things fix the
-# backlog itself:
-#   1. STATUS_CALL_TIMEOUT_SEC: a hard wall-clock ceiling on the whole call.
-#   2. Single-flight caching below: concurrent callers share one in-flight
-#      computation instead of each starting their own redundant fan-out.
-STATUS_CALL_TIMEOUT_SEC = 12  # generous vs. the 5-10s per-SSH-call timeouts
+STATUS_CALL_TIMEOUT_SEC = 12  # seconds
 
 _STATUS_LOCK = threading.Lock()
 _STATUS_INFLIGHT: Future | None = None
@@ -157,16 +142,8 @@ def detect_model_stage(ip: str, user: str, c_name: str) -> str:
 
     return "NOT READY - INITIALIZING"
 
-# Upper bound on what counts as a "real" load duration worth recording.
-# Previously 1800s (30min), which meant a genuinely slow cold-cache load of a
-# larger 2-node model (qwen-3.5-122b, llama-3.3-70b, deepseek-v4-flash, etc.)
-# would never get recorded - so its ETA stayed pinned to the generic
-# 700s/180s default forever instead of learning the real number over time.
 MAX_RECORDABLE_LOAD_SEC = 7200  # 2 hours
 
-# See the BUGFIX comment in _finalize_host_status() for why this exists:
-# guards record_load_time() from being called more than once per container
-# instance during the poll-based (as opposed to deploy-time) recording path.
 _RECORDED_LOAD_STARTS: dict[str, float] = {}
 _RECORDED_LOAD_STARTS_LOCK = threading.Lock()
 
@@ -221,13 +198,6 @@ def get_vllm_metrics(head_ip: str = "10.0.14.43", port: int = 8000) -> dict:
     return metrics
 
 def _discover_host_container(host: str, meta: dict) -> dict:
-    """
-    Phase 1 (parallel-safe): host-local discovery of the active vLLM
-    container, if any. Doesn't depend on cluster_ready/serving_host, so it's
-    safe to run for both hosts concurrently before we know which one is
-    actually serving - this replaces the old separate discover_serving_host()
-    pass, which duplicated this same `docker ps` round-trip.
-    """
     ip = meta["ip"]
     user = None
     info = {
@@ -283,12 +253,6 @@ def _discover_host_container(host: str, meta: dict) -> dict:
     return info
 
 def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool, serving_host: str, catalog_models: dict) -> tuple:
-    """
-    Phase 2 (parallel-safe): turns phase-1 discovery + already-known
-    cluster_ready/serving_host into the final per-host status dict. Each
-    host's telemetry/log/inspect calls here are independent of the other
-    host, so this can run for both hosts concurrently.
-    """
     ip = meta["ip"]
     user = None
 
@@ -303,7 +267,6 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
     container_state = info["container_state"]
     loaded_model = info["loaded_model"]
 
-    # Model key normalization for load_times.json matching
     matched_key = loaded_model
     if catalog_models and isinstance(catalog_models, dict):
         for cat_key, cat_data in catalog_models.items():
@@ -322,19 +285,6 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
             time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
             if time_res.returncode == 0 and time_res.stdout.strip():
                 start_ts = parse_iso_time(time_res.stdout.strip())
-                # BUGFIX: this used to call record_load_time() on every single
-                # status poll while the container sat READY and serving, not
-                # just once when it first became ready. Since `elapsed` grows
-                # with every poll, load_times.json entries grew unboundedly
-                # (e.g. climbing in fixed poll-interval steps forever) instead
-                # of capturing the one true cold-start duration. _execute_
-                # deployment_impl() already records the accurate figure once
-                # via wait_for_cluster_ready() when wait=True; this poll-based
-                # path exists as a fallback for models started outside that
-                # flow, so it must also record at most once per container
-                # instance. Track (host, container) -> the StartedAt we've
-                # already recorded for; a changed StartedAt means a new
-                # container instance (restart/redeploy) worth recording again.
                 record_key = f"{host}:{active_container}"
                 with _RECORDED_LOAD_STARTS_LOCK:
                     already_recorded = _RECORDED_LOAD_STARTS.get(record_key) == start_ts
@@ -344,8 +294,6 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                     elapsed = int(time.time() - start_ts)
                     record_load_time(matched_key, topo_key, elapsed)
         elif cluster_ready:
-            # Serving endpoint is healthy, but this host is a 2-node worker
-            # (no HTTP endpoint of its own) riding along with the real head.
             model_status = "READY"
         else:
             model_status = detect_model_stage(ip, user, active_container)
@@ -387,34 +335,17 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
     }
 
 def _collect_bounded(futures: list, host_order: list, deadline: float, label: str) -> dict:
-    """
-    Waits on `futures` (each tagged by position with host_order) up to the
-    given absolute `deadline` (a time.monotonic() value), rather than
-    blocking on as_completed() with no bound. A host whose future hasn't
-    resolved by the deadline is reported as unreachable/timed-out instead of
-    stalling the whole status call - this is what actually stops one bad
-    host from making every poll (and everything queued behind it) hang.
-    """
     results = {}
     for host, fut in zip(host_order, futures):
         remaining = max(0.0, deadline - time.monotonic())
         try:
             results[host] = fut.result(timeout=remaining)
         except Exception:
-            # concurrent.futures.TimeoutError (deadline hit) or any exception
-            # raised inside the worker - either way, don't propagate and
-            # don't block; represent this host as unreachable so the rest of
-            # the response can still return promptly.
             print(f"[!] {label} timed out or failed for host '{host}' - reporting unreachable.")
             results[host] = None
     return results
 
 def _compute_cluster_status_impl() -> dict:
-    """
-    Does the actual SSH fan-out and assembly. Callers should go through
-    get_cluster_status() below, which adds the hard wall-clock ceiling and
-    single-flight de-duplication - calling this directly bypasses both.
-    """
     call_deadline = time.monotonic() + STATUS_CALL_TIMEOUT_SEC
 
     offline_mode = False
@@ -424,12 +355,6 @@ def _compute_cluster_status_impl() -> dict:
         except Exception:
             pass
 
-    # Phase 1: discover each host's container state concurrently. This used
-    # to be two sequential per-host round trips (a dedicated
-    # discover_serving_host() pass, then the "docker ps -a" inside the main
-    # loop) done one host at a time - now it's one round trip per host, both
-    # hosts in parallel. Bounded by call_deadline (see _collect_bounded) so a
-    # single unreachable host can't stall this phase past the overall budget.
     host_order = list(HOSTS.keys())
     futures_phase1 = [WORKER_POOL.submit(_discover_host_container, host, meta) for host, meta in HOSTS.items()]
     phase1_results = _collect_bounded(futures_phase1, host_order, call_deadline, "Phase 1 discovery")
@@ -438,10 +363,6 @@ def _compute_cluster_status_impl() -> dict:
         for host, res in phase1_results.items()
     }
 
-    # Figure out which host is actually serving BEFORE health-checking it.
-    # Do not assume spark-4 - a 1-node deploy may have been pinned to spark-3.
-    # Iterate HOSTS (not container_info) for deterministic host preference
-    # regardless of which thread happened to finish first.
     serving_host = "spark-4"
     for host in HOSTS:
         if container_info.get(host, {}).get("active_container") in (ContainerRole.STANDALONE, ContainerRole.HEAD):
@@ -465,19 +386,12 @@ def _compute_cluster_status_impl() -> dict:
         "hosts": {}
     }
 
-    # Phase 2: finalize each host's status (telemetry, ETA, model-stage
-    # detection) concurrently, now that cluster_ready/serving_host are known.
-    # Bounded the same way as Phase 1 - this is the phase most exposed to a
-    # slow/unreachable host, since it makes the most sequential SSH calls.
     futures_phase2 = [
         WORKER_POOL.submit(_finalize_host_status, host, meta, container_info.get(host, {}), cluster_ready, serving_host, catalog_models)
         for host, meta in HOSTS.items()
     ]
     phase2_results = _collect_bounded(futures_phase2, host_order, call_deadline, "Phase 2 finalize")
 
-    # Assemble in HOSTS' original order rather than thread-completion order,
-    # so the dashboard's host cards don't jump around between polls. A None
-    # here means this host's future didn't resolve within the deadline.
     for host in HOSTS:
         result = phase2_results.get(host)
         if result is None:
@@ -493,21 +407,6 @@ def _compute_cluster_status_impl() -> dict:
     return status_data
 
 def get_cluster_status() -> dict:
-    """
-    Public entry point. Every existing call site (interactive_menu, the
-    /api/status route, etc.) keeps calling this exact function with no
-    changes required there.
-
-    Wraps _compute_cluster_status_impl() with single-flight de-duplication:
-    if a computation is already in progress when this is called, callers
-    share that one in-flight result instead of each starting an independent,
-    redundant SSH fan-out. A short TTL cache also absorbs bursts of
-    near-simultaneous polls (e.g. multiple open dashboard tabs) landing just
-    after the in-flight call finishes. Combined with STATUS_CALL_TIMEOUT_SEC
-    bounding each computation, this is what actually prevents the polling
-    backlog that looked like a hung dashboard - see the comments on
-    STATUS_CALL_TIMEOUT_SEC / _STATUS_LOCK above for the full rationale.
-    """
     global _STATUS_INFLIGHT, _STATUS_CACHE, _STATUS_CACHE_TS
 
     with _STATUS_LOCK:
@@ -523,8 +422,6 @@ def get_cluster_status() -> dict:
         result = inflight.result(timeout=STATUS_CALL_TIMEOUT_SEC + 2)
     except Exception as e:
         print(f"[!] get_cluster_status(): in-flight computation failed or timed out: {e}")
-        # Fall back to the last good cache rather than propagating a 500 to
-        # the dashboard, if we have one.
         with _STATUS_LOCK:
             if _STATUS_CACHE is not None:
                 return _STATUS_CACHE
@@ -536,13 +433,65 @@ def get_cluster_status() -> dict:
 
     return result
 
+def enrich_catalog(catalog_dict: dict) -> dict:
+    """Decorates catalog models with parsed metadata, estimated load times, and TPS stats."""
+    models = catalog_dict.get("catalog", {}).get("models", {})
+    if not isinstance(models, dict):
+        return catalog_dict
+
+    ledger_tps = {}
+    if BENCHMARK_LEDGER_PATH.exists():
+        try:
+            for line in BENCHMARK_LEDGER_PATH.read_text().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 3:
+                    m_name, tps_val = parts[1], parts[2]
+                    try:
+                        ledger_tps[m_name] = f"{round(float(tps_val))} tps"
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+    for m_key, m_data in models.items():
+        if not isinstance(m_data, dict):
+            continue
+
+        hf_path = str(m_data.get("hf_path", "")).lower()
+        m_key_lower = m_key.lower()
+
+        if "nvfp4" in m_key_lower or "nvfp4" in hf_path or "fp4" in m_key_lower:
+            precision_label = "NVFP4"
+        elif "fp8" in m_key_lower or "fp8" in hf_path:
+            precision_label = "FP8"
+        elif "int4" in m_key_lower or "awq" in m_key_lower:
+            precision_label = "INT4"
+        else:
+            precision_label = "BF16"
+
+        m_data["precision_label"] = precision_label
+
+        topologies = m_data.get("topologies", {})
+        if isinstance(topologies, dict):
+            for t_key, t_data in topologies.items():
+                if not isinstance(t_data, dict):
+                    continue
+
+                vllm_args = t_data.get("vllm_args", "")
+                
+                seq_match = re.search(r'--max-num-seqs\s+(\d+)', vllm_args)
+                t_data["max_num_seqs"] = seq_match.group(1) if seq_match else "Uncapped"
+
+                kv_match = re.search(r'--kv-cache-dtype\s+([^\s]+)', vllm_args)
+                t_data["kv_dtype"] = (kv_match.group(1).upper() + " KV") if kv_match else "AUTO KV"
+
+                est_sec, has_hist = get_estimated_load_time(m_key, t_key)
+                t_data["avg_load_display"] = f"{est_sec}s" if has_hist else "N/A"
+                t_data["historical_tps"] = ledger_tps.get(m_key, "N/A")
+
+    return catalog_dict
+
 def _load_model_catalog_legacy() -> dict:
-    """
-    Original models.yaml-parsing implementation. Kept intact, unmodified,
-    as the USE_LEGACY_CATALOG=1 rollback path -- see load_model_catalog()
-    below. This is the burn-in escape hatch: flipping the env var falls
-    back to this exact behavior with no code change or redeploy.
-    """
     if not MODELS_YAML_PATH.exists():
         return {"catalog": {"models": {}}}
     try:
@@ -578,24 +527,13 @@ def _load_model_catalog_legacy() -> dict:
         return {"error": str(e), "catalog": {"models": {}}}
 
 def load_model_catalog() -> dict:
-    """
-    Public entry point. Name, signature, and return shape are unchanged --
-    every existing call site (get_cluster_status, _execute_deployment_impl,
-    interactive_menu, and the /api/catalog route) keeps calling this exact
-    function with no changes required there.
-
-    Defaults to the recipes/ path via build_catalog_response(). Set
-    USE_LEGACY_CATALOG=1 to fall back to _load_model_catalog_legacy() (the
-    original models.yaml parsing, preserved above) without any code change
-    or redeploy -- this is the rollback lever during burn-in.
-    """
     if os.environ.get("USE_LEGACY_CATALOG") == "1":
-        return _load_model_catalog_legacy()
-    return build_catalog_response()
+        raw_cat = _load_model_catalog_legacy()
+    else:
+        raw_cat = build_catalog_response()
+    return enrich_catalog(raw_cat)
 
 def _execute_teardown_impl(target_hosts: list = None) -> dict:
-    """Actual teardown logic. Callers must hold CLUSTER_OP_LOCK before calling this -
-    use execute_teardown() below unless you're already inside a locked deploy sequence."""
     results = {}
     hosts_to_clean = target_hosts if target_hosts else list(HOSTS.keys())
     for host in hosts_to_clean:
@@ -606,8 +544,6 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
     return results
 
 def execute_teardown(target_hosts: list = None) -> dict:
-    """Public entry point. Acquires CLUSTER_OP_LOCK so a teardown can never
-    interleave with an in-progress deploy (or another teardown)."""
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
     if not acquired:
         return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
@@ -646,18 +582,9 @@ def execute_sync() -> dict:
     return {"status": "success", "details": results}
 
 def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
-    """Actual deployment logic. Callers must hold CLUSTER_OP_LOCK before calling this -
-    use execute_deployment() below. dry_run=True builds every docker run command exactly
-    as a real deploy would but never calls run_ssh (or anything else that touches a host):
-    no teardown, no GPU clock lock, no ray registration, no post-deploy verification, no
-    wait/benchmark. Returns the per-host docker run argument lists instead of deploying."""
     deploy_start_time = time.time()
     docker_run_commands: dict = {}
 
-    # nodes must be exactly 1 or 2 - anything else used to silently fall through
-    # to single-node behavior (the `else [head]` branch below), which meant a
-    # bad value like nodes=0 or nodes=3 would deploy quietly with the wrong
-    # topology instead of failing loudly.
     if nodes not in (1, 2):
         return {"status": "error", "message": f"Invalid 'nodes' value {nodes!r}: must be 1 or 2."}
 
@@ -670,7 +597,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     models_catalog = catalog_resp.get("catalog", {}).get("models", {})
 
     if model not in models_catalog:
-        return {"status": "error", "message": f"Model '{model}' not defined in models.yaml catalog."}
+        return {"status": "error", "message": f"Model '{model}' not defined in catalog."}
 
     model_config = models_catalog[model]
     topologies = model_config.get("topologies", {})
@@ -679,7 +606,6 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     if topo_key not in topologies:
         return {"status": "error", "message": f"Topology '{topo_key}' not supported for model '{model}'."}
 
-    # Fetch live cluster offline state to explicitly bind to docker arguments
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
         try:
@@ -690,7 +616,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
     topo_config = topologies[topo_key]
     hf_path = model_config.get("hf_path", model)
-    gpu_util = model_config.get("gpu_util", 0.70)
+    gpu_util = model_config.get("gpu_util", 0.75)
     max_model_len = topo_config.get("max_model_len", 32768)
     tp_size = topo_config.get("tp_size", 1)
     pp_size = topo_config.get("pp_size", nodes)
@@ -718,20 +644,8 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"
 
     def _jit_cache_mounts_and_env(vol_mount: str) -> tuple[list[str], list[str]]:
-        """
-        Triton/CUDA JIT-compile cache: mounted -v args and matching -e vars.
-        Without a persistent cache dir, every fresh container pays full
-        kernel-compile time on its first request (this is what
-        detect_model_stage()'s "NOT READY - COMPILING KERNELS" stage is
-        catching in the logs). Derives the host-side cache directory as
-        siblings of the existing HF cache dir (from cluster_config.yaml's
-        per-host volume_mount, e.g. "/home/tetrel/.cache/huggingface:...")
-        rather than a hardcoded path, so this tracks whatever host user/path
-        convention cluster_config.yaml already uses instead of assuming
-        "tetrel" specifically.
-        """
         host_hf_dir = vol_mount.split(":", 1)[0]
-        host_cache_root = str(Path(host_hf_dir).parent)  # e.g. /home/tetrel/.cache
+        host_cache_root = str(Path(host_hf_dir).parent)
         triton_mount = f"{host_cache_root}/triton_cache:/root/.triton_cache"
         cuda_mount = f"{host_cache_root}/nv_compute_cache:/root/.nv/ComputeCache"
         mounts = ["-v", triton_mount, "-v", cuda_mount]
@@ -784,10 +698,6 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
     else:
         vllm_head_args = None
-        # These already exist in cluster_config.yaml's ports: block but were
-        # previously ignored - the deploy code hardcoded 29500/6379 as
-        # literals instead of reading them, so editing ports.master or
-        # ports.ray in the config silently did nothing.
         cluster_ports = load_cluster_config().ports
         master_port = str(cluster_ports.get("master", 29500))
         ray_port = str(cluster_ports.get("ray", 6379))
@@ -944,11 +854,6 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     }
 
 def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
-    """Public entry point. Acquires CLUSTER_OP_LOCK so two deploys (or a deploy
-    and a teardown) can never interleave and leave the cluster in a half-started,
-    dashboard-doesn't-match-reality state. dry_run=True is a pure computation - it
-    never calls run_ssh or mutates any cluster state - so it skips the lock
-    entirely and can safely run concurrently with a real deploy in progress."""
     if dry_run:
         return _execute_deployment_impl(model, nodes, head, user_id, wait=wait, run_benchmark=run_benchmark, dry_run=True)
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
@@ -970,20 +875,17 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
     if not containers: return {"logs": ["No active vLLM containers on this node."]}
 
     c_name = containers[0]
-    # Fetch a larger tail buffer from Docker to compensate for filtered health/metrics requests
     fetch_tail = max(tail * 5, 400)
     log_res = run_ssh(ip, None, ["docker", "logs", "--tail", str(fetch_tail), c_name], timeout=10)
     
     raw_logs = log_res.stdout.splitlines() if log_res.returncode == 0 else log_res.stderr.splitlines()
     clean_logs = [ANSI_ESCAPE.sub('', line) for line in raw_logs]
 
-    # Suppress HTTP health check and Prometheus metrics polling requests
     filtered_logs = [
-        line for line in clean_logs 
+        line for line in clean_logs
         if not any(endpoint in line for endpoint in ["GET /health", "GET /metrics"])
     ]
 
-    # Retain the exact requested line depth from the filtered log buffer
     final_logs = filtered_logs[-tail:] if len(filtered_logs) > tail else filtered_logs
 
     return {"logs": final_logs if final_logs else ["Log buffer empty."]}
@@ -1005,7 +907,7 @@ def interactive_menu():
     models = list(catalog_data.keys())
 
     if not models:
-        print("[-] No models found in models.yaml.")
+        print("[-] No models found in catalog.")
         return
 
     print("\nAvailable Models:")
@@ -1054,7 +956,7 @@ def interactive_menu():
         print(f"[-] Invalid selection: {e}")
 
 if HAS_FASTAPI:
-    app = FastAPI(title="Tetrel Security DGX Control Plane API", version="4.6.3")
+    app = FastAPI(title="Tetrel Security DGX Control Plane API", version="4.8.1")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
     class DeployRequest(BaseModel):
