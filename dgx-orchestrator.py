@@ -261,6 +261,24 @@ BENCHMARK_STATE = {
 }
 BENCHMARK_STATE_LOCK = threading.Lock()
 
+# --- Global Teardown Progress State ---
+# Teardown is otherwise a synchronous, blocking call (deploy depends on that --
+# it must know containers are actually gone before launching new ones, so it
+# can't be fire-and-forget the way benchmarking is). Since the grace-period
+# rewrite it can now legitimately take up to ~3x TEARDOWN_GRACE_SEC, with zero
+# visibility into which phase it's in. This dict is written by
+# _execute_teardown_impl as it moves through phases and read by the status
+# endpoint, which the dashboard is ALREADY polling on its own timer
+# concurrently with the blocking teardown POST -- so the UI gets live phase
+# updates without teardown itself needing to become async.
+TEARDOWN_STATE = {
+    "running": False,
+    "phase": "idle",  # idle | signaling | stopping | removing | done
+    "message": "Idle",
+    "last_run": None
+}
+TEARDOWN_STATE_LOCK = threading.Lock()
+
 # --- Global Thread Pool ---
 WORKER_POOL = ThreadPoolExecutor(max_workers=len(HOSTS) * 2)
 
@@ -478,10 +496,55 @@ def parse_iso_time(ts_str: str) -> float:
     except Exception:
         return time.time()
 
+_LOG_LINE_PREFIX_RE = re.compile(r'^\([^)]*\)\s*')  # e.g. "(APIServer pid=2331) "
+
+def _detect_crash_signature(clean_text: str) -> Optional[str]:
+    """
+    Returns a short crash reason if the log tail contains an unhandled
+    Python traceback, else None.
+
+    This exists because detect_model_stage()'s keyword scan below matches
+    on substrings anywhere in the log -- including inside an exception's
+    OWN error message. A ValueError reading "nvfp4 KV cache is not
+    supported with MLA backends" contains the literal phrase "kv cache"
+    and silently matched the WARMUP bucket, reporting a definitively
+    crashed engine as "NOT READY - WARMUP" with an ETA that counted up
+    forever since nothing was ever going to finish. Checking for a
+    traceback FIRST and short-circuiting avoids this whole class of false
+    positive regardless of what a future crash's error text happens to
+    contain -- not just this one specific message.
+
+    Also matters because in a 2-node Ray deploy, the container's PID 1 is
+    `ray start --block`, not the vLLM engine -- the engine runs as a
+    separate `docker exec -d` process, detached from the container's own
+    process tree. Docker correctly reports the container RUNNING (Ray is
+    fine) even after the engine itself has crashed, so container-level
+    health alone can't be trusted here; the logs are the only signal.
+    """
+    if "traceback (most recent call last)" not in clean_text.lower():
+        return None
+
+    # Walk backward for the actual exception line -- by Python convention
+    # the last non-empty line after a traceback is "SomeError: message" or
+    # "pkg.mod.SomeError: message". vLLM's multi-process API server
+    # prefixes every log line with e.g. "(APIServer pid=2331) ", which has
+    # to be stripped first or the line-start anchor never matches.
+    lines = [l.strip() for l in clean_text.splitlines() if l.strip()]
+    for line in reversed(lines):
+        stripped = _LOG_LINE_PREFIX_RE.sub('', line)
+        if re.match(r'^[\w.]+(?:Error|Exception):\s', stripped):
+            return stripped[:160]
+    return "Unhandled exception (see logs)"
+
 def detect_model_stage(ip: str, user: str, c_name: str) -> str:
     res = run_ssh(ip, user, ["docker", "logs", "--tail", "250", c_name], timeout=10)
     raw_text = res.stdout + res.stderr
     clean_text = ANSI_ESCAPE.sub('', raw_text)
+
+    crash = _detect_crash_signature(clean_text)
+    if crash:
+        return f"CRASHED (ENGINE EXITED: {crash})"
+
     lines = [l.strip().lower() for l in clean_text.splitlines() if l.strip()]
 
     for line in reversed(lines):
@@ -837,34 +900,38 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
             model_status = "READY"
         else:
             model_status = detect_model_stage(ip, user, active_container)
-            
-            if isinstance(telemetry.get("gpu_util_pct"), int) and telemetry["gpu_util_pct"] > 75:
-                model_status = "WARMING UP (CUDA GRAPHS)"
-                
-            time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
-            if time_res.returncode == 0 and time_res.stdout.strip():
-                start_ts = parse_iso_time(time_res.stdout.strip())
-                elapsed = int(time.time() - start_ts)
-                
-                current_load_type = "cached"
-                if "DOWNLOADING" in model_status:
-                    current_load_type = "downloaded"
-                elif "COMPILING" in model_status:
-                    current_load_type = "compiled"
-                    
-                est_total, has_history = get_estimated_load_time(matched_key, topo_key, current_load_type)
-                remaining = est_total - elapsed
-                eta_seconds = max(0, remaining)
 
-                if remaining > 0:
-                    suffix = "" if has_history else " (Initial run - no history)"
-                    eta_display = f"~{remaining}s remaining{suffix}"
-                else:
-                    overrun = elapsed - est_total
-                    if has_history:
-                        eta_display = f"Finishing startup (+{overrun}s over est.)"
+            if model_status.startswith("CRASHED"):
+                eta_display = "Check Docker Logs"
+                eta_seconds = 0
+            else:
+                if isinstance(telemetry.get("gpu_util_pct"), int) and telemetry["gpu_util_pct"] > 75:
+                    model_status = "WARMING UP (CUDA GRAPHS)"
+
+                time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
+                if time_res.returncode == 0 and time_res.stdout.strip():
+                    start_ts = parse_iso_time(time_res.stdout.strip())
+                    elapsed = int(time.time() - start_ts)
+
+                    current_load_type = "cached"
+                    if "DOWNLOADING" in model_status:
+                        current_load_type = "downloaded"
+                    elif "COMPILING" in model_status:
+                        current_load_type = "compiled"
+
+                    est_total, has_history = get_estimated_load_time(matched_key, topo_key, current_load_type)
+                    remaining = est_total - elapsed
+                    eta_seconds = max(0, remaining)
+
+                    if remaining > 0:
+                        suffix = "" if has_history else " (Initial run - no history)"
+                        eta_display = f"~{remaining}s remaining{suffix}"
                     else:
-                        eta_display = f"Loading... ({elapsed}s elapsed - no historic data)"
+                        overrun = elapsed - est_total
+                        if has_history:
+                            eta_display = f"Finishing startup (+{overrun}s over est.)"
+                        else:
+                            eta_display = f"Loading... ({elapsed}s elapsed - no historic data)"
     elif active_container != "None":
         model_status = f"STOPPED ({container_state.upper()})"
         eta_display = "N/A"
@@ -934,6 +1001,11 @@ def _compute_cluster_status_impl() -> dict:
         is_benchmarking = BENCHMARK_STATE["running"]
         benchmark_msg = BENCHMARK_STATE["message"]
 
+    with TEARDOWN_STATE_LOCK:
+        is_tearing_down = TEARDOWN_STATE["running"]
+        teardown_phase = TEARDOWN_STATE["phase"]
+        teardown_msg = TEARDOWN_STATE["message"]
+
     status_data = {
         "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S EST"),
         "network_mode": "Working in OFFLINE mode" if offline_mode else "Working in ONLINE mode",
@@ -945,6 +1017,9 @@ def _compute_cluster_status_impl() -> dict:
         "session_stats": SESSION_TRACKER.get_live_stats(),
         "is_benchmarking": is_benchmarking,
         "benchmark_message": benchmark_msg,
+        "is_tearing_down": is_tearing_down,
+        "teardown_phase": teardown_phase,
+        "teardown_message": teardown_msg,
         "hosts": {}
     }
 
@@ -1173,6 +1248,14 @@ def _teardown_host_rm(ip: str):
     the primary kill mechanism."""
     return run_ssh(ip, None, ["docker", "rm", "-f", ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER], timeout=15)
 
+def _set_teardown_state(running: bool, phase: str, message: str, mark_last_run: bool = False):
+    with TEARDOWN_STATE_LOCK:
+        TEARDOWN_STATE["running"] = running
+        TEARDOWN_STATE["phase"] = phase
+        TEARDOWN_STATE["message"] = message
+        if mark_last_run:
+            TEARDOWN_STATE["last_run"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 def _execute_teardown_impl(target_hosts: list = None) -> dict:
     """
     Runs each teardown phase across ALL target hosts CONCURRENTLY, not one
@@ -1189,24 +1272,48 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
     it. Running each phase across all hosts in parallel means head and
     worker are signaled together and come down together, closing that
     window.
+
+    Also writes live progress into TEARDOWN_STATE as it moves through
+    phases -- see the module comment above that dict for why. This runs
+    unconditionally, whether called from the standalone teardown endpoint
+    or from inside a deploy's own pre-deploy teardown, so both get the same
+    visibility on the dashboard.
     """
     results = {}
     hosts_to_clean = [h for h in (target_hosts if target_hosts else list(HOSTS.keys())) if h in HOSTS]
     ips = {h: HOSTS[h]["ip"] for h in hosts_to_clean}
+    host_list = ", ".join(hosts_to_clean) or "no hosts"
 
-    proc_futures = {h: WORKER_POOL.submit(_teardown_host_processes, ip) for h, ip in ips.items()}
-    for f in proc_futures.values(): f.result()
+    try:
+        _set_teardown_state(True, "signaling",
+                             f"Signaling processes on {host_list} (SIGTERM, up to {TEARDOWN_GRACE_SEC}s grace)...")
+        proc_futures = {h: WORKER_POOL.submit(_teardown_host_processes, ip) for h, ip in ips.items()}
+        for f in proc_futures.values(): f.result()
 
-    stop_futures = {h: WORKER_POOL.submit(_teardown_host_containers, ip) for h, ip in ips.items()}
-    for f in stop_futures.values(): f.result()
+        _set_teardown_state(True, "stopping",
+                             f"Gracefully stopping containers on {host_list} (up to {TEARDOWN_GRACE_SEC}s)...")
+        stop_futures = {h: WORKER_POOL.submit(_teardown_host_containers, ip) for h, ip in ips.items()}
+        for f in stop_futures.values(): f.result()
 
-    rm_futures = {h: WORKER_POOL.submit(_teardown_host_rm, ip) for h, ip in ips.items()}
-    for h, f in rm_futures.items():
-        res = f.result()
-        results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
+        _set_teardown_state(True, "removing", f"Removing containers on {host_list}...")
+        rm_futures = {h: WORKER_POOL.submit(_teardown_host_rm, ip) for h, ip in ips.items()}
+        for h, f in rm_futures.items():
+            res = f.result()
+            results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
 
-    time.sleep(2)
-    return results
+        _set_teardown_state(True, "removing", f"Removing containers on {host_list}...")
+        rm_futures = {h: WORKER_POOL.submit(_teardown_host_rm, ip) for h, ip in ips.items()}
+        for h, f in rm_futures.items():
+            res = f.result()
+            results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
+
+        time.sleep(2)
+        return results
+    finally:
+        # Always resets, whether teardown succeeded or a phase raised --
+        # otherwise a mid-teardown exception would leave the dashboard
+        # showing "in progress" forever with no way to clear it.
+        _set_teardown_state(False, "done", f"Teardown complete for {host_list}.", mark_last_run=True)
 
 def execute_teardown(target_hosts: list = None) -> dict:
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)

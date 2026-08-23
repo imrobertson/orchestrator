@@ -164,6 +164,18 @@
             transition: opacity 0.3s ease;
         }
 
+        /* Teardown Progress Line -- persists for the whole operation (up to
+           ~60s across the SIGTERM/stop/rm phases), unlike .status-toast
+           which auto-fades after 6s and would go blank mid-teardown. */
+        .teardown-status-line {
+            margin-top: 4px;
+            font-size: 11px;
+            font-family: monospace;
+            text-align: center;
+            min-height: 14px;
+            color: #fbbf24;
+        }
+
         /* Logs Section */
         .log-section {
             margin-top: 15px;
@@ -322,6 +334,7 @@
             <div style="margin-top: auto;">
                 <button id="deployBtn" class="btn" onclick="triggerDeploy()">Deploy Model</button>
                 <button id="teardownBtn" class="btn btn-danger" onclick="triggerTeardown()">Teardown Runtimes</button>
+                <div id="teardownStatusLine" class="teardown-status-line"></div>
                 <div id="statusToast" class="status-toast"></div>
             </div>
         </div>
@@ -350,6 +363,9 @@
     let latestSessionStats = null;
     let isBenchmarking = false;
     let savedBenchmarkCheckState = false;
+    let isTearingDown = false;
+    let teardownMessage = '';
+    let isDeploying = false;
 
     function stripAnsiCodes(str) {
         return str.replace(/[\u001b\u009b]\[[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqv-y]/g, '');
@@ -415,6 +431,60 @@
         }
     }
 
+    // Reflects live teardown progress and locks every other control that
+    // could interfere with an in-flight deploy or teardown -- clicking
+    // Deploy while teardown is killing containers, or clicking Teardown
+    // while a deploy is mid-launch, both race against the same containers
+    // and can leave the cluster in a state neither operation intended.
+    // isTearingDown/teardownMessage come from is_tearing_down/
+    // teardown_message polled from /api/status every 4s (teardown itself
+    // is synchronous -- deploy depends on that ordering -- so this
+    // piggybacks on the existing polling loop for visibility rather than
+    // needing teardown to become async). isDeploying is purely a local
+    // flag around the deploy fetch, since deploy has no server-side
+    // progress state to poll.
+    function applyOperationLocks() {
+        const busy = isTearingDown || isDeploying;
+
+        const deployBtn = document.getElementById('deployBtn');
+        if (deployBtn) {
+            deployBtn.disabled = busy;
+            deployBtn.innerText = isDeploying ? 'Deploying...' : 'Deploy Model';
+        }
+
+        const teardownBtn = document.getElementById('teardownBtn');
+        const teardownLine = document.getElementById('teardownStatusLine');
+        if (teardownBtn) {
+            if (isTearingDown) {
+                teardownBtn.innerText = '⏳ Tearing Down...';
+                teardownBtn.disabled = true;
+                if (teardownLine) teardownLine.innerText = teardownMessage || 'Teardown in progress...';
+            } else {
+                teardownBtn.innerText = 'Teardown Runtimes';
+                teardownBtn.disabled = isDeploying;
+                if (teardownLine) teardownLine.innerText = isDeploying ? 'Blocked while a deployment is in progress.' : '';
+            }
+        }
+
+        // The deploy form itself: changing model/topology mid-operation is
+        // harmless on its own, but leaving it open invites exactly the
+        // "click Deploy on a different model while teardown is still
+        // running" mistake this whole thing exists to prevent.
+        ['modelSelect', 'nodesSelect', 'headSelect', 'userIdInput'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.disabled = busy;
+        });
+
+        // benchmarkControlContainer renders EITHER the auto-run checkbox OR
+        // the "Run Benchmark Now" button depending on cluster_ready --
+        // lock whichever is currently present without clobbering its own
+        // BENCHMARKING-IN-PROGRESS disabled state.
+        const benchCheck = document.getElementById('runBenchmarkCheck');
+        if (benchCheck) benchCheck.disabled = busy;
+        const benchBtn = document.querySelector('#benchmarkControlContainer button.btn-action');
+        if (benchBtn) benchBtn.disabled = benchBtn.disabled || busy;
+    }
+
     async function fetchStatus() {
         try {
             const res = await fetch(`${API_BASE}/status`);
@@ -423,6 +493,8 @@
             
             latestSessionStats = data.session_stats;
             isBenchmarking = data.is_benchmarking || false;
+            isTearingDown = data.is_tearing_down || false;
+            teardownMessage = data.teardown_message || '';
             
             if (latestSessionStats && latestSessionStats.active) {
                 document.getElementById('speedoMeter').innerText = `SESSION SPEED: ${latestSessionStats.tps} tok/s`;
@@ -483,6 +555,7 @@
 
             updateRecipeMetadata();
             updateBenchmarkControl(data.cluster_ready);
+            applyOperationLocks();
 
             const grid = document.getElementById('hostsGrid');
             grid.innerHTML = '';
@@ -495,6 +568,8 @@
                 const modelStatusStr = info.model_status || 'NONE';
                 if (modelStatusStr === 'READY') {
                     modelBadgeClass = 'ready';
+                } else if (modelStatusStr.startsWith('CRASHED') || modelStatusStr.startsWith('ORPHANED')) {
+                    modelBadgeClass = 'offline';
                 } else if (modelStatusStr.startsWith('NOT READY') || modelStatusStr.includes('STARTING') || modelStatusStr.includes('WARMING')) {
                     modelBadgeClass = 'loading';
                 }
@@ -734,6 +809,11 @@
     }
 
     async function triggerDeploy() {
+        if (isTearingDown) {
+            showStatusToast('Cannot deploy while a teardown is in progress.', true);
+            return;
+        }
+
         const model = document.getElementById('modelSelect').value;
         const nodesSelect = document.getElementById('nodesSelect');
         const recipe = globalCatalog[model];
@@ -750,10 +830,11 @@
 
         if(!confirm(`Deploy ${model} on ${nodes} node(s)?${run_benchmark ? '\n(Auto-benchmark enabled)' : ''}`)) return;
 
-        const btn = document.getElementById('deployBtn');
-        const origText = btn.innerText;
-        btn.innerText = 'Deploying...';
-        btn.disabled = true;
+        // Immediate lock, before the request even goes out -- closes the
+        // double-click window and blocks Teardown/benchmark controls for
+        // the duration, same pattern as triggerTeardown() below.
+        isDeploying = true;
+        applyOperationLocks();
 
         try {
             const response = await fetch(`${API_BASE}/deploy`, {
@@ -782,8 +863,8 @@
         } catch(e) {
             showStatusToast(`Deployment failed: ${e.message || 'Server connection lost'}`, true);
         } finally {
-            btn.innerText = origText;
-            btn.disabled = false;
+            isDeploying = false;
+            applyOperationLocks();
         }
     }
 
@@ -806,7 +887,7 @@
             const response = await fetch(`${API_BASE}/benchmark`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ head, nodes })
+                body: JSON.stringify({ head, nodes, model })
             });
             
             if (!response.ok) {
@@ -826,21 +907,43 @@
     }
 
     async function triggerTeardown() {
+        if (isDeploying) {
+            showStatusToast('Cannot teardown while a deployment is in progress.', true);
+            return;
+        }
         if(!confirm('Are you sure you want to teardown all active runtimes across the cluster?')) return;
-        
-        const btn = document.getElementById('teardownBtn');
-        const origText = btn.innerText;
-        btn.innerText = 'Tearing down...';
-        btn.disabled = true;
+
+        // Immediate client-side feedback before the first status poll can
+        // pick up server-side state, and closes the double-click window.
+        // The live phase text (signaling -> stopping -> removing) then
+        // takes over via applyOperationLocks(), driven by is_tearing_down /
+        // teardown_message polled from /api/status every 4s -- teardown
+        // itself is synchronous (deploy depends on that), so this rides
+        // the existing polling loop rather than needing an async redesign.
+        isTearingDown = true;
+        teardownMessage = 'Sending teardown request...';
+        applyOperationLocks();
 
         try {
-            await fetch(`${API_BASE}/teardown`, {method: 'POST'});
-            showStatusToast('✓ Teardown sequence initiated');
+            const response = await fetch(`${API_BASE}/teardown`, {method: 'POST'});
+            if (!response.ok) {
+                let errMsg = response.statusText;
+                try {
+                    const errData = await response.json();
+                    errMsg = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
+                } catch(jErr) {}
+                showStatusToast(`Teardown Error: ${errMsg}`, true);
+            } else {
+                showStatusToast('✓ Teardown complete');
+            }
         } catch(e) {
             showStatusToast('Teardown request failed.', true);
         } finally {
-            btn.innerText = origText;
-            btn.disabled = false;
+            // The POST resolving means the backend's teardown phases are
+            // already done and TEARDOWN_STATE is back to idle -- poll
+            // immediately rather than waiting up to 4s for the next timer
+            // tick, so the button clears right away.
+            fetchStatus();
         }
     }
 
