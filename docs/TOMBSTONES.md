@@ -1,4 +1,13 @@
 # Control Plane Release Tombstones & Fix Log
+
+### 50. Orchestrator Daemon Self-Destruction via Broad Teardown `pkill` & Missing Lock Wrapper (V4.8.3)
+* **The Trap:** Triggering a deployment executed `_execute_teardown_impl()`, which ran `sudo pkill -9 -f 'vllm|ray|python3'`. Because `dgx-orchestrator` runs as a `python3` process on `spark-4`, it killed its own HTTP server mid-request, causing browser deployment calls to fail with `Failed to fetch`. Additionally, `execute_deployment()` was missing its `CLUSTER_OP_LOCK` wrapper definition during refactoring, raising a backend `NameError`.
+* **The Fix:** Re-implemented `execute_deployment()` with `CLUSTER_OP_LOCK` enforcement, and updated host teardown commands to explicitly filter out `dgx-orchestrator` PIDs (`grep -v 'dgx-orchestrator'`) before issuing process kill signals.
+
+### 49. Speculative Metric Key Mismatch & Strict Recipe MTP Checks (V4.8.3)
+* **The Trap:** vLLM and DeepSeek-V4 speculative models expose draft/accepted token counters under `vllm:spec_decode_num_draft_tokens_total` and `vllm:spec_decode_num_accepted_tokens_total`. The scraper was listening for legacy `vllm:num_spec_tokens_*` keys, resulting in zeroed draft stats. Furthermore, `enrich_catalog()` strictly checked CLI flags for `mtp_enabled`, hiding speculative UI metrics for models using integrated draft heads or alternative flags like `--speculative-config`.
+* **The Fix:** Updated `get_vllm_metrics()` to parse `vllm:spec_decode_num_*` Prometheus metrics, and expanded `enrich_catalog()` to check case-insensitively for speculative keywords (`speculative`, `mtp`, `draft`, `nextn`, `proposal`) or historical ledger activity.
+
 ### 48. In-RAM Telemetry Loss on Daemon Shutdown (V4.8.3)
 * **The Trap:** Real-time token counts, session durations, and MTP (Multi-Token Prediction) hit rates were accumulated in memory to protect host NVMe drives from continuous disk writes. Unplanned daemon restarts, container updates, or host reboots wiped uncommitted session analytics.
 * **The Fix:** Implemented a 1-hour periodic delta-checkpoint flush in `SessionTracker` and attached OS signal traps (`SIGTERM` / `SIGINT`) to `dgx-orchestrator.py` to force stateful commits to `model_ledger.json` before process termination.

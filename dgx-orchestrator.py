@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 import yaml
 
 from common.config import legacy_hosts_dict, load_cluster_config
@@ -48,11 +48,206 @@ BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
 MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 LEDGER_PATH = BASE_DIR / "model_ledger.json"
 BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
+BENCHMARK_RESULTS_PATH = BASE_DIR / "benchmark_results.txt"
 
 HOSTS = legacy_hosts_dict()
 
 NETWORK_STATE_FILE = BASE_DIR / ".network_mode"
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9?]*[ -/]*[@-~])')
+
+# --- JIT Cache Roots ---
+# Kernel cache roots eligible for LRU eviction via prune_cluster_cache().
+# Deliberately excludes ~/.nv/ComputeCache (driver-managed via
+# CUDA_CACHE_MAXSIZE -- hand-pruning it fights the driver's own eviction)
+# and ~/.cache/huggingface (model weights, a completely different lifecycle
+# from JIT kernel artifacts). cache_inventory() below reports on both of
+# those anyway, for visibility, but never evicts from them.
+JIT_CACHE_ROOTS = [
+    "~/.cache/triton",
+    "~/.cache/tilelang",
+    "~/.cache/deepgemm",
+    "~/.cache/vllm",
+]
+
+# Every cache root worth *looking at*, even ones prune_cluster_cache() will
+# never touch. Used by cache_inventory() only.
+INVENTORY_ROOTS = [
+    ("triton", "~/.cache/triton"),
+    ("tilelang", "~/.cache/tilelang"),
+    ("deepgemm", "~/.cache/deepgemm"),
+    ("vllm", "~/.cache/vllm"),
+    ("compute_cache", "~/.nv/ComputeCache"),
+    ("huggingface", "~/.cache/huggingface"),
+]
+
+# Runs on each Spark over SSH. argv: <roots_json> <target_free_bytes> <dry_run:0|1>
+#
+# Evicts whole entry DIRECTORIES, never individual files. A Triton/TileLang
+# cache entry is a directory of co-dependent artifacts (metadata json + ptx +
+# cubin/so); deleting files piecemeal with `find -type f` leaves a
+# half-entry that the loader treats as a hit and then fails to load the
+# binary -- that's corruption, not a cache miss, and it doesn't announce
+# itself: it just recompiles one kernel, once, unpredictably.
+#
+# Recency is max(atime, mtime) across the entry's files. Under noatime,
+# atime is frozen at whatever it was at creation/extraction time, so mtime
+# is the only usable signal -- this degrades gracefully to "least recently
+# written" rather than silently treating every hot kernel as equally stale.
+#
+# Only evicts if free space is currently below target_free_bytes, and then
+# strictly oldest-entry-first until the target is met. Above the floor,
+# nothing is touched -- this is a safety-valve, not a housekeeping sweep.
+_REMOTE_PRUNE_SCRIPT = r'''
+import json, os, shutil, sys, time
+
+roots = [os.path.expanduser(p) for p in json.loads(sys.argv[1])]
+target_free = int(sys.argv[2])
+dry_run = sys.argv[3] == "1"
+
+probe = next((r for r in roots if os.path.isdir(r)), os.path.expanduser("~"))
+
+def free_bytes():
+    st = os.statvfs(probe)
+    return st.f_bavail * st.f_frsize
+
+# Report mount options so the caller can see if atime is even meaningful.
+mount_opts = "unknown"
+try:
+    best = ""
+    with open("/proc/mounts") as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) >= 4 and probe.startswith(parts[1]) and len(parts[1]) > len(best):
+                best, mount_opts = parts[1], parts[3]
+except Exception:
+    pass
+
+entries = []
+for root in roots:
+    if not os.path.isdir(root):
+        continue
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        size = 0
+        last_used = 0.0
+        try:
+            for dirpath, _dirnames, filenames in os.walk(path):
+                for fn in filenames:
+                    fp = os.path.join(dirpath, fn)
+                    try:
+                        st = os.lstat(fp)
+                    except OSError:
+                        continue
+                    size += st.st_size
+                    last_used = max(last_used, st.st_atime, st.st_mtime)
+        except OSError:
+            continue
+        entries.append((last_used, size, path))
+
+free_before = free_bytes()
+result = {
+    "mount_options": mount_opts,
+    "free_before": free_before,
+    "target_free": target_free,
+    "entries_total": len(entries),
+    "evicted": [],
+    "bytes_freed": 0,
+    "dry_run": dry_run,
+    "errors": [],
+}
+
+if free_before < target_free:
+    entries.sort(key=lambda e: e[0])  # least recently used first
+    reclaimed = 0
+    for last_used, size, path in entries:
+        if free_before + reclaimed >= target_free:
+            break
+        age_days = round((time.time() - last_used) / 86400, 1)
+        if not dry_run:
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                result["errors"].append("%s: %s" % (path, exc))
+                continue
+        reclaimed += size
+        result["evicted"].append({
+            "path": path, "bytes": size, "last_used": last_used,
+            "age_days": age_days,
+            "reason": "below free-space floor, LRU order",
+        })
+result["bytes_freed"] = reclaimed if free_before < target_free else 0
+result["shortfall_bytes"] = max(0, target_free - free_before)
+result["free_after"] = free_bytes()
+print(json.dumps(result))
+'''
+
+# Read-only inventory of everything under the cache roots. No deletion, no
+# threshold, no free-space check -- safe to run at any time, including
+# against a live production cluster. argv: <roots_json as [[label, path], ...]>
+_REMOTE_INVENTORY_SCRIPT = r'''
+import json, os, sys, time
+
+roots = json.loads(sys.argv[1])
+now = time.time()
+
+report = {"generated_at": now, "roots": {}}
+
+for label, root in roots:
+    root = os.path.expanduser(root)
+    entry = {"path": root, "exists": os.path.isdir(root), "entry_count": 0,
+             "total_bytes": 0, "entries": []}
+    if entry["exists"]:
+        for name in sorted(os.listdir(root)):
+            path = os.path.join(root, name)
+            if not os.path.isdir(path):
+                continue
+            size = 0
+            last_used = 0.0
+            file_count = 0
+            try:
+                for dirpath, _dirnames, filenames in os.walk(path):
+                    for fn in filenames:
+                        fp = os.path.join(dirpath, fn)
+                        try:
+                            st = os.lstat(fp)
+                        except OSError:
+                            continue
+                        size += st.st_size
+                        last_used = max(last_used, st.st_atime, st.st_mtime)
+                        file_count += 1
+            except OSError:
+                continue
+            entry["entries"].append({
+                "name": name, "bytes": size, "file_count": file_count,
+                "last_used": last_used, "age_days": round((now - last_used) / 86400, 1),
+            })
+            entry["total_bytes"] += size
+        entry["entry_count"] = len(entry["entries"])
+        entry["entries"].sort(key=lambda e: e["last_used"])  # oldest first, LRU order
+    report["roots"][label] = entry
+
+probe = next((os.path.expanduser(p) for _l, p in roots if os.path.isdir(os.path.expanduser(p))),
+             os.path.expanduser("~"))
+st = os.statvfs(probe)
+report["disk_free_bytes"] = st.f_bavail * st.f_frsize
+report["disk_total_bytes"] = st.f_blocks * st.f_frsize
+
+mount_opts = "unknown"
+try:
+    best = ""
+    with open("/proc/mounts") as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) >= 4 and probe.startswith(parts[1]) and len(parts[1]) > len(best):
+                best, mount_opts = parts[1], parts[3]
+except Exception:
+    pass
+report["mount_options"] = mount_opts
+
+print(json.dumps(report))
+'''
 
 # --- Cluster Operation Lock ---
 CLUSTER_OP_LOCK = threading.Lock()
@@ -382,34 +577,130 @@ def get_vllm_metrics(head_ip: str = "10.0.14.43", port: int = 8000) -> dict:
         pass
     return metrics
 
-def prune_cluster_cache(max_age_days: int = 30, min_free_gb: int = 50) -> dict:
-    print(f"[+] Checking JIT cache footprints across cluster (Age threshold: {max_age_days}d, Min Free NVMe: {min_free_gb}GB)...")
+def cache_inventory(target_hosts: list = None) -> dict:
+    """
+    Read-only snapshot of every cache root on each host: what's there, how
+    big, how old, in LRU order (oldest first). No thresholds, no deletion --
+    safe to run against a live cluster at any time. See INVENTORY_ROOTS for
+    what's covered (includes huggingface and ComputeCache for visibility,
+    even though prune_cluster_cache() never touches those).
+    """
+    hosts_to_check = target_hosts if target_hosts else list(HOSTS.keys())
+    results = {}
+
+    for host in hosts_to_check:
+        if host not in HOSTS:
+            continue
+        ip = HOSTS[host]["ip"]
+        cmd = ["python3", "-c", _REMOTE_INVENTORY_SCRIPT, json.dumps(INVENTORY_ROOTS)]
+        res = run_ssh(ip, None, cmd, capture=True, timeout=60)
+
+        if res.returncode != 0:
+            results[host] = {"status": "error", "message": res.stderr.strip() or "inventory script failed"}
+            continue
+
+        try:
+            data = json.loads(res.stdout.strip())
+        except Exception as exc:
+            results[host] = {"status": "error", "message": f"unparseable output: {exc}"}
+            continue
+
+        gb = lambda b: round(b / (1024 ** 3), 2)
+        roots_summary = {}
+        for label, r in data["roots"].items():
+            roots_summary[label] = {
+                "exists": r["exists"],
+                "entry_count": r["entry_count"],
+                "total_gb": gb(r["total_bytes"]),
+                "oldest": r["entries"][0] if r["entries"] else None,
+                "newest": r["entries"][-1] if r["entries"] else None,
+                "entries": r["entries"],
+            }
+
+        results[host] = {
+            "status": "ok",
+            "mount_options": data["mount_options"],
+            "atime_reliable": "noatime" not in data["mount_options"],
+            "disk_free_gb": gb(data["disk_free_bytes"]),
+            "disk_total_gb": gb(data["disk_total_bytes"]),
+            "roots": roots_summary,
+        }
+
+    return {"status": "success", "hosts": results}
+
+def prune_cluster_cache(min_free_gb: int = 50, headroom_gb: int = 20, dry_run: bool = False) -> dict:
+    """
+    LRU-evict JIT kernel caches, but ONLY on hosts currently below the free
+    space floor -- above the floor, nothing is touched on that host.
+
+    min_free_gb  -- floor. If free space is at or above this, no eviction
+                    is considered at all.
+    headroom_gb  -- when a host IS below the floor, evict oldest-first
+                    until free space reaches (min_free_gb + headroom_gb),
+                    not just up to the floor -- otherwise the very next
+                    deploy's cache growth re-triggers eviction immediately.
+    dry_run      -- report exactly what would be evicted and why, without
+                    deleting anything. Read-only; safe against production.
+    """
+    target_free_bytes = (min_free_gb + headroom_gb) * (1024 ** 3)
+    verb = "Dry-run evaluating" if dry_run else "Evaluating"
+    print(f"[+] {verb} JIT caches (floor: {min_free_gb} GB, evict target: {min_free_gb + headroom_gb} GB)...")
+
     results = {}
     for host, meta in HOSTS.items():
         ip = meta["ip"]
-        check_space_cmd = ["bash", "-c", "df -BG /home/tetrel | tail -n1 | awk '{print $4}' | tr -d 'G'"]
-        res = run_ssh(ip, None, check_space_cmd, capture=True, timeout=10)
-        
-        free_gb = 0
-        if res.returncode == 0 and res.stdout.strip().isdigit():
-            free_gb = int(res.stdout.strip())
-        
-        if free_gb > min_free_gb:
-            msg = f"{free_gb} GB free (> {min_free_gb} GB threshold). Retaining all cached kernels."
-            print(f"  [{host}] {msg}")
-            results[host] = msg
+        cmd = [
+            "python3", "-c", _REMOTE_PRUNE_SCRIPT,
+            json.dumps(JIT_CACHE_ROOTS),
+            str(target_free_bytes),
+            "1" if dry_run else "0",
+        ]
+        res = run_ssh(ip, None, cmd, capture=True, timeout=180)
+
+        if res.returncode != 0:
+            msg = res.stderr.strip() or "prune script failed"
+            print(f"  [{host}] ERROR: {msg}")
+            results[host] = {"status": "error", "message": msg}
             continue
 
-        print(f"  [{host}] {free_gb} GB free (<= {min_free_gb} GB threshold). Pruning kernels untouched for >{max_age_days} days...")
-        prune_cmd = [
-            "bash", "-c",
-            f"find ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton -type f -atime +{max_age_days} -delete 2>/dev/null; "
-            f"find ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton -type d -empty -delete 2>/dev/null"
-        ]
-        run_ssh(ip, None, prune_cmd, timeout=30)
-        results[host] = f"Pruned kernels older than {max_age_days} days (Free: {free_gb}GB)"
-        
-    print("[+] Cache evaluation complete.")
+        try:
+            data = json.loads(res.stdout.strip())
+        except Exception as exc:
+            results[host] = {"status": "error", "message": f"unparseable output: {exc}"}
+            continue
+
+        gb = lambda b: round(b / (1024 ** 3), 2)
+        summary = {
+            "status": "ok",
+            "mount_options": data["mount_options"],
+            "atime_reliable": "noatime" not in data["mount_options"],
+            "free_before_gb": gb(data["free_before"]),
+            "free_after_gb": gb(data["free_after"]),
+            "entries_total": data["entries_total"],
+            "entries_evicted": len(data["evicted"]),
+            "evicted": data["evicted"],
+            "gb_freed": gb(data["bytes_freed"]),
+            "dry_run": data["dry_run"],
+            "errors": data["errors"],
+        }
+
+        if not summary["atime_reliable"]:
+            print(f"  [{host}] NOTE: mount options include noatime -- atime is frozen, LRU order is falling back to mtime.")
+
+        if summary["entries_evicted"] == 0:
+            print(f"  [{host}] {summary['free_before_gb']} GB free (floor {min_free_gb} GB). Nothing considered.")
+        else:
+            action = "would evict" if dry_run else "evicted"
+            print(f"  [{host}] {summary['free_before_gb']} GB free -> {action} {summary['entries_evicted']}/{data['entries_total']} entries ({summary['gb_freed']} GB), now {summary['free_after_gb']} GB.")
+            for ev in summary["evicted"]:
+                print(f"      - {ev['path']} ({gb(ev['bytes'])} GB, {ev['age_days']}d old) -- {ev['reason']}")
+
+        if summary["errors"]:
+            for err in summary["errors"]:
+                print(f"  [{host}] eviction error: {err}")
+
+        results[host] = summary
+
     return {"status": "success", "details": results}
 
 def _discover_host_container(host: str, meta: dict) -> dict:
@@ -788,6 +1079,13 @@ def enrich_catalog(catalog_dict: dict) -> dict:
                 if has_j and est_j > (est_c + 60): t_data["avg_load_display"] = f"~{est_c}s (C) / ~{est_j}s (JIT)"
                 else: t_data["avg_load_display"] = f"~{est_c}s" if has_c else "N/A"
                     
+                # NOTE: ledger_tps is keyed on whatever benchmark.py logged in
+                # the "Model" column. Historically that was the raw served
+                # HF basename, which never matches m_key (the catalog/recipe
+                # key) -- this lookup was silently always "N/A". benchmark.py
+                # now accepts --model-key so new rows key on m_key directly;
+                # old rows in benchmark_ledger.csv predate that and won't
+                # match until the ledger is rotated or backfilled.
                 t_data["historical_tps"] = ledger_tps.get(m_key, "N/A")
                 
                 t_data["lifetime_in"] = lt_stats.get("in", 0)
@@ -858,7 +1156,7 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
     finally:
         CLUSTER_OP_LOCK.release()
 
-def _run_benchmark_worker(head: str, nodes: int):
+def _run_benchmark_worker(head: str, nodes: int, model_key: Optional[str] = None):
     with BENCHMARK_STATE_LOCK:
         BENCHMARK_STATE["running"] = True
         BENCHMARK_STATE["message"] = f"Executing 3-pass benchmark against {head}..."
@@ -866,13 +1164,38 @@ def _run_benchmark_worker(head: str, nodes: int):
     try:
         head_ip = HOSTS[head]["ip"] if head in HOSTS else "10.0.14.43"
         print(f"[+] Running background 3-pass benchmark against {head} ({head_ip})...")
-        bench_res = subprocess.run(["python3", "benchmark.py", "--host", head_ip, "--nodes", str(nodes)], capture_output=True, text=True)
-        bench_file = BASE_DIR / "benchmark_results.txt"
-        bench_file.write_text(bench_res.stdout)
-        print(f"[+] Benchmark completed. Written to {bench_file}")
+
+        cmd = [sys.executable, str(BASE_DIR / "benchmark.py"), "--host", head_ip, "--nodes", str(nodes)]
+        if model_key:
+            cmd.extend(["--model-key", model_key])
+
+        # Hard ceiling on the subprocess: 3 passes x up to 300s urllib
+        # timeout each, plus slack. Without this, a wedged socket inside
+        # benchmark.py leaves BENCHMARK_STATE["running"] True forever,
+        # which permanently trips the re-entry guard in
+        # execute_standalone_benchmark() and pins the dashboard button on
+        # "BENCHMARKING IN PROGRESS" until the daemon is restarted.
+        bench_res = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=str(BASE_DIR), timeout=1200
+        )
+
+        if bench_res.returncode != 0:
+            err = (bench_res.stderr or bench_res.stdout or "no output").strip()
+            tail = err.splitlines()[-1] if err.splitlines() else err
+            print(f"[!] benchmark.py exited {bench_res.returncode}: {err}")
+            with BENCHMARK_STATE_LOCK:
+                BENCHMARK_STATE["message"] = f"Benchmark failed (exit {bench_res.returncode}): {tail}"
+            return  # leave the last good benchmark_results.txt untouched
+
+        BENCHMARK_RESULTS_PATH.write_text(bench_res.stdout)
+        print(f"[+] Benchmark completed. Written to {BENCHMARK_RESULTS_PATH}")
         with BENCHMARK_STATE_LOCK:
             BENCHMARK_STATE["message"] = "Benchmark completed successfully."
             BENCHMARK_STATE["last_run"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    except subprocess.TimeoutExpired:
+        print("[!] Benchmark subprocess timed out after 1200s and was killed.")
+        with BENCHMARK_STATE_LOCK:
+            BENCHMARK_STATE["message"] = "Benchmark timed out after 1200s."
     except Exception as e:
         print(f"[!] Background benchmark execution failed: {e}")
         with BENCHMARK_STATE_LOCK:
@@ -881,7 +1204,7 @@ def _run_benchmark_worker(head: str, nodes: int):
         with BENCHMARK_STATE_LOCK:
             BENCHMARK_STATE["running"] = False
 
-def execute_standalone_benchmark(head: str, nodes: int) -> dict:
+def execute_standalone_benchmark(head: str, nodes: int, model_key: Optional[str] = None) -> dict:
     """Launches benchmark.py asynchronously without blocking HTTP response or tearing down containers."""
     with BENCHMARK_STATE_LOCK:
         if BENCHMARK_STATE["running"]:
@@ -891,7 +1214,7 @@ def execute_standalone_benchmark(head: str, nodes: int) -> dict:
     if not check_vllm_health(head_ip):
         return {"status": "error", "message": f"vLLM engine on {head} ({head_ip}) is not responding to health checks."}
 
-    threading.Thread(target=_run_benchmark_worker, args=(head, nodes), daemon=True).start()
+    threading.Thread(target=_run_benchmark_worker, args=(head, nodes, model_key), daemon=True).start()
     return {"status": "success", "message": f"Benchmark background task initiated for {head}."}
 
 def authorize_user_key(public_key_path: str) -> dict:
@@ -1157,7 +1480,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             record_load_time(model, topo_key, total_duration, "cached")
 
             if run_benchmark:
-                execute_standalone_benchmark(head=head, nodes=nodes)
+                execute_standalone_benchmark(head=head, nodes=nodes, model_key=model)
 
     return {
         "status": "success",
@@ -1259,7 +1582,7 @@ def interactive_menu():
         print(f"[-] Invalid selection: {e}")
 
 if HAS_FASTAPI:
-    app = FastAPI(title="Tetrel Security DGX Control Plane API", version="4.8.3")
+    app = FastAPI(title="Tetrel Security DGX Control Plane API", version="4.8.4")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
     class DeployRequest(BaseModel):
@@ -1274,9 +1597,15 @@ if HAS_FASTAPI:
     class BenchmarkRequest(BaseModel):
         head: str = "spark-4"
         nodes: Literal[1, 2] = 2
+        model: Optional[str] = None  # catalog key, threaded to benchmark.py --model-key for ledger join
 
     class NetworkToggleRequest(BaseModel):
         offline: bool
+
+    class PruneCacheRequest(BaseModel):
+        min_free_gb: int = 50
+        headroom_gb: int = 20
+        dry_run: bool = False
 
     @app.get("/api/status")
     def api_status(): return get_cluster_status()
@@ -1295,7 +1624,7 @@ if HAS_FASTAPI:
 
     @app.post("/api/benchmark")
     def api_benchmark(req: BenchmarkRequest):
-        res = execute_standalone_benchmark(req.head, req.nodes)
+        res = execute_standalone_benchmark(req.head, req.nodes, model_key=req.model)
         if res.get("status") != "success": raise HTTPException(status_code=400, detail=res.get("message", "Benchmark failed"))
         return res
 
@@ -1311,9 +1640,13 @@ if HAS_FASTAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
             
+    @app.get("/api/cache-inventory")
+    def api_cache_inventory():
+        return cache_inventory()
+
     @app.post("/api/prune-cache")
-    def api_prune_cache(days: int = 30, min_free_gb: int = 50):
-        return prune_cluster_cache(days, min_free_gb)
+    def api_prune_cache(req: PruneCacheRequest):
+        return prune_cluster_cache(req.min_free_gb, req.headroom_gb, req.dry_run)
 
 def _telemetry_daemon_loop():
     """Background polling loop for maintaining lifetime and session analytics."""
@@ -1339,6 +1672,7 @@ def main():
     subparsers.add_parser("teardown")
     subparsers.add_parser("menu")
     subparsers.add_parser("sync")
+    subparsers.add_parser("cache-inventory", help="Read-only cache snapshot across the cluster. No deletion, safe against production.")
 
     deploy_parser = subparsers.add_parser("deploy")
     deploy_parser.add_argument("--model", required=True)
@@ -1357,13 +1691,14 @@ def main():
     auth_parser.add_argument("--key", required=True)
     
     prune_parser = subparsers.add_parser("prune-cache")
-    prune_parser.add_argument("--days", type=int, default=30)
-    prune_parser.add_argument("--min-free-gb", type=int, default=50)
+    prune_parser.add_argument("--min-free-gb", type=int, default=50, help="Eviction floor. Above this, nothing is touched.")
+    prune_parser.add_argument("--headroom-gb", type=int, default=20, help="When evicting, free up to floor+headroom so the next deploy doesn't re-trigger immediately.")
+    prune_parser.add_argument("--dry-run", action="store_true", help="Report what would be evicted and why, without deleting anything. Safe against production.")
 
     cli_parser = subparsers.add_parser("cli")
     cli_sub = cli_parser.add_subparsers(dest="cli_action")
 
-    for cmd in ["status", "teardown", "menu", "sync"]:
+    for cmd in ["status", "teardown", "menu", "sync", "cache-inventory"]:
         cli_sub.add_parser(cmd)
         
     cli_sub.add_parser("daemon").add_argument("--port", type=int, default=5001)
@@ -1385,8 +1720,9 @@ def main():
     cli_auth.add_argument("--key", required=True)
     
     cli_prune = cli_sub.add_parser("prune-cache")
-    cli_prune.add_argument("--days", type=int, default=30)
     cli_prune.add_argument("--min-free-gb", type=int, default=50)
+    cli_prune.add_argument("--headroom-gb", type=int, default=20)
+    cli_prune.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
     subcommand = args.subcommand
@@ -1409,7 +1745,36 @@ def main():
     elif subcommand == "logs": print("\n".join(get_container_logs(args.host, args.tail).get("logs", [])))
     elif subcommand == "authorize-key": print(json.dumps(authorize_user_key(args.key), indent=2))
     elif subcommand == "sync": print(json.dumps(execute_sync(), indent=2))
-    elif subcommand == "prune-cache": print(json.dumps(prune_cluster_cache(getattr(args, "days", 30), getattr(args, "min_free_gb", 50)), indent=2))
+    elif subcommand == "cache-inventory":
+        inv = cache_inventory()
+        for host, data in inv["hosts"].items():
+            if data.get("status") != "ok":
+                print(f"[{host}] ERROR: {data.get('message')}")
+                continue
+            print(f"\n=== {host} === (mount: {data['mount_options']}, atime_reliable={data['atime_reliable']}, "
+                  f"free: {data['disk_free_gb']}/{data['disk_total_gb']} GB)")
+            for label, r in data["roots"].items():
+                if not r["exists"]:
+                    continue
+                print(f"  {label}: {r['entry_count']} entries, {r['total_gb']} GB")
+                if r["oldest"]:
+                    print(f"    oldest: {r['oldest']['name']} ({r['oldest']['age_days']}d, {round(r['oldest']['bytes']/(1024**3), 2)} GB)")
+                if r["newest"]:
+                    print(f"    newest: {r['newest']['name']} ({r['newest']['age_days']}d, {round(r['newest']['bytes']/(1024**3), 2)} GB)")
+    elif subcommand == "prune-cache":
+        res = prune_cluster_cache(getattr(args, "min_free_gb", 50), getattr(args, "headroom_gb", 20), getattr(args, "dry_run", False))
+        for host, s in res["details"].items():
+            if s.get("status") != "ok":
+                print(f"[{host}] ERROR: {s.get('message')}")
+                continue
+            verb = "WOULD EVICT" if s["dry_run"] else "EVICTED"
+            print(f"\n=== {host} === free: {s['free_before_gb']} GB (floor {getattr(args, 'min_free_gb', 50)} GB, atime_reliable={s['atime_reliable']})")
+            if s["entries_evicted"] == 0:
+                print("  Above floor -- nothing considered.")
+            else:
+                print(f"  {verb} {s['entries_evicted']}/{s['entries_total']} entries, {s['gb_freed']} GB, oldest-first.")
+        print("\n--- full detail ---")
+        print(json.dumps(res, indent=2))
     else: interactive_menu()
 
 if __name__ == "__main__":

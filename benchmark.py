@@ -10,13 +10,13 @@ import argparse
 import csv
 import datetime
 import json
+import sys
 import time
 import urllib.request
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
-BENCHMARK_RESULTS_PATH = BASE_DIR / "benchmark_results.txt"
 
 
 def discover_model_id(host: str, port: int) -> str:
@@ -67,7 +67,12 @@ def run_benchmark_pass(host: str, port: int, model_id: str, prompt: str, max_tok
                 choices = chunk_json.get("choices", [])
                 if choices:
                     delta = choices[0].get("delta", {})
-                    if delta.get("content"):
+                    # DeepSeek V4 (and other reasoning models run with
+                    # --reasoning-parser) stream their initial tokens into
+                    # reasoning_content, not content. Counting only `content`
+                    # means TTFT never fires during the reasoning block, and
+                    # a fully-reasoning response reports decode_tps == 0.0.
+                    if delta.get("content") or delta.get("reasoning_content"):
                         if first_token_time is None:
                             first_token_time = time.perf_counter()
                         chunk_count += 1
@@ -113,6 +118,11 @@ def main():
     parser.add_argument("--nodes", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--prompt", default="Write a 200 word technical overview of distributed tensor parallelism.")
+    parser.add_argument("--model-key", default=None,
+                        help="Catalog key (recipe filename stem) to log in the ledger instead of "
+                             "the raw served model id. Without this, enrich_catalog()'s "
+                             "historical_tps lookup can't join the ledger back to the catalog, "
+                             "since the served id and the catalog key are different strings.")
     args = parser.parse_args()
 
     print(f"[+] Connecting to http://{args.host}:{args.port}...")
@@ -149,9 +159,14 @@ def main():
     
     print(summary_text)
 
-    # Write output files
-    BENCHMARK_RESULTS_PATH.write_text(summary_text)
-    
+    # NOTE: benchmark_results.txt is intentionally NOT written here. The
+    # orchestrator's _run_benchmark_worker() owns that file (it captures our
+    # full stdout, including the per-pass lines above, not just the summary).
+    # Two writers racing on the same path meant the loser's content -- which
+    # could be either -- silently won.
+
+    ledger_key = args.model_key or model_id.split("/")[-1]
+
     file_exists = BENCHMARK_LEDGER_PATH.exists()
     with open(BENCHMARK_LEDGER_PATH, "a", newline="") as f:
         writer = csv.writer(f)
@@ -159,14 +174,18 @@ def main():
             writer.writerow(["Timestamp", "Model", "Warm_Decode_TPS", "Warm_TTFT_Sec", "Nodes"])
         writer.writerow([
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            model_id.split("/")[-1],
+            ledger_key,
             f"{avg_warm_decode_tps:.2f}",
             f"{avg_warm_ttft:.2f}",
             args.nodes
         ])
 
-    print(f"\n[+] Results logged to '{BENCHMARK_LEDGER_PATH.name}' and '{BENCHMARK_RESULTS_PATH.name}'")
+    print(f"\n[+] Results logged to '{BENCHMARK_LEDGER_PATH.name}' (key: {ledger_key})")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"[-] Benchmark failed: {exc}", file=sys.stderr)
+        sys.exit(1)
