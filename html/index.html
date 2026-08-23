@@ -43,10 +43,10 @@
         .net-badge { font-size: 12px; padding: 4px 10px; border-radius: 6px; font-weight: bold; cursor: pointer; display: inline-block; transition: all 0.2s ease; border: 1px solid transparent; }
         .net-badge:hover { filter: brightness(1.2); }
 
-        /* Top Layout */
+        /* Top Layout - Balanced Ratio for Breathing Room */
         .dashboard-top {
             display: grid;
-            grid-template-columns: 2fr 1fr;
+            grid-template-columns: 1.2fr 1fr;
             gap: 15px;
             flex-shrink: 0;
         }
@@ -77,11 +77,27 @@
         
         .metric-row { display: flex; justify-content: space-between; margin: 4px 0; font-size: 13px; color: #cbd5e1; }
         .metric-val { font-family: monospace; color: var(--accent); font-size: 12px; text-align: right; }
-        .telemetry-ticker { margin-top: auto; padding-top: 10px; border-top: 1px dashed var(--border-color); font-size: 11px; color: var(--text-muted); text-align: center; font-family: monospace; }
+        
+        /* Compact Non-Wrapping Telemetry Bar */
+        .telemetry-ticker {
+            margin-top: auto;
+            padding-top: 10px;
+            border-top: 1px dashed var(--border-color);
+            font-size: 11px;
+            color: var(--text-muted);
+            font-family: monospace;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            white-space: nowrap;
+            overflow: hidden;
+        }
+        .tele-stat { display: flex; align-items: center; gap: 3px; }
+        .tele-val { color: var(--text-main); font-weight: bold; }
 
         /* Forms & Inputs */
         label { font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px; font-weight: 500; }
-        select, input {
+        select, input[type="text"] {
             background: var(--bg-dark);
             color: white;
             border: 1px solid #475569;
@@ -94,21 +110,23 @@
             min-height: 38px;
         }
 
-        /* Recipe Metadata Strip */
+        /* Recipe Metadata Strip - Strict Single-Row Layout */
         .recipe-meta-strip {
             background: var(--bg-dark);
             border: 1px solid var(--border-color);
             border-radius: 6px;
-            padding: 8px;
+            padding: 10px 6px;
             margin-bottom: 10px;
             display: grid;
             grid-template-columns: repeat(4, 1fr);
-            gap: 6px;
+            gap: 4px;
             text-align: center;
+            align-items: center;
+            transition: grid-template-columns 0.2s ease;
         }
-        .meta-item { display: flex; flex-direction: column; }
-        .meta-label { font-size: 9px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; margin-bottom: 2px; }
-        .meta-value { font-family: monospace; font-size: 12px; color: var(--accent); font-weight: bold; }
+        .meta-item { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+        .meta-label { font-size: 9px; color: var(--text-muted); text-transform: uppercase; font-weight: 600; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .meta-value { font-family: monospace; font-size: 11px; color: var(--accent); font-weight: bold; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
         .recipe-yaml-drawer { margin-bottom: 10px; font-size: 11px; }
         .recipe-yaml-drawer summary { cursor: pointer; color: var(--accent); font-size: 11px; font-weight: bold; user-select: none; }
@@ -186,7 +204,7 @@
             font-family: monospace;
         }
 
-        @media (max-width: 1024px) {
+        @media (max-width: 1150px) {
             body { height: auto; min-height: 100vh; overflow-y: auto; }
             .dashboard-top { grid-template-columns: 1fr; }
             .log-section { height: 400px; min-height: 250px; flex-grow: 0; }
@@ -195,7 +213,7 @@
             .hosts-grid { grid-template-columns: 1fr; }
             header { flex-direction: column; align-items: flex-start; }
             .clock { align-self: flex-start; margin-top: 5px; }
-            .recipe-meta-strip { grid-template-columns: 1fr 1fr; gap: 8px; }
+            .recipe-meta-strip { grid-template-columns: 1fr 1fr !important; gap: 8px; }
         }
     </style>
 </head>
@@ -226,8 +244,9 @@
             <label>Select Model:</label>
             <select id="modelSelect" onfocus="fetchCatalog()" onchange="updateTopologyOptions()"></select>
             
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                <div>
+            <!-- Conditional Topology Row -->
+            <div id="topologyRow" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                <div id="topoSelectContainer">
                     <label>Topology:</label>
                     <select id="nodesSelect" onchange="updateHeadNodeVisibility()">
                         <!-- Populated Dynamically -->
@@ -245,7 +264,7 @@
             <!-- Recipe Metadata Strip -->
             <div id="recipeMetaCard" class="recipe-meta-strip">
                 <div class="meta-item">
-                    <span class="meta-label">Context / Max Seqs</span>
+                    <span class="meta-label">Context / Seqs</span>
                     <span id="metaContextSeq" class="meta-value">--</span>
                 </div>
                 <div class="meta-item">
@@ -253,12 +272,16 @@
                     <span id="metaLoadTime" class="meta-value">--</span>
                 </div>
                 <div class="meta-item">
-                    <span class="meta-label">Output Speed</span>
-                    <span id="metaTps" class="meta-value">--</span>
-                </div>
-                <div class="meta-item">
                     <span class="meta-label">Precision / Dtype</span>
                     <span id="metaPrecision" class="meta-value">--</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Lifetime Tokens</span>
+                    <span id="metaLifetimeTokens" class="meta-value">--</span>
+                </div>
+                <div class="meta-item" id="metaMtpContainer" style="display: none;">
+                    <span class="meta-label">MTP Hit Rate</span>
+                    <span id="metaMtpRate" class="meta-value">--</span>
                 </div>
             </div>
 
@@ -266,6 +289,11 @@
                 <summary>Inspect Recipe YAML</summary>
                 <pre><code id="rawYamlViewer">Select a recipe...</code></pre>
             </details>
+
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px;">
+                <input type="checkbox" id="runBenchmarkCheck" style="width: auto; margin: 0; min-height: auto; cursor: pointer;">
+                <label for="runBenchmarkCheck" style="margin: 0; cursor: pointer; color: #cbd5e1;">Auto-run benchmark when ready</label>
+            </div>
             
             <label>User ID / Auditor:</label>
             <input type="text" id="userIdInput" value="dashboard_user">
@@ -297,9 +325,24 @@
     let currentLogHost = 'spark-4';
     let currentOfflineState = false;
     let globalCatalog = {};
+    let lastSyncedActiveModel = null;
+    let latestSessionStats = null;
 
     function stripAnsiCodes(str) {
         return str.replace(/[\u001b\u009b]\[[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqv-y]/g, '');
+    }
+    
+    function formatTokens(num) {
+        if (!num) return '0';
+        if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+        if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
+        return num.toString();
+    }
+
+    function formatRam(mbVal) {
+        if (mbVal === undefined || mbVal === 'N/A' || isNaN(mbVal)) return 'N/A';
+        const gbVal = mbVal / 1024;
+        return gbVal >= 10 ? `${Math.round(gbVal)} GB` : `${gbVal.toFixed(1)} GB`;
     }
 
     function showStatusToast(msg, isError = false) {
@@ -322,9 +365,15 @@
             const res = await fetch(`${API_BASE}/status`);
             const data = await res.json();
             document.getElementById('serverClock').innerText = `Server Time: ${data.server_time}`;
-            if (document.getElementById('speedoMeter')) {
+            
+            latestSessionStats = data.session_stats;
+            
+            if (latestSessionStats && latestSessionStats.active) {
+                document.getElementById('speedoMeter').innerText = `SESSION SPEED: ${latestSessionStats.tps} tok/s`;
+            } else {
                 document.getElementById('speedoMeter').innerText = `SPEED: ${data.system_tps || 0.0} tok/s`;
             }
+            
             if (document.getElementById('streamThreads')) {
                 document.getElementById('streamThreads').innerText = `THREADS: ${data.running_requests || 0} active (${data.waiting_requests || 0} queued)`;
             }
@@ -333,18 +382,50 @@
             if (data.network_mode === "Working in OFFLINE mode") {
                 currentOfflineState = true;
                 netBadge.innerHTML = '🔒 OFFLINE MODE';
-                netBadge.title = 'Click to toggle. Note: Network changes only apply to new deployments, not currently running models.';
+                netBadge.title = 'Click to toggle.';
                 netBadge.style.color = '#f87171';
                 netBadge.style.borderColor = '#991b1b';
                 netBadge.style.background = '#450a0a';
             } else {
                 currentOfflineState = false;
                 netBadge.innerHTML = '🌐 ONLINE MODE';
-                netBadge.title = 'Click to toggle. Note: Network changes only apply to new deployments, not currently running models.';
+                netBadge.title = 'Click to toggle.';
                 netBadge.style.color = '#34d399';
                 netBadge.style.borderColor = '#065f46';
                 netBadge.style.background = '#022c22';
             }
+
+            let detectedActiveModel = null;
+            for (const [host, info] of Object.entries(data.hosts)) {
+                if (info.active_model && info.active_model !== 'None') {
+                    detectedActiveModel = info.active_model;
+                    break;
+                }
+            }
+
+            if (detectedActiveModel && Object.keys(globalCatalog).length > 0) {
+                let matchedCatalogKey = null;
+                for (const [catKey, catData] of Object.entries(globalCatalog)) {
+                    const hfPath = catData.hf_path || '';
+                    if (catKey === detectedActiveModel || hfPath.endsWith(detectedActiveModel) || catKey.toLowerCase().includes(detectedActiveModel.toLowerCase()) || detectedActiveModel.toLowerCase().includes(catKey.toLowerCase())) {
+                        matchedCatalogKey = catKey;
+                        break;
+                    }
+                }
+
+                if (matchedCatalogKey && matchedCatalogKey !== lastSyncedActiveModel) {
+                    lastSyncedActiveModel = matchedCatalogKey;
+                    const modelSelect = document.getElementById('modelSelect');
+                    if (modelSelect.value !== matchedCatalogKey) {
+                        modelSelect.value = matchedCatalogKey;
+                        updateTopologyOptions();
+                    }
+                }
+            } else if (!detectedActiveModel) {
+                lastSyncedActiveModel = null;
+            }
+
+            updateRecipeMetadata();
 
             const grid = document.getElementById('hostsGrid');
             grid.innerHTML = '';
@@ -357,7 +438,7 @@
                 const modelStatusStr = info.model_status || 'NONE';
                 if (modelStatusStr === 'READY') {
                     modelBadgeClass = 'ready';
-                } else if (modelStatusStr.startsWith('NOT READY')) {
+                } else if (modelStatusStr.startsWith('NOT READY') || modelStatusStr.includes('STARTING') || modelStatusStr.includes('WARMING')) {
                     modelBadgeClass = 'loading';
                 }
                 const modelBadge = `<span class="badge ${modelBadgeClass}">${modelStatusStr}</span>`;
@@ -368,9 +449,27 @@
 
                 let telemetryHtml = '';
                 if (info.telemetry && info.telemetry.gpu_temp_c !== undefined) {
-                    telemetryHtml = `TEMP: ${info.telemetry.gpu_temp_c}°C &nbsp;|&nbsp; GPU: ${info.telemetry.gpu_util_pct}% &nbsp;|&nbsp; MEM: ${info.telemetry.mem_used_mb}/${info.telemetry.mem_total_mb} MB`;
+                    const temp = info.telemetry.gpu_temp_c !== 'N/A' ? `${info.telemetry.gpu_temp_c}°C` : 'N/A';
+                    const util = info.telemetry.gpu_util_pct !== 'N/A' ? `${info.telemetry.gpu_util_pct}%` : 'N/A';
+                    
+                    let pwr = 'N/A';
+                    if (info.telemetry.power_draw_w !== undefined && info.telemetry.power_draw_w !== 'N/A') {
+                        pwr = `${info.telemetry.power_draw_w}W`;
+                    }
+                    
+                    const ram = formatRam(info.telemetry.host_mem_avail_mb);
+
+                    telemetryHtml = `
+                        <div class="tele-stat" title="GPU Temperature"><span>TEMP:</span><span class="tele-val">${temp}</span></div>
+                        <span>·</span>
+                        <div class="tele-stat" title="GPU Utilization"><span>GPU:</span><span class="tele-val">${util}</span></div>
+                        <span>·</span>
+                        <div class="tele-stat" title="Package Power Draw"><span>PWR:</span><span class="tele-val">${pwr}</span></div>
+                        <span>·</span>
+                        <div class="tele-stat" title="Free Host Unified Memory"><span>RAM:</span><span class="tele-val">${ram}</span></div>
+                    `;
                 } else {
-                    telemetryHtml = `Telemetry Unavailable`;
+                    telemetryHtml = `<div style="margin: auto;">Telemetry Unavailable</div>`;
                 }
 
                 grid.innerHTML += `
@@ -441,6 +540,7 @@
         const model = document.getElementById('modelSelect').value;
         const nodesSelect = document.getElementById('nodesSelect');
         const topologies = globalCatalog[model]?.topologies || {};
+        const topoKeys = Object.keys(topologies);
         
         const currentNodes = nodesSelect.value;
         nodesSelect.innerHTML = '';
@@ -450,14 +550,29 @@
         if (topologies['2_node']) {
             nodesSelect.innerHTML += `<option value="2">2 Node</option>`;
         }
+        
+        const topoRow = document.getElementById('topologyRow');
+        if (topoKeys.length <= 1) {
+            topoRow.style.display = 'none';
+        } else {
+            topoRow.style.display = 'grid';
+        }
+
         if (currentNodes && nodesSelect.querySelector(`option[value="${currentNodes}"]`)) {
             nodesSelect.value = currentNodes;
+        } else if (topoKeys.length === 1) {
+            nodesSelect.value = topoKeys[0] === '2_node' ? '2' : '1';
         }
+        
         updateHeadNodeVisibility();
     }
 
     function updateHeadNodeVisibility() {
-        const nodes = document.getElementById('nodesSelect').value;
+        const nodesSelect = document.getElementById('nodesSelect');
+        const model = document.getElementById('modelSelect').value;
+        const recipe = globalCatalog[model];
+        const nodes = nodesSelect.value || (recipe?.topologies?.['2_node'] ? '2' : '1');
+        
         const headContainer = document.getElementById('headSelectContainer');
         if (nodes === "2") {
             headContainer.style.visibility = 'hidden';
@@ -469,23 +584,42 @@
 
     function updateRecipeMetadata() {
         const modelKey = document.getElementById('modelSelect').value;
-        const nodes = document.getElementById('nodesSelect').value;
+        const nodesSelect = document.getElementById('nodesSelect');
         const recipe = globalCatalog[modelKey];
         if (!recipe) return;
 
+        const nodes = nodesSelect.value || (recipe.topologies?.['2_node'] ? '2' : '1');
         const topoKey = nodes === "2" ? "2_node" : "1_node";
         const top = recipe.topologies?.[topoKey] || {};
 
         const ctxK = top.max_model_len ? `${Math.round(top.max_model_len / 1024)}k` : "N/A";
         const maxSeqs = top.max_num_seqs || "Uncapped";
         document.getElementById('metaContextSeq').innerText = `${ctxK} / ${maxSeqs}`;
-
         document.getElementById('metaLoadTime').innerText = top.avg_load_display || "N/A";
-        document.getElementById('metaTps').innerText = top.historical_tps || "N/A";
 
         const precision = recipe.precision_label || "BF16";
         const kvDtype = top.kv_dtype || "AUTO KV";
         document.getElementById('metaPrecision').innerText = `${precision} / ${kvDtype}`;
+        
+        const formatIn = formatTokens(top.lifetime_in);
+        const formatOut = formatTokens(top.lifetime_out);
+        document.getElementById('metaLifetimeTokens').innerText = `${formatIn} / ${formatOut}`;
+        
+        const metaStrip = document.getElementById('recipeMetaCard');
+        const mtpContainer = document.getElementById('metaMtpContainer');
+        
+        if (top.mtp_enabled) {
+            metaStrip.style.gridTemplateColumns = 'repeat(5, 1fr)';
+            mtpContainer.style.display = 'flex';
+            let liveMtp = '--';
+            if (latestSessionStats && latestSessionStats.active) {
+                liveMtp = `${latestSessionStats.mtp_rate}%`;
+            }
+            document.getElementById('metaMtpRate').innerText = `${liveMtp} / ${top.hist_mtp_rate || 0}%`;
+        } else {
+            metaStrip.style.gridTemplateColumns = 'repeat(4, 1fr)';
+            mtpContainer.style.display = 'none';
+        }
 
         document.getElementById('rawYamlViewer').textContent = JSON.stringify(recipe, null, 2);
     }
@@ -516,11 +650,19 @@
 
     async function triggerDeploy() {
         const model = document.getElementById('modelSelect').value;
-        const nodes = parseInt(document.getElementById('nodesSelect').value);
+        const nodesSelect = document.getElementById('nodesSelect');
+        const recipe = globalCatalog[model];
+        
+        let nodes = parseInt(nodesSelect.value);
+        if (isNaN(nodes)) {
+            nodes = recipe?.topologies?.['2_node'] ? 2 : 1;
+        }
+
         const head = document.getElementById('headSelect').value;
         const user_id = document.getElementById('userIdInput').value;
+        const run_benchmark = document.getElementById('runBenchmarkCheck') ? document.getElementById('runBenchmarkCheck').checked : false;
 
-        if(!confirm(`Deploy ${model} on ${nodes} node(s)?`)) return;
+        if(!confirm(`Deploy ${model} on ${nodes} node(s)?${run_benchmark ? '\n(Auto-benchmark enabled)' : ''}`)) return;
 
         const btn = document.getElementById('deployBtn');
         const origText = btn.innerText;
@@ -531,17 +673,28 @@
             const response = await fetch(`${API_BASE}/deploy`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({model, nodes, head, user_id})
+                body: JSON.stringify({
+                    model, 
+                    nodes, 
+                    head, 
+                    user_id,
+                    wait: run_benchmark,
+                    run_benchmark
+                })
             });
             
             if (!response.ok) {
-                const errData = await response.json();
-                showStatusToast(`Deployment Error: ${errData.detail || response.statusText}`, true);
+                let errMsg = response.statusText;
+                try {
+                    const errData = await response.json();
+                    errMsg = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
+                } catch(jsonErr) {}
+                showStatusToast(`Deployment Error: ${errMsg}`, true);
             } else {
-                showStatusToast('✓ Deployment sequence initiated');
+                showStatusToast(run_benchmark ? '✓ Deployment & benchmark sequence initiated' : '✓ Deployment sequence initiated');
             }
         } catch(e) {
-            showStatusToast('Deployment request failed.', true);
+            showStatusToast(`Deployment failed: ${e.message || 'Server connection lost'}`, true);
         } finally {
             btn.innerText = origText;
             btn.disabled = false;

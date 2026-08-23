@@ -18,6 +18,7 @@ import os
 import pathlib
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -45,7 +46,7 @@ except ImportError:
 # --- Core Configurations ---
 BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
 MODELS_YAML_PATH = BASE_DIR / "models.yaml"
-LOAD_TIMES_PATH = BASE_DIR / "load_times.json"
+LEDGER_PATH = BASE_DIR / "model_ledger.json"
 BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
 
 HOSTS = legacy_hosts_dict()
@@ -69,30 +70,181 @@ _STATUS_CACHE: dict | None = None
 _STATUS_CACHE_TS = 0.0
 _STATUS_CACHE_TTL_SEC = 2  # dedupe bursts of near-simultaneous polls
 
+# --- Telemetry Session State ---
+class SessionTracker:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = False
+        self.first_active_ts = 0.0
+        self.last_active_ts = 0.0
+        self.last_flush_ts = 0.0
+        self.model = None
+        self.topo = None
+        
+        self.start_p_tok = 0.0
+        self.start_g_tok = 0.0
+        self.start_d_tok = 0.0
+        self.start_a_tok = 0.0
+
+        self.flushed_p_tok = 0.0
+        self.flushed_g_tok = 0.0
+        self.flushed_d_tok = 0.0
+        self.flushed_a_tok = 0.0
+
+        self.cur_p_tok = 0.0
+        self.cur_g_tok = 0.0
+        self.cur_d_tok = 0.0
+        self.cur_a_tok = 0.0
+
+    def update(self, metrics: dict, model: str, topo: str):
+        with self.lock:
+            p_tok = metrics.get("prompt_tokens", 0.0)
+            g_tok = metrics.get("gen_tokens", 0.0)
+            d_tok = metrics.get("draft_tokens", 0.0)
+            a_tok = metrics.get("accepted_tokens", 0.0)
+            reqs = metrics.get("running_requests", 0)
+
+            now = time.time()
+            is_moving = reqs > 0 or p_tok > self.cur_p_tok or g_tok > self.cur_g_tok or d_tok > self.cur_d_tok
+
+            if not self.active and is_moving:
+                self.active = True
+                self.model = model
+                self.topo = topo
+                self.first_active_ts = now
+                self.last_active_ts = now
+                self.last_flush_ts = now
+                
+                self.start_p_tok = p_tok
+                self.start_g_tok = g_tok
+                self.start_d_tok = d_tok
+                self.start_a_tok = a_tok
+
+                self.flushed_p_tok = p_tok
+                self.flushed_g_tok = g_tok
+                self.flushed_d_tok = d_tok
+                self.flushed_a_tok = a_tok
+            elif self.active and is_moving:
+                self.last_active_ts = now
+            
+            self.cur_p_tok = p_tok
+            self.cur_g_tok = g_tok
+            self.cur_d_tok = d_tok
+            self.cur_a_tok = a_tok
+
+            if self.active:
+                if (now - self.last_active_ts) > 600:
+                    self._commit_session()
+                    self.active = False
+                elif (now - self.last_flush_ts) > 3600:
+                    self._commit_session()
+
+    def _commit_session(self):
+        with self.lock:
+            if not self.model or not self.topo:
+                return
+            
+            p_diff = self.cur_p_tok - self.flushed_p_tok
+            g_diff = self.cur_g_tok - self.flushed_g_tok
+            d_diff = self.cur_d_tok - self.flushed_d_tok
+            a_diff = self.cur_a_tok - self.flushed_a_tok
+            
+            if p_diff <= 0 and g_diff <= 0 and d_diff <= 0 and a_diff <= 0:
+                return
+            
+            data = {}
+            if LEDGER_PATH.exists():
+                try: data = json.loads(LEDGER_PATH.read_text())
+                except Exception: pass
+                
+            key = f"{self.model}::{self.topo}"
+            if key not in data or not isinstance(data[key], dict):
+                data[key] = {"cached": [], "compiled": [], "downloaded": [], "lifetime": {"in": 0, "out": 0, "draft": 0, "accepted": 0}}
+                
+            if "lifetime" not in data[key]:
+                data[key]["lifetime"] = {"in": 0, "out": 0, "draft": 0, "accepted": 0}
+                
+            data[key]["lifetime"]["in"] += int(p_diff)
+            data[key]["lifetime"]["out"] += int(g_diff)
+            data[key]["lifetime"]["draft"] += int(d_diff)
+            data[key]["lifetime"]["accepted"] += int(a_diff)
+            
+            try: LEDGER_PATH.write_text(json.dumps(data, indent=2))
+            except Exception: pass
+
+            self.flushed_p_tok = self.cur_p_tok
+            self.flushed_g_tok = self.cur_g_tok
+            self.flushed_d_tok = self.cur_d_tok
+            self.flushed_a_tok = self.cur_a_tok
+            self.last_flush_ts = time.time()
+
+    def get_live_stats(self) -> dict:
+        with self.lock:
+            if not self.active:
+                return {"active": False}
+                
+            active_time = max(0.1, self.last_active_ts - self.first_active_ts)
+            g_diff = self.cur_g_tok - self.start_g_tok
+            d_diff = self.cur_d_tok - self.start_d_tok
+            a_diff = self.cur_a_tok - self.start_a_tok
+            
+            tps = g_diff / active_time
+            mtp_rate = (a_diff / d_diff * 100) if d_diff > 0 else 0.0
+            
+            return {
+                "active": True,
+                "duration_sec": int(active_time),
+                "tps": round(tps, 1),
+                "mtp_rate": round(mtp_rate, 1),
+                "gen_tokens": int(g_diff),
+                "draft_tokens": int(d_diff),
+                "accepted_tokens": int(a_diff)
+            }
+
+SESSION_TRACKER = SessionTracker()
+
 # --- Core Helpers ---
 def get_lightweight_telemetry(ip: str, user: str) -> dict:
-    """Queries nvidia-smi telemetry line-by-line for Grace Blackwell unified memory."""
-    cmd = ["/usr/bin/nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
+    """Queries GPU thermal, util, power, and host unified memory availability in a single pass."""
+    cmd = [
+        "bash", "-c", 
+        "/usr/bin/nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit --format=csv,noheader,nounits | head -n 1 && "
+        "awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo"
+    ]
     res = run_ssh(ip, user, cmd, capture=True, timeout=10)
     
+    telemetry = {
+        "gpu_temp_c": "N/A", 
+        "gpu_util_pct": "N/A", 
+        "power_draw_w": "N/A", 
+        "power_limit_w": "N/A", 
+        "host_mem_avail_mb": "N/A"
+    }
+    
     if res.returncode == 0 and res.stdout.strip():
-        for line in res.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 2:
-                temp_str, util_str = parts[0], parts[1]
-                if temp_str.isdigit() and util_str.isdigit():
-                    mem_used = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else "Unified"
-                    mem_total = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else "131072"
-                    return {
-                        "gpu_temp_c": int(temp_str),
-                        "gpu_util_pct": int(util_str),
-                        "mem_used_mb": mem_used,
-                        "mem_total_mb": mem_total
-                    }
-    return {}
+        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+        if len(lines) >= 1:
+            gpu_parts = [p.strip() for p in lines[0].split(",")]
+            
+            if len(gpu_parts) >= 1 and gpu_parts[0].isdigit(): 
+                telemetry["gpu_temp_c"] = int(gpu_parts[0])
+            if len(gpu_parts) >= 2 and gpu_parts[1].isdigit(): 
+                telemetry["gpu_util_pct"] = int(gpu_parts[1])
+            
+            if len(gpu_parts) >= 3:
+                try: telemetry["power_draw_w"] = int(float(gpu_parts[2]))
+                except ValueError: pass
+                
+            if len(gpu_parts) >= 4:
+                try: telemetry["power_limit_w"] = int(float(gpu_parts[3]))
+                except ValueError: pass
+                
+        if len(lines) >= 2 and lines[1].isdigit():
+            telemetry["host_mem_avail_mb"] = int(lines[1])
+            
+    return telemetry
 
 def check_vllm_health(head_ip: str = "10.0.14.43", port: int = 8000) -> bool:
-    """Probes the vLLM /health endpoint to check if HTTP API serving is ready."""
     url = f"http://{head_ip}:{port}/health"
     try:
         req = urllib.request.Request(url, method="GET")
@@ -102,7 +254,6 @@ def check_vllm_health(head_ip: str = "10.0.14.43", port: int = 8000) -> bool:
         return False
 
 def wait_for_cluster_ready(head_ip: str = "10.0.14.43", timeout_sec: int = 900, poll_interval: int = 15) -> bool:
-    """Polls the vLLM /health endpoint until HTTP 200 ready state."""
     start_time = time.time()
     print(f"[+] Polling http://{head_ip}:8000/health until serving ready (Timeout: {timeout_sec}s)...")
     
@@ -117,7 +268,6 @@ def wait_for_cluster_ready(head_ip: str = "10.0.14.43", timeout_sec: int = 900, 
     return False
 
 def parse_iso_time(ts_str: str) -> float:
-    """Parses Docker StartedAt ISO timestamp into unix epoch seconds."""
     try:
         ts_clean = ts_str.split(".")[0].replace("Z", "")
         dt = datetime.datetime.strptime(ts_clean, "%Y-%m-%dT%H:%M:%S")
@@ -126,13 +276,14 @@ def parse_iso_time(ts_str: str) -> float:
         return time.time()
 
 def detect_model_stage(ip: str, user: str, c_name: str) -> str:
-    """Inspects recent log output with ANSI stripping and case insensitivity."""
     res = run_ssh(ip, user, ["docker", "logs", "--tail", "250", c_name], timeout=10)
     raw_text = res.stdout + res.stderr
     clean_text = ANSI_ESCAPE.sub('', raw_text)
     lines = [l.strip().lower() for l in clean_text.splitlines() if l.strip()]
 
     for line in reversed(lines):
+        if any(k in line for k in ["downloading", "fetching", "allocating", "huggingface"]):
+            return "NOT READY - DOWNLOADING"
         if any(k in line for k in ["warming up", "warmup", "kv cache", "cuda graph", "mhc", "profiling", "capturing", "graph capture"]):
             return "NOT READY - WARMUP"
         if any(k in line for k in ["tilelang", "deepgemm", "kernel", "compiling", "jit", "tuning", "building"]):
@@ -142,44 +293,57 @@ def detect_model_stage(ip: str, user: str, c_name: str) -> str:
 
     return "NOT READY - INITIALIZING"
 
-MAX_RECORDABLE_LOAD_SEC = 7200  # 2 hours
+MAX_RECORDABLE_LOAD_SEC = 14400  # 4 hours
 
 _RECORDED_LOAD_STARTS: dict[str, float] = {}
 _RECORDED_LOAD_STARTS_LOCK = threading.Lock()
 
-def record_load_time(model: str, topo_key: str, duration_sec: int):
-    if duration_sec > MAX_RECORDABLE_LOAD_SEC or duration_sec < 60: return
+def record_load_time(model: str, topo_key: str, duration_sec: int, load_type: str = "cached"):
+    if duration_sec > MAX_RECORDABLE_LOAD_SEC or duration_sec < 10: return
     data = {}
-    if LOAD_TIMES_PATH.exists():
-        try: data = json.loads(LOAD_TIMES_PATH.read_text())
+    if LEDGER_PATH.exists():
+        try: data = json.loads(LEDGER_PATH.read_text())
         except Exception: data = {}
     key = f"{model}::{topo_key}"
     
-    existing = data.get(key, [])
+    if key not in data or isinstance(data[key], list):
+        data[key] = {"cached": [], "compiled": [], "downloaded": [], "lifetime": {"in": 0, "out": 0, "draft": 0, "accepted": 0}}
+        
+    existing = data[key].get(load_type, [])
     if existing and existing[-1] == duration_sec:
         return
 
-    data.setdefault(key, []).append(duration_sec)
-    data[key] = data[key][-20:]
-    try: LOAD_TIMES_PATH.write_text(json.dumps(data, indent=2))
+    data[key].setdefault(load_type, []).append(duration_sec)
+    data[key][load_type] = data[key][load_type][-20:]
+    try: LEDGER_PATH.write_text(json.dumps(data, indent=2))
     except Exception: pass
 
-def get_estimated_load_time(model: str, topo_key: str) -> tuple[int, bool]:
-    default_est = 700 if "deepseek" in model.lower() else 180
-    if not LOAD_TIMES_PATH.exists():
+def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached") -> tuple[int, bool]:
+    default_ests = {"cached": 180, "compiled": 1500, "downloaded": 4500}
+    default_est = default_ests.get(load_type, 180)
+    
+    if "deepseek" in model.lower():
+        default_ests = {"cached": 700, "compiled": 1800, "downloaded": 5000}
+        default_est = default_ests.get(load_type, 700)
+        
+    if not LEDGER_PATH.exists():
         return default_est, False
     try:
-        data = json.loads(LOAD_TIMES_PATH.read_text())
-        times = data.get(f"{model}::{topo_key}", [])
-        if times:
-            return int(sum(times) / len(times)), True
+        data = json.loads(LEDGER_PATH.read_text())
+        key_data = data.get(f"{model}::{topo_key}", {})
+        if isinstance(key_data, dict):
+            times = key_data.get(load_type, [])
+            if times:
+                return int(sum(times) / len(times)), True
     except Exception:
         pass
     return default_est, False
 
 def get_vllm_metrics(head_ip: str = "10.0.14.43", port: int = 8000) -> dict:
-    """Scrapes vLLM Prometheus endpoint for system throughput (TPS) and request concurrency."""
-    metrics = {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
+    metrics = {
+        "tps": 0.0, "running_requests": 0, "waiting_requests": 0,
+        "prompt_tokens": 0.0, "gen_tokens": 0.0, "draft_tokens": 0.0, "accepted_tokens": 0.0
+    }
     try:
         url = f"http://{head_ip}:{port}/metrics"
         req = urllib.request.Request(url, method="GET")
@@ -187,15 +351,58 @@ def get_vllm_metrics(head_ip: str = "10.0.14.43", port: int = 8000) -> dict:
             content = response.read().decode("utf-8")
             for line in content.splitlines():
                 if line.startswith("#"): continue
+                parts = line.split()
+                if not parts: continue
+                try: val = float(parts[-1])
+                except ValueError: continue
+
                 if "vllm:avg_generation_throughput_tok_per_s" in line:
-                    metrics["tps"] = round(float(line.split()[-1]), 1)
+                    metrics["tps"] = round(val, 1)
                 elif "vllm:num_requests_running" in line:
-                    metrics["running_requests"] = int(float(line.split()[-1]))
+                    metrics["running_requests"] = int(val)
                 elif "vllm:num_requests_waiting" in line:
-                    metrics["waiting_requests"] = int(float(line.split()[-1]))
+                    metrics["waiting_requests"] = int(val)
+                elif "vllm:prompt_tokens_total" in line:
+                    metrics["prompt_tokens"] = val
+                elif "vllm:generation_tokens_total" in line:
+                    metrics["gen_tokens"] = val
+                elif any(k in line for k in ["vllm:spec_decode_num_draft_tokens_total", "vllm:num_spec_tokens_draft_total"]):
+                    metrics["draft_tokens"] = val
+                elif any(k in line for k in ["vllm:spec_decode_num_accepted_tokens_total", "vllm:num_spec_tokens_accepted_total"]):
+                    metrics["accepted_tokens"] = val
     except Exception:
         pass
     return metrics
+
+def prune_cluster_cache(max_age_days: int = 30, min_free_gb: int = 50) -> dict:
+    print(f"[+] Checking JIT cache footprints across cluster (Age threshold: {max_age_days}d, Min Free NVMe: {min_free_gb}GB)...")
+    results = {}
+    for host, meta in HOSTS.items():
+        ip = meta["ip"]
+        check_space_cmd = ["bash", "-c", "df -BG /home/tetrel | tail -n1 | awk '{print $4}' | tr -d 'G'"]
+        res = run_ssh(ip, None, check_space_cmd, capture=True, timeout=10)
+        
+        free_gb = 0
+        if res.returncode == 0 and res.stdout.strip().isdigit():
+            free_gb = int(res.stdout.strip())
+        
+        if free_gb > min_free_gb:
+            msg = f"{free_gb} GB free (> {min_free_gb} GB threshold). Retaining all cached kernels."
+            print(f"  [{host}] {msg}")
+            results[host] = msg
+            continue
+
+        print(f"  [{host}] {free_gb} GB free (<= {min_free_gb} GB threshold). Pruning kernels untouched for >{max_age_days} days...")
+        prune_cmd = [
+            "bash", "-c",
+            f"find ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton -type f -atime +{max_age_days} -delete 2>/dev/null; "
+            f"find ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton -type d -empty -delete 2>/dev/null"
+        ]
+        run_ssh(ip, None, prune_cmd, timeout=30)
+        results[host] = f"Pruned kernels older than {max_age_days} days (Free: {free_gb}GB)"
+        
+    print("[+] Cache evaluation complete.")
+    return {"status": "success", "details": results}
 
 def _discover_host_container(host: str, meta: dict) -> dict:
     ip = meta["ip"]
@@ -203,6 +410,7 @@ def _discover_host_container(host: str, meta: dict) -> dict:
     info = {
         "host": host, "ip": ip, "reachable": False,
         "active_container": "None", "container_state": "None", "loaded_model": "None",
+        "is_crashed": False
     }
 
     res = run_ssh(ip, user, ["docker", "ps", "-a", "--format", "{{.Names}}::{{.State}}::{{.Image}}"], timeout=10)
@@ -217,18 +425,26 @@ def _discover_host_container(host: str, meta: dict) -> dict:
             continue
         c_name = parts[0]
         c_state = parts[1] if len(parts) > 1 else "running"
+        is_crashed = c_state.lower().startswith("exited") or "dead" in c_state.lower()
+        
         if c_name not in [ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER]:
             continue
 
         info["active_container"] = c_name
         info["container_state"] = c_state.lower()
+        info["is_crashed"] = is_crashed
 
         loaded_model = "None"
         inspect_res = run_ssh(ip, user, ["docker", "inspect", c_name, "--format", "{{json .Config.Cmd}}"], timeout=8)
         if inspect_res.returncode == 0 and "--model" in inspect_res.stdout:
             try:
                 cmd_parts = json.loads(inspect_res.stdout.strip())
-                if "--model" in cmd_parts:
+                if len(cmd_parts) >= 2 and cmd_parts[0] == "bash" and "-c" in cmd_parts:
+                    bash_cmd = cmd_parts[-1]
+                    model_match = re.search(r'--model\s+([^\s]+)', bash_cmd)
+                    if model_match:
+                        loaded_model = model_match.group(1).split("/")[-1]
+                elif "--model" in cmd_parts:
                     idx = cmd_parts.index("--model")
                     if idx + 1 < len(cmd_parts):
                         loaded_model = cmd_parts[idx + 1].split("/")[-1]
@@ -252,20 +468,28 @@ def _discover_host_container(host: str, meta: dict) -> dict:
 
     return info
 
-def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool, serving_host: str, catalog_models: dict) -> tuple:
+def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool, container_info: dict, serving_host: str, catalog_models: dict) -> tuple:
     ip = meta["ip"]
     user = None
+    telemetry = get_lightweight_telemetry(ip, user)
 
     if not info.get("reachable"):
         return host, {
             "ip": ip, "docker_status": "UNREACHABLE", "container_name": "None",
             "container_state": "NONE", "active_model": "None", "model_status": "NONE",
-            "eta_seconds": 0, "eta_display": "N/A", "telemetry": {}
+            "eta_seconds": 0, "eta_display": "N/A", "telemetry": telemetry
         }
 
     active_container = info["active_container"]
     container_state = info["container_state"]
     loaded_model = info["loaded_model"]
+    is_crashed = info.get("is_crashed", False)
+
+    head_crashed = False
+    for h, cinfo in container_info.items():
+        if HOSTS.get(h, {}).get("role") == "head" and cinfo.get("is_crashed"):
+            head_crashed = True
+            break
 
     matched_key = loaded_model
     if catalog_models and isinstance(catalog_models, dict):
@@ -279,7 +503,15 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
     eta_display = "Ready" if cluster_ready else "N/A"
     topo_key = "2_node" if active_container in [ContainerRole.HEAD, ContainerRole.WORKER] else "1_node"
 
-    if active_container != "None" and container_state == "running":
+    if is_crashed:
+        model_status = f"CRASHED ({container_state.upper()})"
+        eta_display = "Check Docker Logs"
+        eta_seconds = 0
+    elif active_container == ContainerRole.WORKER and head_crashed:
+        model_status = "ORPHANED (HEAD CRASHED)"
+        eta_display = "Requires Teardown"
+        eta_seconds = 0
+    elif active_container != "None" and container_state == "running":
         if cluster_ready and host == serving_host:
             model_status = "READY"
             time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
@@ -292,16 +524,36 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                         _RECORDED_LOAD_STARTS[record_key] = start_ts
                 if not already_recorded:
                     elapsed = int(time.time() - start_ts)
-                    record_load_time(matched_key, topo_key, elapsed)
+                    log_res = run_ssh(ip, user, ["docker", "logs", "--tail", "5000", active_container], timeout=15)
+                    logs_lower = (log_res.stdout + log_res.stderr).lower()
+                    if "downloading" in logs_lower or "fetching" in logs_lower:
+                        load_type = "downloaded"
+                    elif "tilelang completes" in logs_lower or "jit compilation" in logs_lower or "compiling" in logs_lower:
+                        load_type = "compiled"
+                    else:
+                        load_type = "cached"
+                        
+                    record_load_time(matched_key, topo_key, elapsed, load_type)
         elif cluster_ready:
             model_status = "READY"
         else:
             model_status = detect_model_stage(ip, user, active_container)
+            
+            if isinstance(telemetry.get("gpu_util_pct"), int) and telemetry["gpu_util_pct"] > 75:
+                model_status = "WARMING UP (CUDA GRAPHS)"
+                
             time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
             if time_res.returncode == 0 and time_res.stdout.strip():
                 start_ts = parse_iso_time(time_res.stdout.strip())
                 elapsed = int(time.time() - start_ts)
-                est_total, has_history = get_estimated_load_time(matched_key, topo_key)
+                
+                current_load_type = "cached"
+                if "DOWNLOADING" in model_status:
+                    current_load_type = "downloaded"
+                elif "COMPILING" in model_status:
+                    current_load_type = "compiled"
+                    
+                est_total, has_history = get_estimated_load_time(matched_key, topo_key, current_load_type)
                 remaining = est_total - elapsed
                 eta_seconds = max(0, remaining)
 
@@ -321,10 +573,9 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
         model_status = "NONE"
         eta_display = "N/A"
 
-    telemetry = get_lightweight_telemetry(ip, user)
     return host, {
         "ip": ip,
-        "docker_status": "ONLINE",
+        "docker_status": "CRASHED" if is_crashed else "ONLINE",
         "container_name": active_container,
         "container_state": container_state.upper() if active_container != "None" else "NONE",
         "active_model": loaded_model,
@@ -373,6 +624,11 @@ def _compute_cluster_status_impl() -> dict:
     cluster_ready = check_vllm_health(serving_ip)
     vllm_metrics = get_vllm_metrics(serving_ip) if cluster_ready else {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
 
+    matched_model = container_info.get(serving_host, {}).get("loaded_model", "Unknown")
+    topo = "2_node" if len([h for h, i in container_info.items() if i.get("active_container") != "None"]) > 1 else "1_node"
+    if cluster_ready:
+        SESSION_TRACKER.update(vllm_metrics, matched_model, topo)
+
     catalog_models = load_model_catalog().get("catalog", {}).get("models", {})
 
     status_data = {
@@ -383,11 +639,12 @@ def _compute_cluster_status_impl() -> dict:
         "system_tps": vllm_metrics["tps"],
         "running_requests": vllm_metrics["running_requests"],
         "waiting_requests": vllm_metrics["waiting_requests"],
+        "session_stats": SESSION_TRACKER.get_live_stats(),
         "hosts": {}
     }
 
     futures_phase2 = [
-        WORKER_POOL.submit(_finalize_host_status, host, meta, container_info.get(host, {}), cluster_ready, serving_host, catalog_models)
+        WORKER_POOL.submit(_finalize_host_status, host, meta, container_info.get(host, {}), cluster_ready, container_info, serving_host, catalog_models)
         for host, meta in HOSTS.items()
     ]
     phase2_results = _collect_bounded(futures_phase2, host_order, call_deadline, "Phase 2 finalize")
@@ -403,6 +660,16 @@ def _compute_cluster_status_impl() -> dict:
         else:
             _, host_status = result
             status_data["hosts"][host] = host_status
+
+    head_s = status_data["hosts"].get("spark-4")
+    worker_s = status_data["hosts"].get("spark-3")
+    if head_s and worker_s:
+        if head_s["model_status"].startswith("NOT READY") or head_s["model_status"] == "READY":
+            if worker_s["container_state"] == "RUNNING" and worker_s["model_status"] != "READY":
+                worker_s["active_model"] = head_s["active_model"]
+                worker_s["model_status"] = head_s["model_status"]
+                worker_s["eta_seconds"] = head_s["eta_seconds"]
+                worker_s["eta_display"] = head_s["eta_display"]
 
     return status_data
 
@@ -434,10 +701,15 @@ def get_cluster_status() -> dict:
     return result
 
 def enrich_catalog(catalog_dict: dict) -> dict:
-    """Decorates catalog models with parsed metadata, estimated load times, and TPS stats."""
+    """Fail-soft catalog enricher with ultra-permissive MTP and model metadata checks."""
     models = catalog_dict.get("catalog", {}).get("models", {})
     if not isinstance(models, dict):
         return catalog_dict
+
+    ledger_data = {}
+    if LEDGER_PATH.exists():
+        try: ledger_data = json.loads(LEDGER_PATH.read_text())
+        except Exception: pass
 
     ledger_tps = {}
     if BENCHMARK_LEDGER_PATH.exists():
@@ -446,91 +718,90 @@ def enrich_catalog(catalog_dict: dict) -> dict:
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) >= 3:
                     m_name, tps_val = parts[1], parts[2]
-                    try:
-                        ledger_tps[m_name] = f"{round(float(tps_val))} tps"
-                    except ValueError:
-                        pass
-        except Exception:
-            pass
+                    try: ledger_tps[m_name] = f"{round(float(tps_val))} tps"
+                    except ValueError: pass
+        except Exception: pass
 
     for m_key, m_data in models.items():
-        if not isinstance(m_data, dict):
-            continue
+        if not isinstance(m_data, dict): continue
 
         hf_path = str(m_data.get("hf_path", "")).lower()
         m_key_lower = m_key.lower()
 
-        if "nvfp4" in m_key_lower or "nvfp4" in hf_path or "fp4" in m_key_lower:
-            precision_label = "NVFP4"
-        elif "fp8" in m_key_lower or "fp8" in hf_path:
-            precision_label = "FP8"
-        elif "int4" in m_key_lower or "awq" in m_key_lower:
-            precision_label = "INT4"
-        else:
-            precision_label = "BF16"
+        if "nvfp4" in m_key_lower or "nvfp4" in hf_path or "fp4" in m_key_lower: precision_label = "NVFP4"
+        elif "fp8" in m_key_lower or "fp8" in hf_path: precision_label = "FP8"
+        elif "int4" in m_key_lower or "awq" in m_key_lower: precision_label = "INT4"
+        else: precision_label = "BF16"
 
         m_data["precision_label"] = precision_label
 
         topologies = m_data.get("topologies", {})
         if isinstance(topologies, dict):
             for t_key, t_data in topologies.items():
-                if not isinstance(t_data, dict):
-                    continue
+                if not isinstance(t_data, dict): continue
 
-                vllm_args = t_data.get("vllm_args", "")
+                vllm_args = str(t_data.get("vllm_args", ""))
+                vllm_args_lower = vllm_args.lower()
                 
                 seq_match = re.search(r'--max-num-seqs\s+(\d+)', vllm_args)
                 t_data["max_num_seqs"] = seq_match.group(1) if seq_match else "Uncapped"
 
                 kv_match = re.search(r'--kv-cache-dtype\s+([^\s]+)', vllm_args)
                 t_data["kv_dtype"] = (kv_match.group(1).upper() + " KV") if kv_match else "AUTO KV"
+                
+                l_key = f"{m_key}::{t_key}"
+                lt_stats = ledger_data.get(l_key, {}).get("lifetime", {})
+                d_tok = lt_stats.get("draft", 0)
+                a_tok = lt_stats.get("accepted", 0)
 
-                est_sec, has_hist = get_estimated_load_time(m_key, t_key)
-                t_data["avg_load_display"] = f"{est_sec}s" if has_hist else "N/A"
+                mtp_keywords = ["speculative", "mtp", "draft", "nextn", "proposal", "ngram", "lookahead"]
+                has_spec_flag = any(kw in vllm_args_lower for kw in mtp_keywords)
+                has_spec_name = any(kw in m_key_lower or kw in hf_path for kw in ["flash", "deepseek-v4", "mtp", "speculative"])
+                
+                t_data["mtp_enabled"] = has_spec_flag or has_spec_name or (d_tok > 0)
+
+                est_c, has_c = get_estimated_load_time(m_key, t_key, "cached")
+                est_j, has_j = get_estimated_load_time(m_key, t_key, "compiled")
+                
+                if has_j and est_j > (est_c + 60): t_data["avg_load_display"] = f"~{est_c}s (C) / ~{est_j}s (JIT)"
+                else: t_data["avg_load_display"] = f"~{est_c}s" if has_c else "N/A"
+                    
                 t_data["historical_tps"] = ledger_tps.get(m_key, "N/A")
+                
+                t_data["lifetime_in"] = lt_stats.get("in", 0)
+                t_data["lifetime_out"] = lt_stats.get("out", 0)
+                t_data["hist_mtp_rate"] = round((a_tok / d_tok * 100), 1) if d_tok > 0 else 0.0
 
     return catalog_dict
 
 def _load_model_catalog_legacy() -> dict:
-    if not MODELS_YAML_PATH.exists():
-        return {"catalog": {"models": {}}}
+    if not MODELS_YAML_PATH.exists(): return {"catalog": {"models": {}}}
     try:
-        with open(MODELS_YAML_PATH, "r") as f:
-            config = yaml.safe_load(f) or {}
-            
+        with open(MODELS_YAML_PATH, "r") as f: config = yaml.safe_load(f) or {}
         global_hf = config.get('GLOBAL_HF_HUB_OFFLINE', 0)
         global_tf = config.get('GLOBAL_TRANSFORMERS_OFFLINE', 0)
-
         models = config.get('models', {})
         if isinstance(models, dict):
             for model_name, model_data in models.items():
-                if not isinstance(model_data, dict):
-                    continue
+                if not isinstance(model_data, dict): continue
                 topologies = model_data.get('topologies', {})
                 if isinstance(topologies, dict):
                     for topo_name, topo_data in topologies.items():
-                        if not isinstance(topo_data, dict):
-                            continue
-                        if 'env_vars' not in topo_data:
-                            topo_data['env_vars'] = []
-                        
+                        if not isinstance(topo_data, dict): continue
+                        if 'env_vars' not in topo_data: topo_data['env_vars'] = []
                         if global_hf == 1:
                             topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('HF_HUB_OFFLINE=')]
                             topo_data['env_vars'].append('HF_HUB_OFFLINE=1')
-
                         if global_tf == 1:
                             topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('TRANSFORMERS_OFFLINE=')]
                             topo_data['env_vars'].append('TRANSFORMERS_OFFLINE=1')
-                    
         return {"catalog": config}
     except Exception as e:
         return {"error": str(e), "catalog": {"models": {}}}
 
 def load_model_catalog() -> dict:
-    if os.environ.get("USE_LEGACY_CATALOG") == "1":
-        raw_cat = _load_model_catalog_legacy()
-    else:
-        raw_cat = build_catalog_response()
+    if os.environ.get("USE_LEGACY_CATALOG") == "1": raw_cat = _load_model_catalog_legacy()
+    else: raw_cat = build_catalog_response()
     return enrich_catalog(raw_cat)
 
 def _execute_teardown_impl(target_hosts: list = None) -> dict:
@@ -539,28 +810,30 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
     for host in hosts_to_clean:
         if host not in HOSTS: continue
         ip = HOSTS[host]["ip"]
+        # Strictly target vLLM and Ray worker processes. NEVER match broad 'python3' strings!
+        cleanup_cmd = ["bash", "-c", "sudo pkill -9 -f 'vllm|ray' || true"]
+        run_ssh(ip, None, cleanup_cmd, timeout=10)
         res = run_ssh(ip, None, ["docker", "rm", "-f", ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER], timeout=15)
         results[host] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
+    time.sleep(2)
     return results
 
 def execute_teardown(target_hosts: list = None) -> dict:
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
-    if not acquired:
-        return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
+    if not acquired: return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
     try:
+        SESSION_TRACKER._commit_session()
+        SESSION_TRACKER.active = False
         return _execute_teardown_impl(target_hosts=target_hosts)
     finally:
         CLUSTER_OP_LOCK.release()
 
 def authorize_user_key(public_key_path: str) -> dict:
     key_file = Path(public_key_path).expanduser()
-    if not key_file.exists():
-        return {"status": "error", "message": f"Key file not found: {public_key_path}"}
-    
+    if not key_file.exists(): return {"status": "error", "message": f"Key file not found: {public_key_path}"}
     pub_key_content = key_file.read_text().strip()
     escaped_key = shlex.quote(pub_key_content)
     results = {}
-    
     for host, meta in HOSTS.items():
         ip = meta["ip"]
         cmd = ["bash", "-c", f"mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo {escaped_key} >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"]
@@ -570,8 +843,7 @@ def authorize_user_key(public_key_path: str) -> dict:
 
 def execute_sync() -> dict:
     results = {}
-    if not MODELS_YAML_PATH.exists():
-        return {"status": "error", "message": "models.yaml missing locally."}
+    if not MODELS_YAML_PATH.exists(): return {"status": "error", "message": "models.yaml missing locally."}
     yaml_content = MODELS_YAML_PATH.read_text()
     escaped_yaml = shlex.quote(yaml_content)
     for host, meta in HOSTS.items():
@@ -585,33 +857,25 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     deploy_start_time = time.time()
     docker_run_commands: dict = {}
 
-    if nodes not in (1, 2):
-        return {"status": "error", "message": f"Invalid 'nodes' value {nodes!r}: must be 1 or 2."}
-
-    if head not in HOSTS:
-        return {"status": "error", "message": f"Invalid 'head' value {head!r}: must be one of {list(HOSTS.keys())}."}
+    if nodes not in (1, 2): return {"status": "error", "message": f"Invalid 'nodes' value {nodes!r}: must be 1 or 2."}
+    if head not in HOSTS: return {"status": "error", "message": f"Invalid 'head' value {head!r}: must be one of {list(HOSTS.keys())}."}
 
     target_hosts = ["spark-4", "spark-3"] if nodes == 2 else [head]
-    
     catalog_resp = load_model_catalog()
     models_catalog = catalog_resp.get("catalog", {}).get("models", {})
 
-    if model not in models_catalog:
-        return {"status": "error", "message": f"Model '{model}' not defined in catalog."}
+    if model not in models_catalog: return {"status": "error", "message": f"Model '{model}' not defined in catalog."}
 
     model_config = models_catalog[model]
     topologies = model_config.get("topologies", {})
     topo_key = "2_node" if nodes == 2 else "1_node"
 
-    if topo_key not in topologies:
-        return {"status": "error", "message": f"Topology '{topo_key}' not supported for model '{model}'."}
+    if topo_key not in topologies: return {"status": "error", "message": f"Topology '{topo_key}' not supported for model '{model}'."}
 
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
-        try:
-            offline_mode = "OFFLINE" in NETWORK_STATE_FILE.read_text().strip()
-        except Exception:
-            pass
+        try: offline_mode = "OFFLINE" in NETWORK_STATE_FILE.read_text().strip()
+        except Exception: pass
     offline_val = "1" if offline_mode else "0"
 
     topo_config = topologies[topo_key]
@@ -622,36 +886,39 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     pp_size = topo_config.get("pp_size", nodes)
     
     vllm_args_raw = topo_config.get("vllm_args", "")
-    try:
-        vllm_args_list = shlex.split(vllm_args_raw)
-    except Exception:
-        vllm_args_list = vllm_args_raw.split()
+    try: vllm_args_list = shlex.split(vllm_args_raw)
+    except Exception: vllm_args_list = vllm_args_raw.split()
 
     use_ray = (nodes > 1) and ("--distributed-executor-backend" in vllm_args_list) and ("ray" in vllm_args_list)
-
     tuning = load_cluster_config().tuning
 
     if not dry_run:
+        SESSION_TRACKER._commit_session()
+        SESSION_TRACKER.active = False
         _execute_teardown_impl(target_hosts=target_hosts)
-
         for h in target_hosts:
             ip = HOSTS[h]["ip"]
             run_ssh(ip, None, ["sudo", "nvidia-smi", "-lgc", tuning.gpu_clock_lock], timeout=10)
+            run_ssh(ip, None, ["bash", "-c", "mkdir -p ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton ~/.cache/vllm"], timeout=10)
 
     default_img = catalog_resp.get("catalog", {}).get("default_image", load_cluster_config().default_image)
     image_tag = model_config.get("image", default_img)
-
     compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"
 
     def _jit_cache_mounts_and_env(vol_mount: str) -> tuple[list[str], list[str]]:
         host_hf_dir = vol_mount.split(":", 1)[0]
         host_cache_root = str(Path(host_hf_dir).parent)
-        triton_mount = f"{host_cache_root}/triton_cache:/root/.triton_cache"
-        cuda_mount = f"{host_cache_root}/nv_compute_cache:/root/.nv/ComputeCache"
-        mounts = ["-v", triton_mount, "-v", cuda_mount]
+        mounts = [
+            "-v", f"{host_cache_root}:/root/.cache",
+            "-v", f"{host_cache_root}/nv_compute_cache:/root/.nv/ComputeCache"
+        ]
         env = [
-            "-e", "TRITON_CACHE_DIR=/root/.triton_cache",
+            "-e", "TRITON_CACHE_DIR=/root/.cache/triton",
             "-e", "CUDA_CACHE_PATH=/root/.nv/ComputeCache",
+            "-e", "TILELANG_CACHE_DIR=/root/.cache/tilelang",
+            "-e", "TL_CACHE_DIR=/root/.cache/tilelang",
+            "-e", "DEEPGEMM_CACHE_DIR=/root/.cache/deepgemm",
+            "-e", "VLLM_CACHE_DIR=/root/.cache/vllm",
             "-e", f"CUDA_CACHE_MAXSIZE={tuning.jit_cache_maxsize_bytes}",
         ]
         return mounts, env
@@ -692,10 +959,8 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         ] + jit_mounts + env_flags + [image_tag] + container_args
 
         res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
-        if dry_run:
-            docker_run_commands[head] = docker_cmd
-        elif res.returncode != 0:
-            return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
+        if dry_run: docker_run_commands[head] = docker_cmd
+        elif res.returncode != 0: return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
     else:
         vllm_head_args = None
         cluster_ports = load_cluster_config().ports
@@ -754,18 +1019,14 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                     "--gpu-memory-utilization", str(gpu_util),
                     "--max-model-len", str(max_model_len)
                 ]
-                if node_rank > 0 and "--headless" not in vllm_args_list:
-                    container_args.append("--headless")
+                if node_rank > 0 and "--headless" not in vllm_args_list: container_args.append("--headless")
                 container_args.extend(vllm_args_list)
 
-            if host == head:
-                vllm_head_args = container_args
+            if host == head: vllm_head_args = container_args
 
             if use_ray:
-                if host == head:
-                    entrypoint_cmd = ["ray", "start", "--head", f"--port={ray_port}", "--num-gpus=1", "--block"]
-                else:
-                    entrypoint_cmd = ["ray", "start", f"--address={head_ip}:{ray_port}", "--num-gpus=1", "--block"]
+                if host == head: entrypoint_cmd = ["ray", "start", "--head", f"--port={ray_port}", "--num-gpus=1", "--block"]
+                else: entrypoint_cmd = ["ray", "start", f"--address={head_ip}:{ray_port}", "--num-gpus=1", "--block"]
             else:
                 entrypoint_cmd = container_args
 
@@ -782,10 +1043,8 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             ] + jit_mounts + env_flags + [image_tag] + entrypoint_cmd
 
             res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
-            if dry_run:
-                docker_run_commands[host] = docker_cmd
-            elif res.returncode != 0:
-                return {"status": "error", "message": f"Docker run failed on {host}: {res.stderr}"}
+            if dry_run: docker_run_commands[host] = docker_cmd
+            elif res.returncode != 0: return {"status": "error", "message": f"Docker run failed on {host}: {res.stderr}"}
 
         if use_ray and vllm_head_args and not dry_run:
             print("[+] Waiting for Ray cluster to register worker nodes (max 60s)...")
@@ -825,23 +1084,16 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
     if wait or run_benchmark:
         head_ip = HOSTS[head]["ip"]
-        is_ready = wait_for_cluster_ready(
-            head_ip=head_ip,
-            timeout_sec=tuning.deploy_wait_timeout_sec,
-            poll_interval=tuning.deploy_poll_interval_sec,
-        )
+        is_ready = wait_for_cluster_ready(head_ip=head_ip, timeout_sec=tuning.deploy_wait_timeout_sec, poll_interval=tuning.deploy_poll_interval_sec)
         
         if is_ready:
             total_duration = int(time.time() - deploy_start_time)
-            record_load_time(model, topo_key, total_duration)
+            record_load_time(model, topo_key, total_duration, "cached")
 
             if run_benchmark:
                 print(f"[+] Triggering 3-pass performance benchmark against {head} ({head_ip})...")
                 time.sleep(30)
-                bench_res = subprocess.run(
-                    ["python3", "benchmark.py", "--host", head_ip, "--nodes", str(nodes)],
-                    capture_output=True, text=True
-                )
+                bench_res = subprocess.run(["python3", "benchmark.py", "--host", head_ip, "--nodes", str(nodes)], capture_output=True, text=True)
                 bench_file = BASE_DIR / "benchmark_results.txt"
                 bench_file.write_text(bench_res.stdout)
                 print(f"[+] Benchmark completed. Results written to {bench_file}")
@@ -852,17 +1104,6 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         "targets": target_hosts,
         "head": head
     }
-
-def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
-    if dry_run:
-        return _execute_deployment_impl(model, nodes, head, user_id, wait=wait, run_benchmark=run_benchmark, dry_run=True)
-    acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
-    if not acquired:
-        return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
-    try:
-        return _execute_deployment_impl(model, nodes, head, user_id, wait=wait, run_benchmark=run_benchmark)
-    finally:
-        CLUSTER_OP_LOCK.release()
 
 def get_container_logs(host: str, tail: int = 40) -> dict:
     if host not in HOSTS: return {"logs": ["Invalid target host specified."]}
@@ -880,12 +1121,7 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
     
     raw_logs = log_res.stdout.splitlines() if log_res.returncode == 0 else log_res.stderr.splitlines()
     clean_logs = [ANSI_ESCAPE.sub('', line) for line in raw_logs]
-
-    filtered_logs = [
-        line for line in clean_logs
-        if not any(endpoint in line for endpoint in ["GET /health", "GET /metrics"])
-    ]
-
+    filtered_logs = [line for line in clean_logs if not any(endpoint in line for endpoint in ["GET /health", "GET /metrics"])]
     final_logs = filtered_logs[-tail:] if len(filtered_logs) > tail else filtered_logs
 
     return {"logs": final_logs if final_logs else ["Log buffer empty."]}
@@ -897,10 +1133,17 @@ def interactive_menu():
 
     for h, data in status["hosts"].items():
         tele = data.get("telemetry", {})
-        temp = f"{tele.get('gpu_temp_c', 'N/A')}°C" if 'gpu_temp_c' in tele else "N/A"
-        util = f"{tele.get('gpu_util_pct', 'N/A')}%" if 'gpu_util_pct' in tele else "N/A"
-        mem = f"{tele.get('mem_used_mb', 'N/A')}/{tele.get('mem_total_mb', 'N/A')} MB" if 'mem_used_mb' in tele else "N/A"
-        print(f"[{h}] Docker: {data['docker_status']} | Container: {data['container_name']} ({data['container_state']}) | Model: {data['active_model']} | Status: {data['model_status']} | ETA: {data['eta_display']} | TEMP: {temp} | GPU: {util} | MEM: {mem}")
+        temp = f"{tele.get('gpu_temp_c', 'N/A')}°C" if 'gpu_temp_c' in tele and tele['gpu_temp_c'] != 'N/A' else "N/A"
+        util = f"{tele.get('gpu_util_pct', 'N/A')}%" if 'gpu_util_pct' in tele and tele['gpu_util_pct'] != 'N/A' else "N/A"
+        
+        pwr_draw = tele.get('power_draw_w', 'N/A')
+        pwr_lim = tele.get('power_limit_w', 'N/A')
+        if pwr_draw != 'N/A' and pwr_lim != 'N/A': pwr = f"{pwr_draw}/{pwr_lim}W"
+        elif pwr_draw != 'N/A': pwr = f"{pwr_draw}W"
+        else: pwr = "N/A"
+            
+        ram = f"{tele.get('host_mem_avail_mb', 'N/A')} MB Free" if 'host_mem_avail_mb' in tele and tele['host_mem_avail_mb'] != 'N/A' else "N/A"
+        print(f"[{h}] Docker: {data['docker_status']} | Container: {data['container_name']} ({data['container_state']}) | Model: {data['active_model']} | Status: {data['model_status']} | ETA: {data['eta_display']} | TEMP: {temp} | GPU: {util} | PWR: {pwr} | RAM: {ram}")
     print("-" * 85)
 
     catalog_data = load_model_catalog().get("catalog", {}).get("models", {})
@@ -911,8 +1154,7 @@ def interactive_menu():
         return
 
     print("\nAvailable Models:")
-    for idx, m in enumerate(models, 1):
-        print(f"  {idx}. {m}")
+    for idx, m in enumerate(models, 1): print(f"  {idx}. {m}")
 
     try:
         choice = input("\nSelect a model number to deploy (or 'q' to quit): ").strip()
@@ -924,7 +1166,7 @@ def interactive_menu():
         print(f"\nAvailable Topologies for {selected_model}:")
         topo_keys = list(topologies.keys())
         for idx, t in enumerate(topo_keys, 1):
-            est, _ = get_estimated_load_time(selected_model, t)
+            est, _ = get_estimated_load_time(selected_model, t, "cached")
             print(f"  {idx}. {t} (Est. Warm Load Time: ~{est}s)")
 
         t_choice = input("Select topology number: ").strip()
@@ -956,7 +1198,7 @@ def interactive_menu():
         print(f"[-] Invalid selection: {e}")
 
 if HAS_FASTAPI:
-    app = FastAPI(title="Tetrel Security DGX Control Plane API", version="4.8.1")
+    app = FastAPI(title="Tetrel Security DGX Control Plane API", version="4.8.3")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
     class DeployRequest(BaseModel):
@@ -997,6 +1239,25 @@ if HAS_FASTAPI:
             return {"status": "success", "mode": mode_str}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+            
+    @app.post("/api/prune-cache")
+    def api_prune_cache(days: int = 30, min_free_gb: int = 50):
+        return prune_cluster_cache(days, min_free_gb)
+
+def _telemetry_daemon_loop():
+    """Background polling loop for maintaining lifetime and session analytics."""
+    while True:
+        try:
+            get_cluster_status()
+        except Exception:
+            pass
+        time.sleep(10)
+
+def handle_shutdown(signum, frame):
+    """Intercepts orchestrator stops/restarts to safely flush RAM data to NVMe."""
+    print("\n[+] Orchestrator daemon shutting down, flushing state to ledger...")
+    SESSION_TRACKER._commit_session()
+    sys.exit(0)
 
 def main():
     parser = argparse.ArgumentParser(description="Tetrel Security DGX Cluster Orchestrator")
@@ -1023,6 +1284,10 @@ def main():
 
     auth_parser = subparsers.add_parser("authorize-key")
     auth_parser.add_argument("--key", required=True)
+    
+    prune_parser = subparsers.add_parser("prune-cache")
+    prune_parser.add_argument("--days", type=int, default=30)
+    prune_parser.add_argument("--min-free-gb", type=int, default=50)
 
     cli_parser = subparsers.add_parser("cli")
     cli_sub = cli_parser.add_subparsers(dest="cli_action")
@@ -1047,6 +1312,10 @@ def main():
 
     cli_auth = cli_sub.add_parser("authorize-key")
     cli_auth.add_argument("--key", required=True)
+    
+    cli_prune = cli_sub.add_parser("prune-cache")
+    cli_prune.add_argument("--days", type=int, default=30)
+    cli_prune.add_argument("--min-free-gb", type=int, default=50)
 
     args = parser.parse_args()
     subcommand = args.subcommand
@@ -1054,7 +1323,13 @@ def main():
 
     if subcommand == "daemon":
         if not HAS_FASTAPI: sys.exit("[-] Error: fastapi and uvicorn are required for daemon mode.")
+        
+        signal.signal(signal.SIGINT, handle_shutdown)
+        signal.signal(signal.SIGTERM, handle_shutdown)
+        
         port = getattr(args, "port", 5001)
+        t = threading.Thread(target=_telemetry_daemon_loop, daemon=True)
+        t.start()
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
     elif subcommand == "status": print(json.dumps(get_cluster_status(), indent=2))
@@ -1063,6 +1338,7 @@ def main():
     elif subcommand == "logs": print("\n".join(get_container_logs(args.host, args.tail).get("logs", [])))
     elif subcommand == "authorize-key": print(json.dumps(authorize_user_key(args.key), indent=2))
     elif subcommand == "sync": print(json.dumps(execute_sync(), indent=2))
+    elif subcommand == "prune-cache": print(json.dumps(prune_cluster_cache(getattr(args, "days", 30), getattr(args, "min_free_gb", 50)), indent=2))
     else: interactive_menu()
 
 if __name__ == "__main__":

@@ -1,4 +1,23 @@
 # Control Plane Release Tombstones & Fix Log
+### 48. In-RAM Telemetry Loss on Daemon Shutdown (V4.8.3)
+* **The Trap:** Real-time token counts, session durations, and MTP (Multi-Token Prediction) hit rates were accumulated in memory to protect host NVMe drives from continuous disk writes. Unplanned daemon restarts, container updates, or host reboots wiped uncommitted session analytics.
+* **The Fix:** Implemented a 1-hour periodic delta-checkpoint flush in `SessionTracker` and attached OS signal traps (`SIGTERM` / `SIGINT`) to `dgx-orchestrator.py` to force stateful commits to `model_ledger.json` before process termination.
+
+### 47. Idle-Time Metric Pollution in Long-Running Sessions (V4.8.3)
+* **The Trap:** Calculating Tokens Per Second (TPS) across a continuous session by subtracting session start time from session end time caused long idle periods (e.g., a 600-second quiet wait before closing a session) to dilute high-speed token generation bursts into artificially low averages.
+* **The Fix:** Decoupled the 10-minute idle tripwire from the active compute timer. Active TPS is calculated strictly as `Total_Generated_Tokens / (Last_Active_TS - First_Active_TS)`. The 600-second idle period triggers session commits to `model_ledger.json` but is completely excluded from the time divisor.
+
+### 46. Wrapped `bash -c` Shell Command Inspection Failure (V4.8.3)
+* **The Trap:** Docker container inspection on Ray head nodes returned array-wrapped shell strings (e.g., `["bash", "-c", "ray start ... && python3 -m vllm ... --model <path>"]`). The inspection parser attempted to find `--model` as a discrete array element, threw an exception, and defaulted to labeling the active container as `"Active Container"`, preventing catalog matching.
+* **The Fix:** Upgraded `_discover_host_container()` to execute a regex pattern (`--model\s+([^\s]+)`) across string-wrapped entrypoint commands to extract the model path regardless of shell layering.
+
+### 45. Multi-Node Asymmetric Logging & Worker UI State Desync (V4.8.3)
+* **The Trap:** In multi-node Ray deployments, the Head node (`spark-4`) acts as driver and logs shard-loading progress to Docker `stdout`. The Worker node (`spark-3`) only runs a passive `ray start` process and receives weights into VRAM over NCCL without outputting log progress. The orchestrator's log stage detector left `spark-3` permanently stuck on `Active Container` / `INITIALIZING` with a generic fallback ETA.
+* **The Fix:** Updated `_compute_cluster_status_impl()` to treat active worker nodes as UI slaves to the head node during boot sequences—broadcasting the head node's detected model name, stage (`LOADING SHARDS`, `COMPILING KERNELS`), and active ETA across all worker UI cards simultaneously.
+
+### 44. Grace Blackwell (GB10) Power Limit String Parsing (`PWR: 6/N/AW`) (V4.8.3)
+* **The Trap:** On Grace Blackwell (GB10) unified superchips, power is dynamically managed across the package. `nvidia-smi` returns `N/A` or `[Not Supported]` for GPU-isolated power limits. The UI blindly concatenated the draw, limit, and unit strings, rendering `PWR: 6/N/AW`.
+* **The Fix:** Sanitized telemetry parsing in `dgx-orchestrator.py` and string construction in `index.html`. If the hardware driver returns `N/A` for the limit, the dashboard gracefully falls back to displaying active draw only (`PWR: 6W`).
 
 ### 43. Multi-Node V1 Shared Memory (`/dev/shm`) Followers Crash (V4.8.1)
 * **The Trap:** Attempting to deploy multi-node models using `--distributed-executor-backend mp` on the vLLM V1 engine triggered `AssertionError: collective_rpc should not be called on follower node` on `spark-3`. The `mp` backend relies on host IPC shared memory (`/dev/shm`), which cannot cross physical nodes.
