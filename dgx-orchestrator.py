@@ -58,6 +58,14 @@ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9?]*[ -/]*[@-~])')
 CLUSTER_OP_LOCK = threading.Lock()
 CLUSTER_OP_LOCK_TIMEOUT = 5  # seconds
 
+# --- Global Benchmark Worker State ---
+BENCHMARK_STATE = {
+    "running": False,
+    "message": "Idle",
+    "last_run": None
+}
+BENCHMARK_STATE_LOCK = threading.Lock()
+
 # --- Global Thread Pool ---
 WORKER_POOL = ThreadPoolExecutor(max_workers=len(HOSTS) * 2)
 
@@ -631,6 +639,10 @@ def _compute_cluster_status_impl() -> dict:
 
     catalog_models = load_model_catalog().get("catalog", {}).get("models", {})
 
+    with BENCHMARK_STATE_LOCK:
+        is_benchmarking = BENCHMARK_STATE["running"]
+        benchmark_msg = BENCHMARK_STATE["message"]
+
     status_data = {
         "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S EST"),
         "network_mode": "Working in OFFLINE mode" if offline_mode else "Working in ONLINE mode",
@@ -640,6 +652,8 @@ def _compute_cluster_status_impl() -> dict:
         "running_requests": vllm_metrics["running_requests"],
         "waiting_requests": vllm_metrics["waiting_requests"],
         "session_stats": SESSION_TRACKER.get_live_stats(),
+        "is_benchmarking": is_benchmarking,
+        "benchmark_message": benchmark_msg,
         "hosts": {}
     }
 
@@ -661,15 +675,23 @@ def _compute_cluster_status_impl() -> dict:
             _, host_status = result
             status_data["hosts"][host] = host_status
 
+    # Strictly guarded worker state mirroring
     head_s = status_data["hosts"].get("spark-4")
     worker_s = status_data["hosts"].get("spark-3")
     if head_s and worker_s:
-        if head_s["model_status"].startswith("NOT READY") or head_s["model_status"] == "READY":
-            if worker_s["container_state"] == "RUNNING" and worker_s["model_status"] != "READY":
-                worker_s["active_model"] = head_s["active_model"]
-                worker_s["model_status"] = head_s["model_status"]
-                worker_s["eta_seconds"] = head_s["eta_seconds"]
-                worker_s["eta_display"] = head_s["eta_display"]
+        head_is_active = (head_s["container_state"] == "RUNNING" and 
+                          head_s["active_model"] != "None" and 
+                          not head_s["model_status"].startswith("CRASHED"))
+        
+        worker_is_healthy_runner = (worker_s["container_state"] == "RUNNING" and 
+                                    not worker_s["model_status"].startswith("CRASHED") and 
+                                    not worker_s["model_status"].startswith("ORPHANED"))
+        
+        if head_is_active and worker_is_healthy_runner:
+            worker_s["active_model"] = head_s["active_model"]
+            worker_s["model_status"] = head_s["model_status"]
+            worker_s["eta_seconds"] = head_s["eta_seconds"]
+            worker_s["eta_display"] = head_s["eta_display"]
 
     return status_data
 
@@ -810,7 +832,6 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
     for host in hosts_to_clean:
         if host not in HOSTS: continue
         ip = HOSTS[host]["ip"]
-        # Safely target vLLM/Ray processes without killing the dgx-orchestrator daemon
         cleanup_cmd = ["bash", "-c", "ps aux | grep -E 'vllm|ray' | grep -v 'dgx-orchestrator' | awk '{print $2}' | xargs -r sudo kill -9 2>/dev/null || true"]
         run_ssh(ip, None, cleanup_cmd, timeout=10)
         res = run_ssh(ip, None, ["docker", "rm", "-f", ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER], timeout=15)
@@ -836,6 +857,42 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
         return _execute_deployment_impl(model, nodes, head, user_id, wait=wait, run_benchmark=run_benchmark, dry_run=dry_run)
     finally:
         CLUSTER_OP_LOCK.release()
+
+def _run_benchmark_worker(head: str, nodes: int):
+    with BENCHMARK_STATE_LOCK:
+        BENCHMARK_STATE["running"] = True
+        BENCHMARK_STATE["message"] = f"Executing 3-pass benchmark against {head}..."
+
+    try:
+        head_ip = HOSTS[head]["ip"] if head in HOSTS else "10.0.14.43"
+        print(f"[+] Running background 3-pass benchmark against {head} ({head_ip})...")
+        bench_res = subprocess.run(["python3", "benchmark.py", "--host", head_ip, "--nodes", str(nodes)], capture_output=True, text=True)
+        bench_file = BASE_DIR / "benchmark_results.txt"
+        bench_file.write_text(bench_res.stdout)
+        print(f"[+] Benchmark completed. Written to {bench_file}")
+        with BENCHMARK_STATE_LOCK:
+            BENCHMARK_STATE["message"] = "Benchmark completed successfully."
+            BENCHMARK_STATE["last_run"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        print(f"[!] Background benchmark execution failed: {e}")
+        with BENCHMARK_STATE_LOCK:
+            BENCHMARK_STATE["message"] = f"Benchmark failed: {e}"
+    finally:
+        with BENCHMARK_STATE_LOCK:
+            BENCHMARK_STATE["running"] = False
+
+def execute_standalone_benchmark(head: str, nodes: int) -> dict:
+    """Launches benchmark.py asynchronously without blocking HTTP response or tearing down containers."""
+    with BENCHMARK_STATE_LOCK:
+        if BENCHMARK_STATE["running"]:
+            return {"status": "error", "message": "A benchmark pass is already running in the background."}
+
+    head_ip = HOSTS[head]["ip"] if head in HOSTS else "10.0.14.43"
+    if not check_vllm_health(head_ip):
+        return {"status": "error", "message": f"vLLM engine on {head} ({head_ip}) is not responding to health checks."}
+
+    threading.Thread(target=_run_benchmark_worker, args=(head, nodes), daemon=True).start()
+    return {"status": "success", "message": f"Benchmark background task initiated for {head}."}
 
 def authorize_user_key(public_key_path: str) -> dict:
     key_file = Path(public_key_path).expanduser()
@@ -1100,12 +1157,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             record_load_time(model, topo_key, total_duration, "cached")
 
             if run_benchmark:
-                print(f"[+] Triggering 3-pass performance benchmark against {head} ({head_ip})...")
-                time.sleep(30)
-                bench_res = subprocess.run(["python3", "benchmark.py", "--host", head_ip, "--nodes", str(nodes)], capture_output=True, text=True)
-                bench_file = BASE_DIR / "benchmark_results.txt"
-                bench_file.write_text(bench_res.stdout)
-                print(f"[+] Benchmark completed. Results written to {bench_file}")
+                execute_standalone_benchmark(head=head, nodes=nodes)
 
     return {
         "status": "success",
@@ -1219,6 +1271,10 @@ if HAS_FASTAPI:
         run_benchmark: bool = False
         dry_run: bool = False
 
+    class BenchmarkRequest(BaseModel):
+        head: str = "spark-4"
+        nodes: Literal[1, 2] = 2
+
     class NetworkToggleRequest(BaseModel):
         offline: bool
 
@@ -1235,6 +1291,12 @@ if HAS_FASTAPI:
     def api_deploy(req: DeployRequest):
         res = execute_deployment(req.model, req.nodes, req.head, req.user_id, wait=req.wait, run_benchmark=req.run_benchmark, dry_run=req.dry_run)
         if res.get("status") not in ("success", "dry_run"): raise HTTPException(status_code=400, detail=res.get("message", "Deployment failed"))
+        return res
+
+    @app.post("/api/benchmark")
+    def api_benchmark(req: BenchmarkRequest):
+        res = execute_standalone_benchmark(req.head, req.nodes)
+        if res.get("status") != "success": raise HTTPException(status_code=400, detail=res.get("message", "Benchmark failed"))
         return res
 
     @app.post("/api/teardown")
