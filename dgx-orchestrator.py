@@ -1137,45 +1137,74 @@ def load_model_catalog() -> dict:
 # compile that's still running past the window -- see docs/ROADMAP.md.
 TEARDOWN_GRACE_SEC = 20
 
+def _teardown_host_processes(ip: str) -> None:
+    """
+    Phase 1 of teardown for one host: SIGTERM any stray vllm/ray processes,
+    give them TEARDOWN_GRACE_SEC, then escalate to -9 for stragglers.
+    Broken out so it can be run concurrently across hosts -- see
+    _execute_teardown_impl for why concurrency here matters.
+    """
+    cleanup_cmd = ["bash", "-c", (
+        "PIDS=$(ps aux | grep -E 'vllm|ray' | grep -v 'dgx-orchestrator' | awk '{print $2}'); "
+        "if [ -n \"$PIDS\" ]; then "
+        "echo \"$PIDS\" | xargs -r sudo kill -TERM 2>/dev/null || true; "
+        f"sleep {TEARDOWN_GRACE_SEC}; "
+        "echo \"$PIDS\" | xargs -r sudo kill -9 2>/dev/null || true; "
+        "fi"
+    )]
+    # NOTE: this still only matches process names containing vllm/ray -- a
+    # bare `ptxas`/`nvcc`/`cicc` child compiler process won't match and
+    # won't be targeted here either way. See docs/ROADMAP.md.
+    run_ssh(ip, None, cleanup_cmd, timeout=TEARDOWN_GRACE_SEC + 15)
+
+def _teardown_host_containers(ip: str) -> None:
+    """Phase 2: graceful docker stop (SIGTERM + grace) for every role that
+    might exist on this host. Errors here (e.g. container doesn't exist)
+    are expected and ignored -- _teardown_host_rm below is the actual
+    cleanup guarantee."""
+    for role in (ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER):
+        run_ssh(ip, None, ["docker", "stop", "--time", str(TEARDOWN_GRACE_SEC), role],
+                timeout=TEARDOWN_GRACE_SEC + 10)
+
+def _teardown_host_rm(ip: str):
+    """Phase 3: final rm -f as a backstop for anything that ignored SIGTERM
+    and docker stop's own escalation. By this point it's had a real grace
+    period, so this is a safety net for genuinely wedged containers, not
+    the primary kill mechanism."""
+    return run_ssh(ip, None, ["docker", "rm", "-f", ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER], timeout=15)
+
 def _execute_teardown_impl(target_hosts: list = None) -> dict:
+    """
+    Runs each teardown phase across ALL target hosts CONCURRENTLY, not one
+    host fully torn down before the next starts.
+
+    This matters specifically for a 2-node deploy: if head and worker are
+    torn down sequentially with real grace periods (as an earlier version
+    of this function did), head can finish its entire ~20-40s graceful
+    shutdown and be fully gone before worker's teardown even begins.
+    Worker spends that whole window still alive and still NCCL/Ray-
+    connected to a rank-0 head that just vanished out from under it mid-
+    collective-op -- observed on the dashboard as the worker going
+    "confused" and then crashing on its own, well before we ever touched
+    it. Running each phase across all hosts in parallel means head and
+    worker are signaled together and come down together, closing that
+    window.
+    """
     results = {}
-    hosts_to_clean = target_hosts if target_hosts else list(HOSTS.keys())
-    for host in hosts_to_clean:
-        if host not in HOSTS: continue
-        ip = HOSTS[host]["ip"]
+    hosts_to_clean = [h for h in (target_hosts if target_hosts else list(HOSTS.keys())) if h in HOSTS]
+    ips = {h: HOSTS[h]["ip"] for h in hosts_to_clean}
 
-        # Host-level stragglers (anything running outside a container, or
-        # left over from a prior crash): SIGTERM first, give it the grace
-        # period, THEN escalate to -9 only for whatever's still alive.
-        # NOTE: this still only matches process names containing vllm/ray
-        # -- a bare `ptxas`/`nvcc`/`cicc` child compiler process won't
-        # match and won't be targeted here either way. See ROADMAP.md.
-        cleanup_cmd = ["bash", "-c", (
-            "PIDS=$(ps aux | grep -E 'vllm|ray' | grep -v 'dgx-orchestrator' | awk '{print $2}'); "
-            "if [ -n \"$PIDS\" ]; then "
-            "echo \"$PIDS\" | xargs -r sudo kill -TERM 2>/dev/null || true; "
-            f"sleep {TEARDOWN_GRACE_SEC}; "
-            "echo \"$PIDS\" | xargs -r sudo kill -9 2>/dev/null || true; "
-            "fi"
-        )]
-        run_ssh(ip, None, cleanup_cmd, timeout=TEARDOWN_GRACE_SEC + 15)
+    proc_futures = {h: WORKER_POOL.submit(_teardown_host_processes, ip) for h, ip in ips.items()}
+    for f in proc_futures.values(): f.result()
 
-        # docker stop sends SIGTERM to PID 1 and waits up to --time seconds
-        # before escalating to SIGKILL itself -- the graceful counterpart
-        # to the `docker rm -f` we used to jump straight to, which sent
-        # SIGKILL immediately with no grace period at the container level
-        # either. Errors here (e.g. container doesn't exist) are expected
-        # and ignored -- the rm -f below is the actual cleanup guarantee.
-        for role in (ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER):
-            run_ssh(ip, None, ["docker", "stop", "--time", str(TEARDOWN_GRACE_SEC), role],
-                    timeout=TEARDOWN_GRACE_SEC + 10)
+    stop_futures = {h: WORKER_POOL.submit(_teardown_host_containers, ip) for h, ip in ips.items()}
+    for f in stop_futures.values(): f.result()
 
-        # Final rm -f as a backstop: if a container ignored SIGTERM and
-        # docker stop's own escalation, this cleans up the corpse. By this
-        # point it's had a real grace period, so this is a safety net for
-        # genuinely wedged containers, not the primary kill mechanism.
-        res = run_ssh(ip, None, ["docker", "rm", "-f", ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER], timeout=15)
-        results[host] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
+    rm_futures = {h: WORKER_POOL.submit(_teardown_host_rm, ip) for h, ip in ips.items()}
+    for h, f in rm_futures.items():
+        res = f.result()
+        results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
+
     time.sleep(2)
     return results
 
