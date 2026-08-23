@@ -810,8 +810,8 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
     for host in hosts_to_clean:
         if host not in HOSTS: continue
         ip = HOSTS[host]["ip"]
-        # Strictly target vLLM and Ray worker processes. NEVER match broad 'python3' strings!
-        cleanup_cmd = ["bash", "-c", "sudo pkill -9 -f 'vllm|ray' || true"]
+        # Safely target vLLM/Ray processes without killing the dgx-orchestrator daemon
+        cleanup_cmd = ["bash", "-c", "ps aux | grep -E 'vllm|ray' | grep -v 'dgx-orchestrator' | awk '{print $2}' | xargs -r sudo kill -9 2>/dev/null || true"]
         run_ssh(ip, None, cleanup_cmd, timeout=10)
         res = run_ssh(ip, None, ["docker", "rm", "-f", ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER], timeout=15)
         results[host] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
@@ -825,6 +825,15 @@ def execute_teardown(target_hosts: list = None) -> dict:
         SESSION_TRACKER._commit_session()
         SESSION_TRACKER.active = False
         return _execute_teardown_impl(target_hosts=target_hosts)
+    finally:
+        CLUSTER_OP_LOCK.release()
+
+def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
+    """Thread-safe public wrapper for cluster model deployments."""
+    acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
+    if not acquired: return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
+    try:
+        return _execute_deployment_impl(model, nodes, head, user_id, wait=wait, run_benchmark=run_benchmark, dry_run=dry_run)
     finally:
         CLUSTER_OP_LOCK.release()
 
