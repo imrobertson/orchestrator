@@ -1124,14 +1124,56 @@ def load_model_catalog() -> dict:
     else: raw_cat = build_catalog_response()
     return enrich_catalog(raw_cat)
 
+# In-flight JIT compilation shells out to nvcc/ptxas/cicc as child
+# subprocesses that write cache artifacts non-atomically. SIGKILL (-9) on
+# the parent does not propagate to those children -- it can't be caught or
+# forwarded at all -- so a hard-kill mid-compile can leave an orphaned
+# compiler process still writing into the persistent, shared cache
+# directory with nobody supervising it, or leave a half-written artifact
+# at the path the loader treats as a cache hit on the next load. This
+# grace period gives an in-flight compile a real chance to finish and (if
+# the library does it right) atomically rename its output into place
+# before anything gets force-killed. It does not guarantee safety for a
+# compile that's still running past the window -- see docs/ROADMAP.md.
+TEARDOWN_GRACE_SEC = 20
+
 def _execute_teardown_impl(target_hosts: list = None) -> dict:
     results = {}
     hosts_to_clean = target_hosts if target_hosts else list(HOSTS.keys())
     for host in hosts_to_clean:
         if host not in HOSTS: continue
         ip = HOSTS[host]["ip"]
-        cleanup_cmd = ["bash", "-c", "ps aux | grep -E 'vllm|ray' | grep -v 'dgx-orchestrator' | awk '{print $2}' | xargs -r sudo kill -9 2>/dev/null || true"]
-        run_ssh(ip, None, cleanup_cmd, timeout=10)
+
+        # Host-level stragglers (anything running outside a container, or
+        # left over from a prior crash): SIGTERM first, give it the grace
+        # period, THEN escalate to -9 only for whatever's still alive.
+        # NOTE: this still only matches process names containing vllm/ray
+        # -- a bare `ptxas`/`nvcc`/`cicc` child compiler process won't
+        # match and won't be targeted here either way. See ROADMAP.md.
+        cleanup_cmd = ["bash", "-c", (
+            "PIDS=$(ps aux | grep -E 'vllm|ray' | grep -v 'dgx-orchestrator' | awk '{print $2}'); "
+            "if [ -n \"$PIDS\" ]; then "
+            "echo \"$PIDS\" | xargs -r sudo kill -TERM 2>/dev/null || true; "
+            f"sleep {TEARDOWN_GRACE_SEC}; "
+            "echo \"$PIDS\" | xargs -r sudo kill -9 2>/dev/null || true; "
+            "fi"
+        )]
+        run_ssh(ip, None, cleanup_cmd, timeout=TEARDOWN_GRACE_SEC + 15)
+
+        # docker stop sends SIGTERM to PID 1 and waits up to --time seconds
+        # before escalating to SIGKILL itself -- the graceful counterpart
+        # to the `docker rm -f` we used to jump straight to, which sent
+        # SIGKILL immediately with no grace period at the container level
+        # either. Errors here (e.g. container doesn't exist) are expected
+        # and ignored -- the rm -f below is the actual cleanup guarantee.
+        for role in (ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER):
+            run_ssh(ip, None, ["docker", "stop", "--time", str(TEARDOWN_GRACE_SEC), role],
+                    timeout=TEARDOWN_GRACE_SEC + 10)
+
+        # Final rm -f as a backstop: if a container ignored SIGTERM and
+        # docker stop's own escalation, this cleans up the corpse. By this
+        # point it's had a real grace period, so this is a safety net for
+        # genuinely wedged containers, not the primary kill mechanism.
         res = run_ssh(ip, None, ["docker", "rm", "-f", ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER], timeout=15)
         results[host] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
     time.sleep(2)
@@ -1339,7 +1381,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         ] + vllm_args_list
 
         docker_cmd = [
-            "docker", "run", "-d",
+            "docker", "run", "-d", "--init",
             "--name", ContainerRole.STANDALONE,
             "--net=host", "--ipc=host", f"--shm-size={tuning.shm_size_1node}",
             "--gpus", "all",
@@ -1420,7 +1462,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                 entrypoint_cmd = container_args
 
             docker_cmd = [
-                "docker", "run", "-d",
+                "docker", "run", "-d", "--init",
                 "--name", role_name,
                 "--net=host", "--ipc=host", f"--shm-size={tuning.shm_size_2node}",
                 "--privileged",
