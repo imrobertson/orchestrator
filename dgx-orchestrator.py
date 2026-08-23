@@ -1476,7 +1476,11 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         host_hf_dir = vol_mount.split(":", 1)[0]
         host_cache_root = str(Path(host_hf_dir).parent)
         mounts = [
-            "-v", f"{host_cache_root}:/root/.cache",
+            "-v", f"{host_cache_root}/triton:/root/.cache/triton",
+            "-v", f"{host_cache_root}/tilelang:/root/.cache/tilelang",
+            "-v", f"{host_cache_root}/deepgemm:/root/.cache/deepgemm",
+            "-v", f"{host_cache_root}/vllm:/root/.cache/vllm",
+            "-v", f"{host_cache_root}/flashinfer:/root/.cache/flashinfer",
             "-v", f"{host_cache_root}/nv_compute_cache:/root/.nv/ComputeCache"
         ]
         env = [
