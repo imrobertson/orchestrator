@@ -30,13 +30,13 @@ def discover_model_id(host: str, port: int) -> str:
     raise RuntimeError(f"No active models found at http://{host}:{port}/v1/models")
 
 
-def run_benchmark_pass(host: str, port: int, model_id: str, prompt: str, max_tokens: int) -> dict:
+def run_benchmark_pass(host: str, port: int, model_id: str, prompt: str, max_tokens: int, temperature: float) -> dict:
     url = f"http://{host}:{port}/v1/chat/completions"
     payload = {
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0.0,
+        "temperature": temperature,
         "stream": True,
         "stream_options": {"include_usage": True}
     }
@@ -117,6 +117,14 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--nodes", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Sampling temperature for the benchmark requests. Default 0.0 "
+                             "(greedy) matches vLLM's default verification behavior for "
+                             "speculative decoding -- a draft token is accepted only if it "
+                             "matches the target's argmax. Raising this to match a "
+                             "'draft_sample_method: probabilistic' spec config lets you "
+                             "benchmark acceptance rate under the same sampling regime the "
+                             "deployment actually uses, instead of always testing greedy.")
     parser.add_argument("--prompt", default="Write a 200 word technical overview of distributed tensor parallelism.")
     parser.add_argument("--model-key", default=None,
                         help="Catalog key (recipe filename stem) to log in the ledger instead of "
@@ -136,7 +144,7 @@ def main():
         run_type = "Cold Start" if idx == 1 else "Warm Pass"
         print(f"--- Run {idx} ({run_type}) ---")
         
-        res = run_benchmark_pass(args.host, args.port, model_id, args.prompt, args.max_tokens)
+        res = run_benchmark_pass(args.host, args.port, model_id, args.prompt, args.max_tokens, args.temperature)
         runs.append(res)
         
         print(f"  TTFT (Prefill): {res['ttft']:.2f}s | Decode Speed: {res['decode_tps']:.1f} tok/s ({res['tokens']} tokens in {res['decode_duration']:.2f}s)\n")
@@ -150,7 +158,7 @@ def main():
 
     summary_text = (
         f"==================================================\n"
-        f"BENCHMARK SUMMARY RESULTS: {model_id}\n"
+        f"BENCHMARK SUMMARY RESULTS: {model_id} (temperature={args.temperature})\n"
         f"==================================================\n"
         f"Cold Start (Run 1) : TTFT {cold_run['ttft']:.2f}s | Decode Speed: {cold_run['decode_tps']:.1f} tok/s\n"
         f"Warm Avg (Runs 2+) : TTFT {avg_warm_ttft:.2f}s | Decode Speed: {avg_warm_decode_tps:.1f} tok/s\n"

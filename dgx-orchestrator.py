@@ -1438,6 +1438,25 @@ def _discover_host_container(host: str, meta: dict) -> dict:
 
     return info
 
+def _resolve_catalog_key(loaded_model: str, catalog_models: dict) -> str:
+    """Map a raw served model name (HF basename pulled from --model, e.g.
+    'DeepSeek-V4-Flash-0731-NVFP4') to its catalog/recipe key (filename
+    stem, e.g. 'deepseek-v4-flash-0731-nvfp4'). Falls back to loaded_model
+    itself if no catalog entry matches, so callers always get a usable key.
+
+    Single source of truth: any code that keys a ledger, session tracker,
+    or historical lookup by "the model" must resolve through here first,
+    or its key will silently never join with enrich_catalog()'s l_key.
+    """
+    matched_key = loaded_model
+    if catalog_models and isinstance(catalog_models, dict):
+        for cat_key, cat_data in catalog_models.items():
+            hf_path = cat_data.get("hf_path", "")
+            if hf_path.endswith(loaded_model) or cat_key == loaded_model or loaded_model in hf_path:
+                matched_key = cat_key
+                break
+    return matched_key
+
 def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool, container_info: dict, serving_host: str, catalog_models: dict) -> tuple:
     ip = meta["ip"]
     user = None
@@ -1461,13 +1480,7 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
             head_crashed = True
             break
 
-    matched_key = loaded_model
-    if catalog_models and isinstance(catalog_models, dict):
-        for cat_key, cat_data in catalog_models.items():
-            hf_path = cat_data.get("hf_path", "")
-            if hf_path.endswith(loaded_model) or cat_key == loaded_model or loaded_model in hf_path:
-                matched_key = cat_key
-                break
+    matched_key = _resolve_catalog_key(loaded_model, catalog_models)
 
     eta_seconds = 0
     eta_display = "Ready" if cluster_ready else "N/A"
@@ -1598,12 +1611,19 @@ def _compute_cluster_status_impl() -> dict:
     cluster_ready = check_vllm_health(serving_ip)
     vllm_metrics = get_vllm_metrics(serving_ip) if cluster_ready else {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
 
-    matched_model = container_info.get(serving_host, {}).get("loaded_model", "Unknown")
+    # catalog_models must load before we resolve the session-tracker key --
+    # SESSION_TRACKER commits lifetime stats keyed on the catalog/recipe key
+    # (matching enrich_catalog()'s l_key), not the raw served HF basename.
+    # Previously this used the raw loaded_model name directly, which never
+    # matched the catalog key, so lifetime_in/lifetime_out silently stayed
+    # at 0 in the dashboard even though sessions were being tracked.
+    catalog_models = load_model_catalog().get("catalog", {}).get("models", {})
+
+    raw_loaded_model = container_info.get(serving_host, {}).get("loaded_model", "Unknown")
+    matched_model = _resolve_catalog_key(raw_loaded_model, catalog_models)
     topo = "2_node" if len([h for h, i in container_info.items() if i.get("active_container") != "None"]) > 1 else "1_node"
     if cluster_ready:
         SESSION_TRACKER.update(vllm_metrics, matched_model, topo)
-
-    catalog_models = load_model_catalog().get("catalog", {}).get("models", {})
 
     with BENCHMARK_STATE_LOCK:
         is_benchmarking = BENCHMARK_STATE["running"]
