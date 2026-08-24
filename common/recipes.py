@@ -155,8 +155,41 @@ def _load_recipes_impl() -> dict[str, RecipeConfig]:
     return {stem: recipe for stem, (recipe, _path) in found.items()}
 
 
+def _recipe_dir_fingerprint() -> tuple:
+    """
+    Cheap signal for "has anything under recipes/{local,eugr}/ changed since
+    we last loaded it". (path, mtime_ns) per *.yaml file across both
+    subdirs, sorted for a stable, hashable/comparable tuple. Covers edits
+    (mtime changes), adds and removes (the file list itself changes), and
+    renames (same, since it's a different set of paths). Deliberately does
+    NOT stat file contents/hash them -- mtime is enough to detect "worth
+    re-reading" without adding a full-file read on every request just to
+    decide whether to do a full-file read.
+    """
+    stamps = []
+    for subdir in RECIPE_SUBDIRS:
+        directory = RECIPES_DIR / subdir
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.yaml")):
+            try:
+                stamps.append((str(path), path.stat().st_mtime_ns))
+            except OSError:
+                # Deleted between glob() and stat() -- treat as absent
+                # rather than erroring; the next real load will just not
+                # see it, same as if it had never matched the glob.
+                continue
+    return tuple(stamps)
+
+
 @functools.lru_cache(maxsize=1)
-def _load_recipes_cached() -> dict[str, RecipeConfig]:
+def _load_recipes_cached(_fingerprint: tuple) -> dict[str, RecipeConfig]:
+    # _fingerprint is unused inside the function -- it exists purely as the
+    # lru_cache key. Any change to it (an edit, add, remove, or rename
+    # under recipes/{local,eugr}/) is a different key, so lru_cache treats
+    # it as a fresh call instead of returning the stale cached result.
+    # maxsize=1 means each new fingerprint evicts the previous entry, so
+    # this never grows unbounded across repeated edits.
     return _load_recipes_impl()
 
 
@@ -168,14 +201,23 @@ def load_recipes(bypass_cache: bool = False) -> dict[str, RecipeConfig]:
     key "foo"). A name collision between local/ and eugr/ (same stem in
     both) still raises -- see _load_recipes_impl().
 
-    Cached across calls (recipe files are read from disk once per process).
-    Pass bypass_cache=True to force a fresh read and invalidate the cache --
-    tests that write fresh recipe fixtures between calls need this.
+    Cached across calls, but the cache auto-invalidates whenever any
+    recipe file under recipes/{local,eugr}/ is added, removed, renamed, or
+    edited (see _recipe_dir_fingerprint()) -- so editing a recipe on disk
+    is picked up on the next call with no process restart required. The
+    common case (nothing changed since the last call) costs one glob +
+    stat() per recipe file, not a re-read/re-parse/re-validate of any of
+    them.
+
+    Pass bypass_cache=True to force a fresh read regardless of the
+    fingerprint -- tests that write fresh recipe fixtures without changing
+    mtimes (e.g. two writes within the same mtime-resolution tick) still
+    need this.
     """
     if bypass_cache:
         _load_recipes_cached.cache_clear()
         return _load_recipes_impl()
-    return _load_recipes_cached()
+    return _load_recipes_cached(_recipe_dir_fingerprint())
 
 
 def build_catalog_response() -> dict:
