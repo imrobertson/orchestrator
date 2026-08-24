@@ -1,4 +1,7 @@
 # Control Plane Release Tombstones & Fix Log
+
+
+
 ### 60. Crashed Engine Misreported as Indefinite Warmup — Keyword Collision in Log Scanner (V4.8.4)
 * **The Trap:** `detect_model_stage()` scanned container logs in reverse for progress keywords, including `"kv cache"` as a WARMUP signal. A vLLM startup crash (`ValueError: nvfp4 KV cache is not supported with MLA backends...`) contains that exact phrase inside its own error message, so the scanner matched the crash report itself as legitimate progress and reported `NOT READY - WARMUP` forever, with an ETA that counted up for over an hour with no historic data. Compounded by 2-node Ray deploys: the container's PID 1 is `ray start --block`, not the vLLM engine — the engine runs via a separate detached `docker exec -d`, so Docker correctly reports the container `RUNNING` long after the actual engine process has died. Container-level health alone can't be trusted for this launch path.
 * **The Fix:** Added `_detect_crash_signature()`, which checks the log tail for an actual Python traceback *before* the keyword scan runs, and short-circuits to `CRASHED (ENGINE EXITED: <exception>)` if found — regardless of what substrings a future crash's error text happens to contain. `_finalize_host_status()` now skips ETA computation entirely for a crashed status instead of computing a countdown against a dead process.
@@ -13,7 +16,8 @@
 
 ### 57. Near-Duplicate Recipe Catalog Keys — Silent Model Repoint (V4.8.4)
 * **The Trap:** `recipes/local/deepseek-v4-flash-nvfp4.yaml` (an older, distinct NVIDIA build) and `recipes/local/deepseek-v4-flash-0731-nvfp4.yaml` (the correct, working auroter 0731 build) coexisted with catalog keys one keystroke apart. A prior session silently repointed the former's `hf_path` to the *same* model as the latter while also swapping in an unvalidated `--kv-cache-dtype nvfp4_ds_mla` (see #56) — with no filename change to signal any of it happened. Deploying the wrong key crashed on a config that had never actually been tested end-to-end.
-* **The Fix:** Reverted `deepseek-v4-flash-nvfp4.yaml` to its original `nvidia/DeepSeek-V4-Flash-NVFP4` config. No structural fix for the underlying class of error yet — near-duplicate catalog keys with no loader-level collision warning remains an open gap, tracked in `ROADMAP.md`.
+* **The Fix:** Deleted `deepseek-v4-flash-nvfp4.yaml` outright rather than reverting it to its original config — the older NVIDIA build it used to serve wasn't in active use, so removing it closes both the collision risk and the invalid kv-cache-dtype landmine in one move. No structural fix for the underlying class of error yet — near-duplicate catalog keys with no loader-level collision warning remains an open gap, tracked in `ROADMAP.md`.
+
 
 ### 56. vLLM Rejects `nvfp4`-Family KV Cache Dtype for MLA Models (V4.8.4)
 * **The Trap:** `--kv-cache-dtype nvfp4_ds_mla` — a custom identifier intended as a GB10/`flashinfer_b12x` MLA cache bypass — crashes at engine-config-creation time with `pydantic_core.ValidationError: nvfp4 KV cache is not supported with MLA (Multi-head Latent Attention) backends`. This is a vLLM core validation guard (landed alongside upstream PR #40177, "Add nvfp4 kv cache support"), not an orchestrator or image issue — confirmed the pulled `eugr/spark-vllm-b12x:latest` image digest was unchanged across the working and broken deploys.

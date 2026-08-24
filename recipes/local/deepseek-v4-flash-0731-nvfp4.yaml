@@ -2,7 +2,7 @@ recipe_version: '1'
 name: deepseek-v4-flash-0731-nvfp4
 hf_path: auroter/DeepSeek-V4-Flash-0731-NVFP4
 image: eugr/spark-vllm-b12x:latest
-gpu_util: 0.75
+gpu_util: 0.85
 capability:
   task: null
   context_class: null
@@ -10,7 +10,7 @@ capability:
 mods: []
 topologies:
   2_node:
-    max_model_len: 393216
+    max_model_len: 524288
     tp_size: 2
     pp_size: 1
     # MULTI-NODE EXECUTOR REQUIREMENT: We MUST use Ray for multi-node deployments 
@@ -32,4 +32,4 @@ topologies:
       --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
       --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
       --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
-      --max-num-seqs 2 --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","moe_backend":"flashinfer_cutlass"}'
+      --max-num-seqs 2 --speculative-config --enable-prefix-caching '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","moe_backend":"flashinfer_cutlass"}'
