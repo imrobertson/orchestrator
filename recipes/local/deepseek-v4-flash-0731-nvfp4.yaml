@@ -23,6 +23,8 @@ topologies:
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
     - VLLM_USE_V1=0
+    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=3600
+    - VLLM_RPC_TIMEOUT=3600
     # GB10 HARDWARE & MLA CACHE BYPASS:
     # - `flashinfer_cutlass` required for GB10 SwiGLU clamping.
     # - DO NOT add `--quantization modelopt_fp4` here to avoid container parser loops.
