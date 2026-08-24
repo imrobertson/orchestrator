@@ -99,6 +99,19 @@ does today. If you're hand-rolling a `docker run` outside the orchestrator
 for testing, replicate this shape rather than a single broad `.cache`
 bind.
 
+### Speculative Decoding / MTP (DSpark) Constraints
+
+**Validated:** `--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","moe_backend":"flashinfer_cutlass"}'`.
+
+* **Minimum Draft Token Floor:** DSpark enforces a strict minimum block size of 5 tokens (`num_speculative_tokens >= 5`). Setting values below 5 (e.g. 2 or 3) fails at config-validation time: `pydantic_core.ValidationError: DSpark requires num_speculative_tokens >= dspark_block_size (5)`.
+* **Topology Binding:** DSpark speculative decoding cannot span pipeline stages. Multi-node deployments using DSpark **must** use Tensor Parallelism (`tp_size: 2`, `pp_size: 1`). Setting `pp_size: 2` breaks speculative state evaluation.
+
+### Attention Backend Selection (FlashInfer vs Native)
+
+**Validated:** `--attention-backend FLASH_ATTN` for guaranteed boot stability when using non-standard tensor shapes or speculative decoding.
+
+**Known-bad (under speculation):** `--attention-backend B12X_ATTN` when combined with DeepSeek-V4 Sparse MLA attention and speculative draft tokens on GB10 (SM120). FlashInfer's JIT autotuner (`sparse_mla_sm120_decode_dsv4`) fails to match non-standard draft tensor shapes to pre-compiled tuning buckets, falling back to unoptimized runners or timing out during startup.
+
 ### Recipe naming discipline
 
 Not a `vllm_args` issue, but earned the hard way: two recipes with catalog

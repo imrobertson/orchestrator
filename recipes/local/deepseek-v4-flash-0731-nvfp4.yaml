@@ -27,10 +27,10 @@ topologies:
     # - `flashinfer_cutlass` required for GB10 SwiGLU clamping.
     # - DO NOT add `--quantization modelopt_fp4` here to avoid container parser loops.
     # - `fp8` required for MLA KV cache.
-    vllm_args: >-
-      --attention-backend FLASH_ATTN --moe-backend flashinfer_cutlass
+vllm_args: >-
+      --attention-backend FLASH_ATTN --moe-backend auto
       --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
       --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
       --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
       --max-num-seqs 1 --enable-prefix-caching
-      --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","moe_backend":"flashinfer_cutlass"}'
+      --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","moe_backend":"auto"}'

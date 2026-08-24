@@ -267,7 +267,136 @@ report["mount_options"] = mount_opts
 print(json.dumps(report))
 '''
 
-# Flushes one model's HuggingFace weights cache, and optionally does a full
+# Read-only IPC/shared-memory inventory. No deletion. argv: none.
+#
+# /proc/sysvipc/shm and /proc/sysvipc/sem are stable kernel ABIs (see man 5
+# proc) -- parsed via the header line itself (zip(header, parts)) rather
+# than assuming fixed column positions, so this stays correct across kernel
+# versions that add/remove columns.
+#
+# nattch is the kernel's own live attach count for a SysV shared memory
+# segment -- 0 means provably nothing has it attached right now. This is a
+# hard guarantee, not a heuristic, which is what makes the sweep script
+# below safe to run unconditionally.
+_REMOTE_IPC_INVENTORY_SCRIPT = r'''
+import json, os, time
+
+report = {"generated_at": time.time(), "shm_segments": [], "semaphores": [],
+          "dev_shm_files": [], "dev_shm_disk": {}}
+
+def parse_sysvipc_table(path):
+    rows = []
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+        if not lines:
+            return rows
+        header = lines[0].split()
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) < len(header):
+                continue
+            rows.append(dict(zip(header, parts)))
+    except Exception:
+        pass
+    return rows
+
+for row in parse_sysvipc_table("/proc/sysvipc/shm"):
+    try:
+        report["shm_segments"].append({
+            "shmid": row.get("shmid"),
+            "key": row.get("key"),
+            "size_bytes": int(row.get("size", 0)),
+            "nattch": int(row.get("nattch", "1")),
+            "cpid": row.get("cpid"),
+            "lpid": row.get("lpid"),
+        })
+    except (ValueError, TypeError):
+        continue
+
+for row in parse_sysvipc_table("/proc/sysvipc/sem"):
+    report["semaphores"].append({
+        "semid": row.get("semid"),
+        "key": row.get("key"),
+        "nsems": row.get("nsems"),
+    })
+
+shm_dir = "/dev/shm"
+try:
+    for name in os.listdir(shm_dir):
+        path = os.path.join(shm_dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        report["dev_shm_files"].append({
+            "name": name,
+            "bytes": st.st_size,
+            "age_days": round((time.time() - st.st_mtime) / 86400, 2),
+        })
+except Exception as exc:
+    report["dev_shm_error"] = str(exc)
+
+try:
+    st = os.statvfs(shm_dir)
+    report["dev_shm_disk"] = {
+        "total_bytes": st.f_blocks * st.f_frsize,
+        "free_bytes": st.f_bavail * st.f_frsize,
+    }
+except Exception as exc:
+    report["dev_shm_disk_error"] = str(exc)
+
+print(json.dumps(report))
+'''
+
+# Removes ONLY SysV shared memory segments with nattch == 0 (provably
+# unattached -- see note above). Never touches POSIX /dev/shm files
+# directly: verifying those are truly orphaned would require cross-
+# referencing every process's open fds AND memory maps across the whole
+# host, which is a real check worth building but isn't safe to rush
+# without testing against the actual hosts -- deliberately deferred, see
+# docs/ROADMAP.md. argv: <dry_run:0|1>
+_REMOTE_IPC_SWEEP_SCRIPT = r'''
+import json, subprocess, sys
+
+dry_run = sys.argv[1] == "1"
+removed = []
+errors = []
+
+try:
+    with open("/proc/sysvipc/shm") as f:
+        lines = f.read().splitlines()
+except Exception as exc:
+    print(json.dumps({"removed": [], "errors": [{"shmid": None, "error": str(exc)}], "total_bytes_freed": 0, "dry_run": dry_run}))
+    sys.exit(0)
+
+if lines:
+    header = lines[0].split()
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < len(header):
+            continue
+        row = dict(zip(header, parts))
+        try:
+            nattch = int(row.get("nattch", "1"))
+            size = int(row.get("size", 0))
+        except (ValueError, TypeError):
+            continue
+        if nattch != 0:
+            continue  # attached somewhere -- never touch this, regardless of what it is or how old
+        shmid = row.get("shmid")
+        if dry_run:
+            removed.append({"shmid": shmid, "bytes": size, "status": "would remove"})
+            continue
+        res = subprocess.run(["ipcrm", "-m", shmid], capture_output=True, text=True)
+        if res.returncode == 0:
+            removed.append({"shmid": shmid, "bytes": size, "status": "removed"})
+        else:
+            errors.append({"shmid": shmid, "error": res.stderr.strip()})
+
+total_bytes_freed = sum(e["bytes"] for e in removed)
+print(json.dumps({"removed": removed, "errors": errors, "total_bytes_freed": total_bytes_freed, "dry_run": dry_run}))
+'''
 # wipe of every JIT cache root on the host. Run on each Spark over SSH.
 # argv: <hf_cache_dir> <jit_roots_json> <dry_run:0|1>
 #
@@ -362,7 +491,7 @@ BENCHMARK_STATE_LOCK = threading.Lock()
 # updates without teardown itself needing to become async.
 TEARDOWN_STATE = {
     "running": False,
-    "phase": "idle",  # idle | signaling | stopping | removing | done
+    "phase": "idle",  # idle | signaling | stopping | removing | sweeping | done
     "message": "Idle",
     "last_run": None
 }
@@ -1053,6 +1182,123 @@ def find_cached_models(target_hosts: list = None) -> dict:
 
     return {"status": "success", "hosts": results}
 
+def ipc_inventory(target_hosts: list = None) -> dict:
+    """
+    Read-only snapshot of SysV shared memory segments, SysV semaphore
+    arrays, and POSIX /dev/shm files on each host. No deletion, safe
+    against a live cluster at any time.
+
+    This matters because our containers run with --ipc=host: Ray's plasma
+    object store (shared-memory-backed) and vLLM/PyTorch's own
+    multiprocessing shared memory usage all live in the HOST's own IPC
+    namespace, not an isolated per-container one. A process killed
+    abruptly rather than shut down cleanly can leak shared memory that
+    persists on the host indefinitely -- these aren't ordinary process
+    memory that the kernel reclaims on exit, they have to be explicitly
+    unlinked. See sweep_ipc_orphans() for the safe cleanup half of this.
+    """
+    hosts_to_check = target_hosts if target_hosts else list(HOSTS.keys())
+    results = {}
+
+    for host in hosts_to_check:
+        if host not in HOSTS:
+            continue
+        ip = HOSTS[host]["ip"]
+        res = run_ssh(ip, None, ["python3", "-c", _REMOTE_IPC_INVENTORY_SCRIPT], capture=True, timeout=30)
+
+        if res.returncode != 0:
+            results[host] = {"status": "error", "message": res.stderr.strip() or "ipc inventory script failed"}
+            continue
+
+        try:
+            data = json.loads(res.stdout.strip())
+        except Exception as exc:
+            results[host] = {"status": "error", "message": f"unparseable output: {exc}"}
+            continue
+
+        gb = lambda b: round(b / (1024 ** 3), 3)
+        shm_segments = data.get("shm_segments", [])
+        orphaned = [s for s in shm_segments if s.get("nattch", 1) == 0]
+        attached = [s for s in shm_segments if s.get("nattch", 1) != 0]
+
+        disk = data.get("dev_shm_disk", {})
+        dev_shm_files = sorted(data.get("dev_shm_files", []), key=lambda f: f["bytes"], reverse=True)
+
+        results[host] = {
+            "status": "ok",
+            "shm_segments_total": len(shm_segments),
+            "shm_segments_attached": len(attached),
+            "shm_segments_orphaned": len(orphaned),
+            "shm_orphaned_gb": gb(sum(s["size_bytes"] for s in orphaned)),
+            "shm_attached_gb": gb(sum(s["size_bytes"] for s in attached)),
+            "semaphore_count": len(data.get("semaphores", [])),
+            "dev_shm_disk_free_gb": gb(disk.get("free_bytes", 0)) if disk else None,
+            "dev_shm_disk_total_gb": gb(disk.get("total_bytes", 0)) if disk else None,
+            "dev_shm_files": [
+                {"name": f["name"], "gb": gb(f["bytes"]), "age_days": f["age_days"]}
+                for f in dev_shm_files
+            ],
+            "orphaned_shm_segments": orphaned,
+        }
+
+    return {"status": "success", "hosts": results}
+
+def sweep_ipc_orphans(target_hosts: list = None, dry_run: bool = False) -> dict:
+    """
+    Removes SysV shared memory segments with nattch == 0 -- provably
+    unattached, a hard kernel-tracked guarantee, not a heuristic. Safe to
+    run unconditionally: a segment still in use by anything, on this
+    workload or any other on the shared host, is never touched.
+
+    Deliberately does NOT touch POSIX /dev/shm files -- see the
+    _REMOTE_IPC_SWEEP_SCRIPT module comment for why that's a real check
+    worth building later rather than rushing now.
+    """
+    hosts_to_check = [h for h in (target_hosts if target_hosts else list(HOSTS.keys())) if h in HOSTS]
+    verb = "Dry-run evaluating" if dry_run else "Sweeping"
+    print(f"[+] {verb} orphaned SysV shared memory segments...")
+
+    results = {}
+    for host in hosts_to_check:
+        ip = HOSTS[host]["ip"]
+        # ipcrm on a segment owned by a different uid (containers commonly
+        # run as root inside; the SSH user may not be root) needs
+        # elevated privileges, same as the sudo usage already established
+        # elsewhere in this file (e.g. sudo nvidia-smi, sudo kill).
+        cmd = ["sudo", "python3", "-c", _REMOTE_IPC_SWEEP_SCRIPT, "1" if dry_run else "0"]
+        res = run_ssh(ip, None, cmd, capture=True, timeout=30)
+
+        if res.returncode != 0:
+            msg = res.stderr.strip() or "ipc sweep script failed"
+            print(f"  [{host}] ERROR: {msg}")
+            results[host] = {"status": "error", "message": msg}
+            continue
+
+        try:
+            data = json.loads(res.stdout.strip())
+        except Exception as exc:
+            results[host] = {"status": "error", "message": f"unparseable output: {exc}"}
+            continue
+
+        gb = lambda b: round(b / (1024 ** 3), 3)
+        results[host] = {
+            "status": "ok",
+            "segments_removed": len(data["removed"]),
+            "gb_freed": gb(data["total_bytes_freed"]),
+            "errors": data["errors"],
+            "dry_run": data["dry_run"],
+        }
+
+        if results[host]["segments_removed"] == 0:
+            print(f"  [{host}] No orphaned segments found.")
+        else:
+            action = "would remove" if dry_run else "removed"
+            print(f"  [{host}] {action} {results[host]['segments_removed']} orphaned segment(s), {results[host]['gb_freed']} GB.")
+        for err in data["errors"]:
+            print(f"  [{host}] error removing shmid {err.get('shmid')}: {err.get('error')}")
+
+    return {"status": "success", "details": results}
+
 def prune_cluster_cache(min_free_gb: int = 50, headroom_gb: int = 20, dry_run: bool = False) -> dict:
     """
     LRU-evict JIT kernel caches, but ONLY on hosts currently below the free
@@ -1576,10 +1822,20 @@ TEARDOWN_GRACE_SEC = 20
 
 def _teardown_host_processes(ip: str) -> None:
     """
-    Phase 1 of teardown for one host: SIGTERM any stray vllm/ray processes,
+    Phase 1a of teardown for one host: SIGTERM any stray vllm/ray
+    processes running directly on the bare host (outside any container),
     give them TEARDOWN_GRACE_SEC, then escalate to -9 for stragglers.
-    Broken out so it can be run concurrently across hosts -- see
-    _execute_teardown_impl for why concurrency here matters.
+
+    IMPORTANT LIMITATION: none of our docker run invocations set
+    --pid=host, so every container gets its own isolated PID namespace --
+    this means `ps aux` run here, over SSH directly against the host, has
+    NO visibility into processes running inside a container at all. This
+    step only ever catches a genuinely bare-metal stray process (e.g.
+    something run manually outside the normal deploy path during
+    debugging) -- it is NOT what reaches the vLLM engine or Ray inside a
+    container. See _teardown_host_container_internals for what actually
+    does that. Kept as a harmless, cheap safety net for the rare bare-
+    metal case, not because it's load-bearing for the common one.
     """
     cleanup_cmd = ["bash", "-c", (
         "PIDS=$(ps aux | grep -E 'vllm|ray' | grep -v 'dgx-orchestrator' | awk '{print $2}'); "
@@ -1589,10 +1845,46 @@ def _teardown_host_processes(ip: str) -> None:
         "echo \"$PIDS\" | xargs -r sudo kill -9 2>/dev/null || true; "
         "fi"
     )]
-    # NOTE: this still only matches process names containing vllm/ray -- a
-    # bare `ptxas`/`nvcc`/`cicc` child compiler process won't match and
-    # won't be targeted here either way. See docs/ROADMAP.md.
     run_ssh(ip, None, cleanup_cmd, timeout=TEARDOWN_GRACE_SEC + 15)
+
+def _teardown_host_container_internals(ip: str) -> None:
+    """
+    Phase 1b of teardown for one host: reaches INSIDE each container via
+    `docker exec` -- the only thing that can actually see and signal
+    container-internal processes, given no --pid=host sharing (see
+    _teardown_host_processes above) -- to gracefully stop the vLLM engine
+    and Ray before the container itself is ever stopped or removed.
+
+    This closes two real gaps:
+    1. In a 2-node Ray deploy, the vLLM engine runs as a separate
+       `docker exec -d` process, detached from the container's own PID 1
+       (`ray start --block`). `docker stop`'s SIGTERM only reaches PID 1
+       -- the engine itself was previously never signaled at all, only
+       ever killed via the abrupt kernel-level namespace teardown at
+       `docker rm -f` time.
+    2. These containers run with --ipc=host, so Ray's shared-memory-backed
+       plasma object store lives in the HOST's own IPC namespace, not an
+       isolated per-container one. A process killed abruptly rather than
+       shut down cleanly can leak shared memory that persists on the host
+       indefinitely -- it isn't reclaimed the way ordinary process memory
+       is, it has to be explicitly unlinked, which only happens on a
+       clean shutdown. `ray stop` is Ray's own designed command for this,
+       and a better tool than a generic SIGTERM for releasing Ray's own
+       IPC allocations correctly.
+
+    Applied uniformly to all three container role names on every host --
+    harmless no-ops for whichever ones don't exist. The 1-node path's own
+    container genuinely IS PID 1's child there, so this is redundant-but-
+    safe in that case specifically, not load-bearing the way it is for a
+    2-node Ray deploy.
+    """
+    for role in (ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER):
+        # Graceful pass.
+        run_ssh(ip, None, ["docker", "exec", role, "pkill", "-TERM", "-f", "vllm.entrypoints.openai.api_server"], timeout=10)
+        run_ssh(ip, None, ["docker", "exec", role, "ray", "stop"], timeout=TEARDOWN_GRACE_SEC + 5)
+        # Escalation pass -- whatever's still alive gets forced.
+        run_ssh(ip, None, ["docker", "exec", role, "pkill", "-9", "-f", "vllm.entrypoints.openai.api_server"], timeout=10)
+        run_ssh(ip, None, ["docker", "exec", role, "ray", "stop", "--force"], timeout=15)
 
 def _teardown_host_containers(ip: str) -> None:
     """Phase 2: graceful docker stop (SIGTERM + grace) for every role that
@@ -1640,6 +1932,17 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
     unconditionally, whether called from the standalone teardown endpoint
     or from inside a deploy's own pre-deploy teardown, so both get the same
     visibility on the dashboard.
+
+    The signaling phase now also reaches INSIDE each container via
+    _teardown_host_container_internals (docker exec), not just the
+    host's own (largely inert -- see that function's docstring) process
+    table. And a new "sweeping" phase runs after removal to clear
+    orphaned (nattch==0) SysV shared memory segments -- see
+    sweep_ipc_orphans for why this is safe to do unconditionally. Together
+    these are what make "clean slate on every deploy" an actual guarantee
+    rather than a hope: _execute_deployment_impl calls this same function
+    as its own pre-deploy step, so every deploy gets it too, not just a
+    manually-triggered teardown.
     """
     results = {}
     hosts_to_clean = [h for h in (target_hosts if target_hosts else list(HOSTS.keys())) if h in HOSTS]
@@ -1650,7 +1953,9 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
         _set_teardown_state(True, "signaling",
                              f"Signaling processes on {host_list} (SIGTERM, up to {TEARDOWN_GRACE_SEC}s grace)...")
         proc_futures = {h: WORKER_POOL.submit(_teardown_host_processes, ip) for h, ip in ips.items()}
+        internal_futures = {h: WORKER_POOL.submit(_teardown_host_container_internals, ip) for h, ip in ips.items()}
         for f in proc_futures.values(): f.result()
+        for f in internal_futures.values(): f.result()
 
         _set_teardown_state(True, "stopping",
                              f"Gracefully stopping containers on {host_list} (up to {TEARDOWN_GRACE_SEC}s)...")
@@ -1662,6 +1967,13 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
         for h, f in rm_futures.items():
             res = f.result()
             results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
+
+        _set_teardown_state(True, "sweeping", f"Sweeping orphaned shared memory on {host_list}...")
+        sweep_result = sweep_ipc_orphans(target_hosts=hosts_to_clean, dry_run=False)
+        for h in hosts_to_clean:
+            s = sweep_result.get("details", {}).get(h, {})
+            if s.get("status") == "ok" and s.get("segments_removed", 0) > 0:
+                results[h] = f"{results.get(h, 'Purged')} (+ {s['segments_removed']} orphaned shm segment(s), {s['gb_freed']} GB freed)"
 
         time.sleep(2)
         return results
@@ -2141,6 +2453,9 @@ if HAS_FASTAPI:
         dry_run: bool = False
         force: bool = False
 
+    class SweepIpcRequest(BaseModel):
+        dry_run: bool = False
+
     @app.get("/api/status")
     def api_status(): return get_cluster_status()
 
@@ -2191,6 +2506,14 @@ if HAS_FASTAPI:
     @app.get("/api/list-cached-models")
     def api_list_cached_models():
         return find_cached_models()
+
+    @app.get("/api/ipc-inventory")
+    def api_ipc_inventory():
+        return ipc_inventory()
+
+    @app.post("/api/sweep-ipc-orphans")
+    def api_sweep_ipc_orphans(req: SweepIpcRequest):
+        return sweep_ipc_orphans(dry_run=req.dry_run)
 
 def _telemetry_daemon_loop():
     """Background polling loop for maintaining lifetime and session analytics."""
@@ -2246,10 +2569,15 @@ def main():
 
     subparsers.add_parser("list-cached-models", help="Cross-reference cached model weights against the live catalog and deploy history to surface active/retired/orphaned caches worth reviewing. Read-only.")
 
+    subparsers.add_parser("ipc-inventory", help="Read-only snapshot of SysV shared memory/semaphores and /dev/shm usage per host. Safe against production.")
+
+    sweep_ipc_parser = subparsers.add_parser("sweep-ipc-orphans", help="Remove SysV shared memory segments with zero attached processes (provably orphaned, safe). Runs automatically as part of teardown; also available standalone.")
+    sweep_ipc_parser.add_argument("--dry-run", action="store_true", help="Report what would be removed and its size, without deleting anything.")
+
     cli_parser = subparsers.add_parser("cli")
     cli_sub = cli_parser.add_subparsers(dest="cli_action")
 
-    for cmd in ["status", "teardown", "menu", "cache-inventory", "list-cached-models"]:
+    for cmd in ["status", "teardown", "menu", "cache-inventory", "list-cached-models", "ipc-inventory"]:
         cli_sub.add_parser(cmd)
         
     cli_sub.add_parser("daemon").add_argument("--port", type=int, default=5001)
@@ -2280,6 +2608,9 @@ def main():
     cli_flush.add_argument("--jit", action="store_true")
     cli_flush.add_argument("--dry-run", action="store_true")
     cli_flush.add_argument("--force", action="store_true")
+
+    cli_sweep_ipc = cli_sub.add_parser("sweep-ipc-orphans")
+    cli_sweep_ipc.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
     subcommand = args.subcommand
@@ -2360,6 +2691,29 @@ def main():
             for m in data["models"]:
                 label = m["matched_model"] or m["cache_dirname"]
                 print(f"  [{m['status']}] {label} -- {m['gb']} GB, {m['age_days']}d old")
+        print("\n--- full detail ---")
+        print(json.dumps(res, indent=2))
+    elif subcommand == "ipc-inventory":
+        inv = ipc_inventory()
+        for host, data in inv["hosts"].items():
+            if data.get("status") != "ok":
+                print(f"[{host}] ERROR: {data.get('message')}")
+                continue
+            print(f"\n=== {host} ===")
+            print(f"  SysV shm: {data['shm_segments_total']} segments "
+                  f"({data['shm_segments_attached']} attached, {data['shm_attached_gb']} GB | "
+                  f"{data['shm_segments_orphaned']} orphaned, {data['shm_orphaned_gb']} GB)")
+            print(f"  Semaphore arrays: {data['semaphore_count']}")
+            if data['dev_shm_disk_total_gb'] is not None:
+                print(f"  /dev/shm disk: {data['dev_shm_disk_free_gb']}/{data['dev_shm_disk_total_gb']} GB free")
+            if data["dev_shm_files"]:
+                print("  /dev/shm files (largest first):")
+                for f in data["dev_shm_files"][:10]:
+                    print(f"    {f['name']} -- {f['gb']} GB, {f['age_days']}d old")
+        print("\n--- full detail ---")
+        print(json.dumps(inv, indent=2))
+    elif subcommand == "sweep-ipc-orphans":
+        res = sweep_ipc_orphans(dry_run=getattr(args, "dry_run", False))
         print("\n--- full detail ---")
         print(json.dumps(res, indent=2))
     else: interactive_menu()
