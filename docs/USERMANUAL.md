@@ -13,17 +13,17 @@ The dashboard is the easiest way to visualize cluster health and manage models.
 
 === Dashboard Features ===
 * '''Header bar:''' live cluster-wide throughput (<code>SPEED: X tok/s</code>) and request concurrency (<code>THREADS: X active (Y queued)</code>) whenever a model is serving, plus server time and an '''ONLINE MODE''' / '''OFFLINE MODE''' indicator.
-* '''Per-host panels (<code>spark-4</code>, <code>spark-3</code>):''' Docker daemon status, active container name and state, currently loaded model, model status (<code>READY</code>, a warmup/loading stage, or <code>NONE</code>), an ETA while a model is still loading, and live '''TEMP''' / '''GPU''' / '''MEM''' readings.
+* '''Per-host panels (<code>spark-4</code>, <code>spark-3</code>):''' Docker daemon status, active container name and state, currently loaded model, model status, an ETA while a model is still loading, and live '''TEMP''' / '''GPU''' / '''MEM''' readings. Model status is one of: <code>READY</code>, a warmup/loading stage, <code>CRASHED</code> (the engine process itself has died — shown in red, with a reason where one could be determined; check that host's logs), <code>ORPHANED</code> (a worker whose head crashed out from under it — needs a teardown), or <code>NONE</code>.
 * '''Deploy a Model (Model Deployer panel):'''
 # Select a model from the '''Select Model''' dropdown — populated live from the current recipe catalog, not a fixed list (see the catalog note below the table).
 # Choose the '''Topology''' (1-Node or 2-Node) and, for a 1-node deploy, the '''Target''' host.
 # Enter a '''User ID / Auditor''' — a self-reported label for tracking who deployed what, not an authenticated identity.
 # Click '''Deploy Model'''.
-* '''Teardown:''' Click the red '''Teardown Runtimes''' button to kill active models on both hosts and free up GPU memory.
+* '''Teardown:''' Click the red '''Teardown Runtimes''' button to gracefully stop and remove active models on both hosts and free up GPU memory. This is a multi-phase operation (SIGTERM the engine, gracefully stop each container, then force-remove anything still standing) that can take up to roughly a minute on a 2-node cluster — the button shows live phase progress for the duration rather than a static "in progress" label. While a teardown (or a deploy) is running, the other controls on the panel — Deploy, the benchmark toggle/button, and the model/topology/host fields — lock to prevent starting a conflicting operation mid-flight.
 * '''Live Logs:''' The full-width bottom panel shows a live terminal trace of the selected host's container logs. Health-check and metrics-polling lines are filtered out automatically so this stays readable during normal operation.
 
 === Understanding the ETA display ===
-When a model is loading, the ETA shown (e.g. <code>~340s remaining</code>) comes from an actual learned average of past load times for that exact model+topology combination, stored in <code>load_times.json</code> — not a fixed guess. The first time you ever deploy a given model+topology combination, you'll see <code>(Initial run - no history)</code> since there's nothing to average yet; after that, every successful deploy refines the estimate. If a load runs long, the display switches to <code>Finishing startup (+Ns over est.)</code> rather than showing a nonsensical negative countdown.
+When a model is loading, the ETA shown (e.g. <code>~340s remaining</code>) comes from an actual learned average of past load times for that exact model+topology combination, stored in <code>model_ledger.json</code> — not a fixed guess. The first time you ever deploy a given model+topology combination, you'll see <code>(Initial run - no history)</code> since there's nothing to average yet; after that, every successful deploy refines the estimate. If a load runs long, the display switches to <code>Finishing startup (+Ns over est.)</code> rather than showing a nonsensical negative countdown. If the engine crashes during startup, the display switches to <code>Check Docker Logs</code> instead of continuing to count elapsed time against a process that's no longer running.
 
 == Method 2: The Command Line (<code>dgx-config</code>) ==
 For users who prefer the terminal or want to script deployments, SSH into <code>maestro</code> and use the <code>dgx-config</code> wrapper.
@@ -53,10 +53,21 @@ Useful extra flags:
 <syntaxhighlight lang="bash">
 dgx-config teardown
 </syntaxhighlight>
+Graceful, not instant — see the dashboard Teardown bullet above for what's actually happening during the wait.
 * '''Check Container Logs:'''
 <syntaxhighlight lang="bash">
 dgx-config logs --host spark-4 --tail 50
 </syntaxhighlight>
+* '''Inspect JIT Cache Usage (read-only):'''
+<syntaxhighlight lang="bash">
+dgx-config cache-inventory
+</syntaxhighlight>
+Reports entry counts, sizes, age, and LRU order for every JIT cache root (Triton, TileLang, DeepGEMM, vLLM, FlashInfer) plus the CUDA compute cache and HuggingFace weights cache, per host. Fully read-only — no thresholds, nothing deleted, safe to run against a live cluster at any time.
+* '''Reclaim JIT Cache Space:'''
+<syntaxhighlight lang="bash">
+dgx-config prune-cache --min-free-gb 50 --headroom-gb 20
+</syntaxhighlight>
+Evicts whole JIT cache entries, oldest-first, but only on a host currently below <code>--min-free-gb</code> free space — above that floor, nothing is touched. Add <code>--dry-run</code> to see exactly what would be evicted and why without deleting anything.
 * '''Authorize a new SSH key on both hosts:'''
 <syntaxhighlight lang="bash">
 dgx-config authorize-key --key ~/.ssh/id_ed25519.pub
@@ -66,15 +77,15 @@ Appends the given public key to <code>~/.ssh/authorized_keys</code> on both <cod
 === Previewing a deploy (<code>--dry-run</code>) ===
 Before deploying something unfamiliar, or if you're not sure a model/topology combination will actually work, run:
 <syntaxhighlight lang="bash">
-dgx-config deploy --model deepseek-v4-flash-0731-experimental --nodes 2 --dry-run
+dgx-config deploy --model deepseek-v4-flash-0731-nvfp4 --nodes 2 --dry-run
 </syntaxhighlight>
 This builds and prints the exact <code>docker run</code> command(s) the real deploy would send — every flag, every environment variable, every mount — without opening a single SSH connection or touching either host. It's the fastest way to confirm a recipe is doing what you expect, or to compare two recipes' actual generated commands side by side, with zero risk to a running cluster.
 
 == Adding a New Model ==
 
-Models are no longer defined in one shared file — each model is its own recipe file under <code>recipes/local/</code> (or <code>recipes/eugr/</code> for ones adapted from the community <code>eugr/spark-vllm-docker</code> project). To add one:
+Models are no longer defined in one shared file — each model is its own recipe file under <code>recipes/local/</code> (or <code>recipes/eugr/</code> for ones adapted from the community <code>eugr/spark-vllm-docker</code> project). The catalog is a living, growing set — expect it to keep gaining variants over time (different precisions, context-length/throughput tradeoffs, single-node vs. multi-node builds of the same base model), not a fixed list to keep in sync with this document. To add one:
 
-# Create <code>recipes/local/your-model-name.yaml</code>. '''The filename is the model's identity''' — it's exactly what you'll pass to <code>--model</code> and exactly what shows up in the dashboard dropdown. There is no separate internal name field to keep in sync with it (an earlier version of the schema had one; it caused a real outage when it drifted out of sync with the filename — see Troubleshooting).
+# Create <code>recipes/local/your-model-name.yaml</code>. '''The filename is the model's identity''' — it's exactly what you'll pass to <code>--model</code> and exactly what shows up in the dashboard dropdown. There is no separate internal name field to keep in sync with it (an earlier version of the schema had one; it caused a real outage when it drifted out of sync with the filename — see Troubleshooting). '''Pick a filename that will still make sense next to its siblings''' — a fast-growing catalog has repeatedly hit near-duplicate names (e.g. an older and newer build of the same model differing only by a suffix) that were easy to confuse or select by mistake. If you're adding a variant of an existing model (a different precision, a longer-context build, a single-thread tuning), make the distinguishing part of the name unambiguous rather than a small typo-adjacent difference from the original.
 # Fill in the required fields:
 <syntaxhighlight lang="yaml">
 recipe_version: '1'
@@ -92,6 +103,7 @@ topologies:
       --trust-remote-code --kv-cache-dtype fp8
 </syntaxhighlight>
 Only define the topologies (<code>1_node</code>, <code>2_node</code>) the model actually supports — a model that needs both Sparks' memory should only have a <code>2_node</code> block; deploying it with <code>--nodes 1</code> will then fail with a clear error instead of silently misbehaving.
+# '''Before reusing <code>vllm_args</code> from another recipe as a starting point, check <code>docs/TROUBLESHOOTING.md</code> for known-bad flag combinations''' — a couple of real incidents came from a copied `vllm_args` block carrying a combination (specific quantization + KV cache dtype pairings, in particular) that had never actually been validated against a real deploy. Not every combination that looks reasonable on paper is safe to assume works.
 # Optionally set <code>image:</code> if the model needs a non-default container (most don't — omitting it falls back to the cluster's default image).
 # Save the file, then confirm it loaded:
 <syntaxhighlight lang="bash">
@@ -124,7 +136,7 @@ Results (time-to-first-token, decode tokens/sec) are written to <code>benchmark_
 
 Use the CLI keys in the table below with the <code>--model</code> flag, or select them from the Web Dashboard.
 
-'''This table is a point-in-time snapshot, not the source of truth.''' The catalog is generated live from one YAML file per model — adding, removing, or editing a model doesn't require touching this document, which means this table can and will drift out of date. '''If this list disagrees with what <code>dgx-config status</code> or the dashboard's dropdown actually show you, trust the running system, not this page.'''
+'''This table is a point-in-time snapshot, not the source of truth, and the catalog is a living, growing thing.''' The catalog is generated live from one YAML file per model — adding, removing, or editing a model doesn't require touching this document, and new variants (different precisions, longer-context builds, single-thread tunings, etc.) get added as the need comes up, not on any fixed schedule. This means this table can and will drift out of date, sometimes significantly. '''If this list disagrees with what <code>dgx-config status</code> or the dashboard's dropdown actually show you, trust the running system, not this page.'''
 
 {| class="wikitable"
 |-
@@ -140,17 +152,13 @@ Use the CLI keys in the table below with the <code>--model</code> flag, or selec
 | 2-Node (32,768)
 | Full-precision DeepSeek V4 Flash, B12X-optimized image.
 |-
-| <code>deepseek-v4-flash-nvfp4</code>
-| 2-Node (32,768)
-| NVFP4-quantized variant, Ray-backed distributed execution.
+| <code>deepseek-v4-flash-0731</code>
+| 2-Node
+| Newer DeepSeek V4 Flash checkpoint (0731), B12X image.
 |-
-| <code>deepseek-v4-flash-0731-experimental</code>
-| 2-Node (131,072)
-| Newer DeepSeek V4 Flash checkpoint (0731), B12X image. Experimental — expect rougher edges than the non-experimental entries.
-|-
-| <code>deepseek-v4-flash-0731-experimental-nvfp4</code>
+| <code>deepseek-v4-flash-0731-nvfp4</code>
 | 2-Node (393,216)
-| NVFP4 variant of the above; largest context window in the catalog. Also experimental.
+| NVFP4-quantized variant of the 0731 checkpoint; largest context window in the catalog. FP8 KV cache, MTP speculative decoding (DSpark).
 |-
 | <code>nemotron-3.5-lightning-bf16</code><br><code>nemotron-3.5-lightning-nvfp4</code>
 | 1-Node (131,072)
@@ -175,6 +183,10 @@ Use the CLI keys in the table below with the <code>--model</code> flag, or selec
 | <code>qwen-3.8-27b</code><br><code>qwen-3.8-27b-nvfp4</code>
 | 1-Node / 2-Node (262,144)
 | Long-context, tool-calling, MTP speculative decoding.
+|-
+| <code>qwen-3.8-27b-nvfp4-sqk2</code>
+| —
+| Newer addition — check <code>dgx-config status</code> / the dashboard for current topology and context details rather than trusting a description here.
 |-
 | <code>llama-3.3-70b</code>
 | 2-Node (56,000)
@@ -207,11 +219,14 @@ ssh tetrel@10.0.14.43 "sudo systemctl start docker"
 * '''"Out of Memory" (OOM) Errors:'''
 If a deployment fails instantly, it usually means the previous model wasn't cleaned up properly. Run <code>dgx-config teardown</code> to flush the GPUs before trying again.
 
+* '''A model shows as "CRASHED" or "ORPHANED":'''
+<code>CRASHED</code> means the engine process itself has died — check that host's logs (<code>dgx-config logs --host spark-4</code>) for the actual error, which is usually near the very end. <code>ORPHANED</code> specifically means a worker node's head counterpart crashed, leaving the worker alive but with nothing to serve — this needs a teardown, not a wait. Note that in a 2-node deploy, Docker reporting a container as "running" doesn't guarantee the model engine inside it is actually alive — the container can stay up (it's running the cluster coordination process) even after the model-serving process inside has crashed. The dashboard/CLI status logic accounts for this by reading the container's own logs rather than trusting container state alone, but if something ever looks "stuck" in a loading state for far longer than its estimate with no error shown, check the logs directly rather than assuming it's still working.
+
 * '''Single-Node vs. Multi-Node:'''
-Pay attention to the topology requirements — not every model supports both. Several catalog entries are 2-node-only (e.g. everything in the DeepSeek V4 Flash family, <code>qwen-3.5-122b</code>, <code>llama-3.3-70b</code>) because they need both Sparks' memory to fit. Trying to deploy a 2-node-only model with <code>--nodes 1</code> fails with a clear error rather than deploying incorrectly. If you're unsure, use <code>--dry-run</code> first.
+Pay attention to the topology requirements — not every model supports both. Several catalog entries are 2-node-only because they need both Sparks' memory to fit. Trying to deploy a 2-node-only model with <code>--nodes 1</code> fails with a clear error rather than deploying incorrectly. If you're unsure, use <code>--dry-run</code> first.
 
 * '''A deploy seems stuck on "COMPILING KERNELS":'''
-This is a real, expected stage on a genuinely fresh container — Triton/CUDA JIT-compiles kernels on first run, which can take a while. If it seems to be taking unusually long every single time (not just once), the persistent JIT cache mount may not be set up correctly on that host; worth flagging to an admin rather than repeatedly retrying, since retrying doesn't help if the cache mount itself is the problem.
+This is a real, expected stage on a genuinely fresh container — Triton/CUDA JIT-compiles kernels on first run, which can take a while. If it seems to be taking unusually long every single time (not just once), the persistent JIT cache mount may not be set up correctly on that host — run <code>dgx-config cache-inventory</code> to check what's actually cached before assuming something is broken; worth flagging to an admin rather than repeatedly retrying, since retrying doesn't help if the cache mount itself is the problem.
 
 * '''The model dropdown / catalog looks completely empty:'''
 This has happened for real, not just in theory: a single malformed recipe file can currently take down the '''entire''' catalog, not just itself, because the loader fails closed rather than skipping the one bad file. If the dropdown is unexpectedly empty (versus just missing one model you expected), that's the most likely cause — check whether a recipe file was recently added or edited, and flag it rather than assuming user error. <code>dgx-config status</code> from the CLI sometimes surfaces more detail than the dashboard does.

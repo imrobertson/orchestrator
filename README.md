@@ -20,7 +20,7 @@ This repository contains the `dgx-config` orchestration suite. It acts as the ce
  '''Role:''' Distributed vLLM worker execution target (`vllm-worker`).
  '''Hardware:''' NVIDIA Grace Blackwell GB10 (128GB LPDDR5x Unified Memory running headless).
  '''Docker Boot Policy:''' Docker auto-start is disabled. Start manually via `systemctl start docker`.
-* '''Host Model Cache Storage:''' `/home/tetrel/.cache/huggingface` is mapped directly to `/root/.cache/huggingface` inside vLLM containers via `volume_mount` to guarantee zero re-downloads across cold restarts. Also derives the Triton/CUDA JIT-compile cache mount paths (`/root/.triton_cache` and `/root/.nv/ComputeCache`).
+* '''Host Model Cache Storage:''' `/home/tetrel/.cache/huggingface` is mapped directly to `/root/.cache/huggingface` inside vLLM containers via `volume_mount` to guarantee zero re-downloads across cold restarts. The same host cache root also derives the JIT-compile cache mounts for Triton, TileLang, DeepGEMM, and vLLM (`/root/.cache/{triton,tilelang,deepgemm,vllm}`) plus `/root/.nv/ComputeCache` for the CUDA compute cache. Use `dgx-config cache-inventory` to see current usage per host, and `dgx-config prune-cache` to reclaim space when a host runs low (see CLI reference below).
 
 == Configuration ==
 
@@ -32,7 +32,7 @@ This repository contains the `dgx-config` orchestration suite. It acts as the ce
 
 == Model Catalog ==
 
-The catalog lives in `recipes/local/*.yaml` and `recipes/eugr/*.yaml` — one file per model. `models.yaml` is deprecated (supported via `USE_LEGACY_CATALOG=1`).
+The catalog lives in `recipes/local/*.yaml` and `recipes/eugr/*.yaml` — one file per model. `models.yaml` is deprecated (supported via `USE_LEGACY_CATALOG=1`). This is a living, growing set: new variants (different precisions, context/throughput tradeoffs, single-node vs. multi-node builds of the same base model) get added as needed, not on a fixed schedule — treat `dgx-config status` or the dashboard dropdown as the source of truth over any static documentation, including this file.
 
 === Recipe Schema ===
 
@@ -65,7 +65,7 @@ Image tags are not hardcoded into the Python orchestrator. `cluster_config.yaml`
 === 2. Global Multi-Model GPU VRAM Teardown Guard ===
 To prevent multiple vLLM models from stacking on the same GPU and causing immediate CUDA Out-Of-Memory (OOM) or port `8000` conflicts:
 
-* '''Pre-Deployment Purge:''' Before spawning any container, `execute_deployment` executes a global `docker rm -f vllm-standalone vllm-head vllm-worker` across all target nodes. This completely flushes GPU VRAM prior to container initialization.
+* '''Pre-Deployment Purge:''' Before spawning any container, `execute_deployment` tears down any existing containers across all target nodes first. Teardown is graceful, not an immediate kill: it sends SIGTERM to host processes and issues `docker stop` (allowing each container up to `TEARDOWN_GRACE_SEC` to exit cleanly) before falling back to `docker rm -f` as a backstop for anything still standing. All target hosts are torn down concurrently, not one after another — sequential per-host teardown left a worker node briefly alive and NCCL-connected to an already-vanished head during a prior release, which this concurrency avoids. Expect teardown to take up to roughly `3 x TEARDOWN_GRACE_SEC` seconds on a 2-node deploy; the dashboard's Teardown button reflects live phase progress for the duration.
 
 === 3. OpenMP Thread Fencing & CPU Scheduling Protections ===
 To prevent PyTorch and vLLM background worker threads from consuming 100% of available Grace ARM CPU cores during multi-node KV cache initialization, multi-node topologies enforce strict CPU thread limits:
@@ -74,7 +74,7 @@ To prevent PyTorch and vLLM background worker threads from consuming 100% of ava
 * '''Host System Impact:''' Restricts OpenMP thread pools to 16 cores per socket, guaranteeing sufficient CPU scheduling headroom for `sshd`, system daemons, and status polling threads.
 
 === 4. JIT-Compile Caching ===
-Every deploy mounts a persistent Triton/CUDA JIT-compile cache (`TRITON_CACHE_DIR`, `CUDA_CACHE_PATH`) derived from the same host directory as the HuggingFace cache mount, sized via `cluster_config.yaml`'s `tuning.jit_cache_maxsize_bytes`.
+Every deploy mounts a persistent JIT-compile cache covering Triton, TileLang, DeepGEMM, and vLLM's own kernel cache, plus the CUDA compute cache, all derived from the same host directory as the HuggingFace cache mount and sized via `cluster_config.yaml`'s `tuning.jit_cache_maxsize_bytes`. Use `dgx-config cache-inventory` to inspect what's cached per host (entry counts, sizes, age, LRU order) — read-only, safe to run against a live cluster at any time. `dgx-config prune-cache` performs LRU eviction of whole cache entries, and only when a host is below a configurable free-space floor; it never touches an individual file within an entry, since partial deletion of a Triton/TileLang cache entry can leave it in a state the loader treats as a hit and then fails to load.
 
 == Network Fabric & Transport ==
 
@@ -155,6 +155,7 @@ dgx-config authorize-key --key ~/.ssh/id_ed25519.pub
 
 * Dynamic API routing via `window.location.hostname`.
 * Displays real-time Docker logs in a full-width bottom panel.
+* Deploy, Teardown, and benchmark controls lock each other out while any one of them is in flight — Teardown shows live phase progress (signaling, stopping, removing) for the duration rather than a static "in progress" label.
 
 === CLI Command Options ===
 
@@ -165,6 +166,8 @@ dgx-config authorize-key --key ~/.ssh/id_ed25519.pub
 * '''Preview Deploy (Dry Run):''' `dgx-config deploy --model deepseek-v4-flash-0731-nvfp4 --nodes 2 --dry-run`
 * '''View Remote Container Logs:''' `dgx-config logs --host spark-4 --tail 100`
 * '''Authorize SSH Key:''' `dgx-config authorize-key --key ~/.ssh/id_ed25519.pub`
+* '''Inspect JIT Cache Usage (read-only):''' `dgx-config cache-inventory`
+* '''Reclaim JIT Cache Space:''' `dgx-config prune-cache --min-free-gb 50 --headroom-gb 20` (add `--dry-run` to preview without deleting anything — safe against a live cluster)
 
 == Operational Documentation & Incident History ==
 
@@ -174,7 +177,4 @@ For detailed failure mode resolutions, migration specs, and historical release l
 * **Release Tombstones & Fix History:** `docs/TOMBSTONES.md`
 * **Catalog Migration & Architecture Plan:** `docs/ARCHITECTURE-MIGRATION-PLAN.md`
 * **Upstream Reference Notes:** `docs/EUGR-REFERENCE-NOTES.md`
-
-```
-
-```
+* **Runtime Robustness Roadmap (v4 -> v5):** `docs/ROADMAP.md`

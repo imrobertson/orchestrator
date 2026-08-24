@@ -67,6 +67,7 @@ JIT_CACHE_ROOTS = [
     "~/.cache/tilelang",
     "~/.cache/deepgemm",
     "~/.cache/vllm",
+    "~/.cache/flashinfer",
 ]
 
 # Every cache root worth *looking at*, even ones prune_cluster_cache() will
@@ -76,6 +77,7 @@ INVENTORY_ROOTS = [
     ("tilelang", "~/.cache/tilelang"),
     ("deepgemm", "~/.cache/deepgemm"),
     ("vllm", "~/.cache/vllm"),
+    ("flashinfer", "~/.cache/flashinfer"),
     ("compute_cache", "~/.nv/ComputeCache"),
     ("huggingface", "~/.cache/huggingface"),
 ]
@@ -1301,12 +1303,6 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
             res = f.result()
             results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
 
-        _set_teardown_state(True, "removing", f"Removing containers on {host_list}...")
-        rm_futures = {h: WORKER_POOL.submit(_teardown_host_rm, ip) for h, ip in ips.items()}
-        for h, f in rm_futures.items():
-            res = f.result()
-            results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
-
         time.sleep(2)
         return results
     finally:
@@ -1466,7 +1462,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         for h in target_hosts:
             ip = HOSTS[h]["ip"]
             run_ssh(ip, None, ["sudo", "nvidia-smi", "-lgc", tuning.gpu_clock_lock], timeout=10)
-            run_ssh(ip, None, ["bash", "-c", "mkdir -p ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton ~/.cache/vllm"], timeout=10)
+            run_ssh(ip, None, ["bash", "-c", "mkdir -p ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton ~/.cache/vllm ~/.cache/flashinfer"], timeout=10)
 
     default_img = catalog_resp.get("catalog", {}).get("default_image", load_cluster_config().default_image)
     image_tag = model_config.get("image", default_img)
