@@ -11,9 +11,9 @@ mods: []
 topologies:
   2_node:
     max_model_len: 262144
-    tp_size: 1
-    pp_size: 2
-    # MULTI-NODE EXECUTOR REQUIREMENT: We MUST use Ray for multi-node deployments 
+    tp_size: 2
+    pp_size: 1
+    # MULTI-NODE EXECUTOR REQUIREMENT: We MUST use Ray for multi-node deployments
     # and set VLLM_USE_V1=0 to force the legacy V0 engine for cross-host RPC.
     env_vars:
     - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
