@@ -27,4 +27,4 @@ topologies:
       --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
       --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
       --max-num-seqs 1 --enable-prefix-caching
-      --speculative-config '{"method":"dspark","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"flashinfer_cutlass"}'
+      
