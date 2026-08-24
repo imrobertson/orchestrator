@@ -28,7 +28,7 @@ topologies:
     # - DO NOT add `--quantization modelopt_fp4` here to avoid container parser loops.
     # - `fp8` required for MLA KV cache.
     vllm_args: >-
-      --attention-backend B12X_ATTN --moe-backend flashinfer_cutlass
+      --attention-backend FLASH_ATTN --moe-backend flashinfer_cutlass
       --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
       --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
       --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
