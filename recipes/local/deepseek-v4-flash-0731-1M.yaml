@@ -20,7 +20,6 @@ topologies:
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
     - VLLM_USE_V1=0
-    - VLLM_USE_DEEP_GEMM=0
     vllm_args: >-
       --attention-backend B12X_ATTN --moe-backend flashinfer_cutlass
       --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
