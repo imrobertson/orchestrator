@@ -56,6 +56,7 @@ dgx-env/
 load_times.json
 benchmark_ledger.csv
 benchmark_results.txt
+*.json
 
 # ==============================================================================
 # TEST RECIPES (not ready to be baked into our repo yet and not going to pollute 

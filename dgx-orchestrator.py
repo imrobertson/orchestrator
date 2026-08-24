@@ -49,6 +49,15 @@ MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 LEDGER_PATH = BASE_DIR / "model_ledger.json"
 BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
 BENCHMARK_RESULTS_PATH = BASE_DIR / "benchmark_results.txt"
+# Records catalog_key -> hf_path (+ derived cache dirname) every time a
+# model is actually deployed. Exists so flush_model_cache() and
+# find_cached_models() can still identify a model's cache directory by its
+# OLD catalog key after the recipe file itself has been deleted -- without
+# this, the recipe was the only record of that mapping, and deleting the
+# recipe deleted the record along with it. Only starts covering a model
+# from the first deploy after this was introduced; it can't retroactively
+# know about something retired before that.
+HF_PATH_LEDGER_PATH = BASE_DIR / "hf_path_ledger.json"
 
 HOSTS = legacy_hosts_dict()
 
@@ -80,6 +89,13 @@ INVENTORY_ROOTS = [
     ("flashinfer", "~/.cache/flashinfer"),
     ("compute_cache", "~/.nv/ComputeCache"),
     ("huggingface", "~/.cache/huggingface"),
+    # "huggingface" above lists one level deep under ~/.cache/huggingface
+    # itself (hub/, modules/, xet/ as three lumped entries) -- useless for
+    # per-model attribution since every model's weights live inside that
+    # single "hub" entry together. This root targets hub/ directly, so
+    # each entry returned IS one model's models--org--repo directory,
+    # individually sized -- what find_cached_models() needs.
+    ("huggingface_models", "~/.cache/huggingface/hub"),
 ]
 
 # Runs on each Spark over SSH. argv: <roots_json> <target_free_bytes> <dry_run:0|1>
@@ -249,6 +265,77 @@ except Exception:
 report["mount_options"] = mount_opts
 
 print(json.dumps(report))
+'''
+
+# Flushes one model's HuggingFace weights cache, and optionally does a full
+# wipe of every JIT cache root on the host. Run on each Spark over SSH.
+# argv: <hf_cache_dir> <jit_roots_json> <dry_run:0|1>
+#
+# The HF weights removal is precise -- HuggingFace's own on-disk naming
+# convention (models--{org}--{repo}) makes it possible to compute the exact
+# directory for one model and remove only that.
+#
+# The JIT wipe, when requested, is NOT model-scoped -- it removes every
+# entry under every given root unconditionally. This is deliberate: JIT
+# cache entries are keyed by compiled-kernel signature, not by model name,
+# and there's no reliable way to attribute an entry to one specific model
+# (see docs/ROADMAP.md's "Cache integrity retrospection" entry). Passing an
+# empty jit_roots list skips this half entirely.
+_REMOTE_MODEL_FLUSH_SCRIPT = r'''
+import json, os, shutil, sys
+
+hf_cache_dir = sys.argv[1]
+jit_roots = json.loads(sys.argv[2])
+dry_run = sys.argv[3] == "1"
+
+def dir_size(path):
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            try:
+                total += os.lstat(fp).st_size
+            except OSError:
+                pass
+    return total
+
+result = {"hf_cache": None, "jit_caches": [], "dry_run": dry_run}
+
+hf_path = os.path.expanduser(hf_cache_dir)
+if os.path.isdir(hf_path):
+    size = dir_size(hf_path)
+    if dry_run:
+        status = "would delete"
+    else:
+        try:
+            shutil.rmtree(hf_path)
+            status = "deleted"
+        except OSError as exc:
+            status = "error: %s" % exc
+    result["hf_cache"] = {"path": hf_path, "bytes": size, "status": status}
+else:
+    result["hf_cache"] = {"path": hf_path, "bytes": 0, "status": "not found"}
+
+for root in jit_roots:
+    root_path = os.path.expanduser(root)
+    if not os.path.isdir(root_path):
+        continue
+    for name in os.listdir(root_path):
+        entry_path = os.path.join(root_path, name)
+        if not os.path.isdir(entry_path):
+            continue
+        size = dir_size(entry_path)
+        if dry_run:
+            status = "would delete"
+        else:
+            try:
+                shutil.rmtree(entry_path)
+                status = "deleted"
+            except OSError as exc:
+                status = "error: %s" % exc
+        result["jit_caches"].append({"path": entry_path, "bytes": size, "status": status})
+
+print(json.dumps(result))
 '''
 
 # --- Cluster Operation Lock ---
@@ -718,6 +805,251 @@ def cache_inventory(target_hosts: list = None) -> dict:
             "disk_total_gb": gb(data["disk_total_bytes"]),
             "roots": roots_summary,
         }
+
+    return {"status": "success", "hosts": results}
+
+def _hf_cache_dirname(hf_path: str) -> str:
+    """
+    Reproduces HuggingFace Hub's on-disk cache directory naming convention
+    for a repo_id -- 'org/Repo-Name' -> 'models--org--Repo-Name'. This is
+    what huggingface_hub's snapshot_download() actually creates under
+    ~/.cache/huggingface/hub/ (used both by vLLM's own model loading and
+    by cache_cluster_assets.py's pre-fetch path), so it's a reliable target
+    to compute without needing to inspect the filesystem first.
+    """
+    return "models--" + hf_path.replace("/", "--")
+
+def _record_hf_path(catalog_key: str, hf_path: str) -> None:
+    """
+    Persists catalog_key -> hf_path (+ derived cache dirname) every time a
+    model is deployed, so it can still be identified by that same catalog
+    key later even after its recipe file is deleted. Fires regardless of
+    whether the deploy attempt goes on to succeed -- the recipe genuinely
+    did specify this hf_path for this key at this point in time, which is
+    exactly the provenance record this exists to preserve.
+    """
+    data = {}
+    if HF_PATH_LEDGER_PATH.exists():
+        try: data = json.loads(HF_PATH_LEDGER_PATH.read_text())
+        except Exception: data = {}
+    data[catalog_key] = {
+        "hf_path": hf_path,
+        "cache_dirname": _hf_cache_dirname(hf_path),
+        "last_deployed": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try: HF_PATH_LEDGER_PATH.write_text(json.dumps(data, indent=2))
+    except Exception: pass
+
+def _load_hf_path_ledger() -> dict:
+    if not HF_PATH_LEDGER_PATH.exists():
+        return {}
+    try:
+        return json.loads(HF_PATH_LEDGER_PATH.read_text())
+    except Exception:
+        return {}
+
+def _resolve_model_to_hf_path(model: str) -> Optional[str]:
+    """
+    Resolution order:
+    1. A live catalog key -- current recipe still exists.
+    2. A catalog key recorded in the historical hf_path ledger -- the
+       recipe has since been deleted, but a prior deploy recorded the
+       mapping (see _record_hf_path). This is what makes "flush the
+       cache for a model I retired a while ago" usable by its old,
+       memorable catalog key rather than requiring the exact raw
+       hf_path (org/repo) to be typed correctly from memory.
+    3. A raw HF repo_id (org/repo) passed directly -- the fallback for a
+       model that was never deployed through this orchestrator (no
+       ledger entry) or predates the ledger's introduction.
+    """
+    catalog = load_model_catalog().get("catalog", {}).get("models", {})
+    if model in catalog:
+        return catalog[model].get("hf_path")
+
+    ledger = _load_hf_path_ledger()
+    if model in ledger:
+        return ledger[model].get("hf_path")
+
+    if "/" in model:
+        return model
+    return None
+
+def flush_model_cache(model: str, include_jit: bool = False, dry_run: bool = False, force: bool = False, target_hosts: list = None) -> dict:
+    """
+    Clears the on-disk cache for one model: HuggingFace weights always,
+    JIT/compute kernel caches optionally via include_jit.
+
+    Two real use cases this covers:
+    - Corruption: a partial/interrupted HF download leaves a directory the
+      loader will happily read as complete, which can surface as a
+      garbage-output or crash-on-load bug with no obvious cause. Deleting
+      the cache directory forces a clean re-download on the next deploy.
+    - Retirement: HF weights are by far the largest disk consumer per
+      model (multi-hundred-GB to multi-TB, vs. single-digit-MB JIT
+      caches) -- this is what actually matters for reclaiming space once
+      a model is no longer wanted.
+
+    include_jit does a FULL wipe of every JIT cache root on the target
+    host(s), not a model-scoped one -- JIT entries are keyed by compiled-
+    kernel signature (shapes, dtypes), not by model name, and we don't
+    have documented ground truth on Triton/TileLang/DeepGEMM/FlashInfer's
+    internal naming conventions to reliably attribute an entry to one
+    model (see docs/ROADMAP.md's "Cache integrity retrospection" entry).
+    This means include_jit affects every OTHER model's compiled kernels on
+    that host too, not just the target one -- opt-in and stated plainly in
+    every place this result gets printed, for exactly that reason.
+
+    The "is this model currently active" check below is best-effort, not a
+    guarantee: get_cluster_status()'s active_model field falls back to the
+    literal string "Active Container" whenever the loaded model can't be
+    parsed from the container command line -- which is the common case for
+    a 2-node Ray deploy (see docs/TROUBLESHOOTING.md #6 / ROADMAP.md's
+    engine-health-monitoring entry for why). In that situation this check
+    will not detect an active model and will not block. Confirm via
+    `dgx-config status` yourself before flushing anything you're not
+    certain is idle -- don't rely on this guard alone.
+    """
+    hf_path = _resolve_model_to_hf_path(model)
+    if not hf_path:
+        return {"status": "error",
+                "message": f"'{model}' not found in the current catalog and doesn't look like an HF repo_id (org/repo). "
+                           f"For an already-retired model, pass its hf_path directly."}
+
+    hosts_to_check = [h for h in (target_hosts if target_hosts else list(HOSTS.keys())) if h in HOSTS]
+
+    if not force:
+        status = get_cluster_status()
+        for host in hosts_to_check:
+            active_model = status.get("hosts", {}).get(host, {}).get("active_model", "None")
+            if active_model != "None" and (active_model in hf_path or hf_path.endswith(active_model)):
+                return {"status": "error",
+                        "message": f"Model appears currently loaded on {host} (active_model='{active_model}'). "
+                                   f"Teardown first, or pass force=True to override. NOTE: this check cannot see "
+                                   f"an active model on a 2-node Ray deploy where the engine's command line wasn't "
+                                   f"parseable (shows as 'Active Container') -- verify with 'dgx-config status' "
+                                   f"yourself if you're not sure."}
+
+    hf_cache_dir = f"~/.cache/huggingface/hub/{_hf_cache_dirname(hf_path)}"
+    jit_roots_arg = JIT_CACHE_ROOTS if include_jit else []
+
+    verb = "Dry-run evaluating" if dry_run else "Flushing"
+    print(f"[+] {verb} cache for '{model}' (hf_path: {hf_path}){' + full JIT cache wipe' if include_jit else ''}...")
+
+    results = {}
+    for host in hosts_to_check:
+        ip = HOSTS[host]["ip"]
+        cmd = ["python3", "-c", _REMOTE_MODEL_FLUSH_SCRIPT, hf_cache_dir, json.dumps(jit_roots_arg), "1" if dry_run else "0"]
+        res = run_ssh(ip, None, cmd, capture=True, timeout=120)
+
+        if res.returncode != 0:
+            msg = res.stderr.strip() or "flush script failed"
+            print(f"  [{host}] ERROR: {msg}")
+            results[host] = {"status": "error", "message": msg}
+            continue
+
+        try:
+            data = json.loads(res.stdout.strip())
+        except Exception as exc:
+            results[host] = {"status": "error", "message": f"unparseable output: {exc}"}
+            continue
+
+        gb = lambda b: round(b / (1024 ** 3), 2)
+        hf_result = data["hf_cache"]
+        jit_results = data["jit_caches"]
+        jit_gb = gb(sum(e["bytes"] for e in jit_results))
+
+        results[host] = {
+            "status": "ok",
+            "hf_cache_path": hf_result["path"],
+            "hf_cache_gb": gb(hf_result["bytes"]),
+            "hf_cache_action": hf_result["status"],
+            "jit_entries_flushed": len(jit_results),
+            "jit_gb_flushed": jit_gb,
+            "dry_run": dry_run,
+        }
+
+        print(f"  [{host}] HF cache ({results[host]['hf_cache_gb']} GB): {hf_result['status']}")
+        if include_jit:
+            print(f"  [{host}] JIT caches: {len(jit_results)} entries, {jit_gb} GB -- ALL models on this host affected, not just '{model}'.")
+
+    return {"status": "success", "model": model, "hf_path": hf_path, "include_jit": include_jit, "details": results}
+
+def find_cached_models(target_hosts: list = None) -> dict:
+    """
+    Cross-references every per-model directory under
+    ~/.cache/huggingface/hub/ (via the huggingface_models inventory root)
+    against the live catalog and the historical hf_path ledger, so
+    retired/orphaned model weight caches can be found without needing to
+    already know their names -- the whole point of this command versus
+    flush_model_cache(), which requires you to name a specific model.
+
+    Three statuses per cached directory:
+    - "active": hf_path matches a model currently in the catalog.
+    - "retired (known)": no longer in the catalog, but a prior deploy's
+      ledger entry (_record_hf_path) identifies which catalog key it
+      used to be.
+    - "orphaned (no record)": matches neither. Either never deployed
+      through this orchestrator, or the model was retired before the
+      hf_path ledger existed to record it -- the ledger only covers
+      deploys from its own introduction forward, it can't retroactively
+      know about anything before that. Still fully identifiable and
+      flushable by its raw cache directory name (pass it to
+      flush_model_cache as a raw hf_path: replace the leading
+      "models--" and the remaining "--" separators back to "/" -- e.g.
+      "models--org--Model-Name" -> "org/Model-Name" -- though the exact
+      original hf_path can't be guaranteed reconstructible if the repo
+      name itself legitimately contained "--").
+    """
+    catalog = load_model_catalog().get("catalog", {}).get("models", {})
+    live_dirname_to_key = {}
+    for key, m in catalog.items():
+        hf_path = m.get("hf_path")
+        if hf_path:
+            live_dirname_to_key[_hf_cache_dirname(hf_path)] = key
+
+    ledger = _load_hf_path_ledger()
+    ledger_dirname_to_key = {}
+    for key, entry in ledger.items():
+        dirname = entry.get("cache_dirname")
+        if not dirname and entry.get("hf_path"):
+            dirname = _hf_cache_dirname(entry["hf_path"])
+        # Live catalog entries take priority if a key somehow appears in
+        # both -- the ledger is a fallback, not an override.
+        if dirname and dirname not in live_dirname_to_key:
+            ledger_dirname_to_key[dirname] = key
+
+    inv = cache_inventory(target_hosts)
+    results = {}
+    for host, data in inv.get("hosts", {}).items():
+        if data.get("status") != "ok":
+            results[host] = data
+            continue
+
+        hub_root = data.get("roots", {}).get("huggingface_models", {})
+        entries = hub_root.get("entries", [])
+        annotated = []
+        for e in entries:
+            dirname = e["name"]
+            if dirname in live_dirname_to_key:
+                status = "active"
+                matched_model = live_dirname_to_key[dirname]
+            elif dirname in ledger_dirname_to_key:
+                status = "retired (known)"
+                matched_model = ledger_dirname_to_key[dirname]
+            else:
+                status = "orphaned (no record)"
+                matched_model = None
+
+            annotated.append({
+                "cache_dirname": dirname,
+                "matched_model": matched_model,
+                "status": status,
+                "gb": round(e["bytes"] / (1024 ** 3), 2),
+                "age_days": e["age_days"],
+            })
+
+        annotated.sort(key=lambda x: x["gb"], reverse=True)
+        results[host] = {"status": "ok", "models": annotated}
 
     return {"status": "success", "hosts": results}
 
@@ -1432,18 +1764,6 @@ def authorize_user_key(public_key_path: str) -> dict:
         results[host] = "Authorized" if res.returncode == 0 else f"Failed: {res.stderr.strip()}"
     return {"status": "success", "details": results}
 
-def execute_sync() -> dict:
-    results = {}
-    if not MODELS_YAML_PATH.exists(): return {"status": "error", "message": "models.yaml missing locally."}
-    yaml_content = MODELS_YAML_PATH.read_text()
-    escaped_yaml = shlex.quote(yaml_content)
-    for host, meta in HOSTS.items():
-        ip = meta["ip"]
-        cmd = ["bash", "-c", f"mkdir -p /opt/dgx-cluster-control && echo {escaped_yaml} > /opt/dgx-cluster-control/models.yaml"]
-        res = run_ssh(ip, None, cmd, timeout=10)
-        results[host] = "Synced models.yaml" if res.returncode == 0 else f"Failed: {res.stderr.strip()}"
-    return {"status": "success", "details": results}
-
 def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
     deploy_start_time = time.time()
     docker_run_commands: dict = {}
@@ -1471,6 +1791,8 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
     topo_config = topologies[topo_key]
     hf_path = model_config.get("hf_path", model)
+    if not dry_run:
+        _record_hf_path(model, hf_path)
     gpu_util = model_config.get("gpu_util", 0.75)
     max_model_len = topo_config.get("max_model_len", 32768)
     tp_size = topo_config.get("tp_size", 1)
@@ -1813,6 +2135,12 @@ if HAS_FASTAPI:
         headroom_gb: int = 20
         dry_run: bool = False
 
+    class FlushModelCacheRequest(BaseModel):
+        model: str  # catalog key, or a raw HF repo_id (org/repo) for an already-retired model
+        include_jit: bool = False
+        dry_run: bool = False
+        force: bool = False
+
     @app.get("/api/status")
     def api_status(): return get_cluster_status()
 
@@ -1854,6 +2182,16 @@ if HAS_FASTAPI:
     def api_prune_cache(req: PruneCacheRequest):
         return prune_cluster_cache(req.min_free_gb, req.headroom_gb, req.dry_run)
 
+    @app.post("/api/flush-model-cache")
+    def api_flush_model_cache(req: FlushModelCacheRequest):
+        res = flush_model_cache(req.model, include_jit=req.include_jit, dry_run=req.dry_run, force=req.force)
+        if res.get("status") != "success": raise HTTPException(status_code=400, detail=res.get("message", "Flush failed"))
+        return res
+
+    @app.get("/api/list-cached-models")
+    def api_list_cached_models():
+        return find_cached_models()
+
 def _telemetry_daemon_loop():
     """Background polling loop for maintaining lifetime and session analytics."""
     while True:
@@ -1877,7 +2215,6 @@ def main():
     subparsers.add_parser("status")
     subparsers.add_parser("teardown")
     subparsers.add_parser("menu")
-    subparsers.add_parser("sync")
     subparsers.add_parser("cache-inventory", help="Read-only cache snapshot across the cluster. No deletion, safe against production.")
 
     deploy_parser = subparsers.add_parser("deploy")
@@ -1901,10 +2238,18 @@ def main():
     prune_parser.add_argument("--headroom-gb", type=int, default=20, help="When evicting, free up to floor+headroom so the next deploy doesn't re-trigger immediately.")
     prune_parser.add_argument("--dry-run", action="store_true", help="Report what would be evicted and why, without deleting anything. Safe against production.")
 
+    flush_parser = subparsers.add_parser("flush-model-cache", help="Clear one model's HuggingFace weights cache (and optionally JIT caches) to recover from corruption or reclaim space for a retired model.")
+    flush_parser.add_argument("--model", required=True, help="Catalog key (live or historically-recorded), or a raw HF repo_id (org/repo) as a last resort.")
+    flush_parser.add_argument("--jit", action="store_true", help="Also wipe ALL JIT/compute caches on the target host(s) -- affects every model's compiled kernels on that host, not just this one.")
+    flush_parser.add_argument("--dry-run", action="store_true", help="Report what would be deleted and its size, without deleting anything.")
+    flush_parser.add_argument("--force", action="store_true", help="Proceed even if the model appears currently loaded (see the command's own caveat about this check's reliability on 2-node Ray deploys).")
+
+    subparsers.add_parser("list-cached-models", help="Cross-reference cached model weights against the live catalog and deploy history to surface active/retired/orphaned caches worth reviewing. Read-only.")
+
     cli_parser = subparsers.add_parser("cli")
     cli_sub = cli_parser.add_subparsers(dest="cli_action")
 
-    for cmd in ["status", "teardown", "menu", "sync", "cache-inventory"]:
+    for cmd in ["status", "teardown", "menu", "cache-inventory", "list-cached-models"]:
         cli_sub.add_parser(cmd)
         
     cli_sub.add_parser("daemon").add_argument("--port", type=int, default=5001)
@@ -1930,6 +2275,12 @@ def main():
     cli_prune.add_argument("--headroom-gb", type=int, default=20)
     cli_prune.add_argument("--dry-run", action="store_true")
 
+    cli_flush = cli_sub.add_parser("flush-model-cache")
+    cli_flush.add_argument("--model", required=True)
+    cli_flush.add_argument("--jit", action="store_true")
+    cli_flush.add_argument("--dry-run", action="store_true")
+    cli_flush.add_argument("--force", action="store_true")
+
     args = parser.parse_args()
     subcommand = args.subcommand
     if subcommand == "cli": subcommand = getattr(args, "cli_action", None) or "menu"
@@ -1950,7 +2301,6 @@ def main():
     elif subcommand == "deploy": print(json.dumps(execute_deployment(args.model, args.nodes, args.head, os.environ.get("USER") or getpass.getuser(), wait=getattr(args, "wait", False), run_benchmark=getattr(args, "benchmark", False), dry_run=getattr(args, "dry_run", False)), indent=2))
     elif subcommand == "logs": print("\n".join(get_container_logs(args.host, args.tail).get("logs", [])))
     elif subcommand == "authorize-key": print(json.dumps(authorize_user_key(args.key), indent=2))
-    elif subcommand == "sync": print(json.dumps(execute_sync(), indent=2))
     elif subcommand == "cache-inventory":
         inv = cache_inventory()
         for host, data in inv["hosts"].items():
@@ -1979,6 +2329,37 @@ def main():
                 print("  Above floor -- nothing considered.")
             else:
                 print(f"  {verb} {s['entries_evicted']}/{s['entries_total']} entries, {s['gb_freed']} GB, oldest-first.")
+        print("\n--- full detail ---")
+        print(json.dumps(res, indent=2))
+    elif subcommand == "flush-model-cache":
+        res = flush_model_cache(args.model, include_jit=getattr(args, "jit", False),
+                                 dry_run=getattr(args, "dry_run", False), force=getattr(args, "force", False))
+        if res.get("status") != "success":
+            print(json.dumps(res, indent=2))
+        else:
+            for host, s in res["details"].items():
+                if s.get("status") != "ok":
+                    print(f"[{host}] ERROR: {s.get('message')}")
+                    continue
+                verb = "Would flush" if s["dry_run"] else "Flushed"
+                print(f"\n=== {host} === {verb} HF cache for {res['hf_path']}: {s['hf_cache_gb']} GB ({s['hf_cache_action']})")
+                if res["include_jit"]:
+                    print(f"  Also {verb.lower()} {s['jit_entries_flushed']} JIT cache entries ({s['jit_gb_flushed']} GB) -- ALL models on this host affected, not just '{res['model']}'.")
+            print("\n--- full detail ---")
+            print(json.dumps(res, indent=2))
+    elif subcommand == "list-cached-models":
+        res = find_cached_models()
+        for host, data in res["hosts"].items():
+            if data.get("status") != "ok":
+                print(f"[{host}] ERROR: {data.get('message')}")
+                continue
+            print(f"\n=== {host} ===")
+            if not data["models"]:
+                print("  No cached model weights found.")
+                continue
+            for m in data["models"]:
+                label = m["matched_model"] or m["cache_dirname"]
+                print(f"  [{m['status']}] {label} -- {m['gb']} GB, {m['age_days']}d old")
         print("\n--- full detail ---")
         print(json.dumps(res, indent=2))
     else: interactive_menu()
