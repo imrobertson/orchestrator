@@ -1,7 +1,7 @@
 recipe_version: '1'
 hf_path: deepseek-ai/DeepSeek-V4-Flash-0731
 image: eugr/spark-vllm-b12x:latest
-gpu_util: 0.90
+gpu_util: 0.82
 capability:
   task: null
   context_class: null
@@ -10,8 +10,8 @@ mods: []
 topologies:
   2_node:
     max_model_len: 1048576
-    tp_size: 1
-    pp_size: 2
+    tp_size: 2
+    pp_size: 1
     env_vars:
     - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
     - OMP_NUM_THREADS=16
@@ -19,11 +19,22 @@ topologies:
     - NCCL_IB_GID_INDEX=3
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
-    - VLLM_USE_V1=0
+    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=3600
+    - VLLM_RPC_TIMEOUT=3600
+    # Changed from tp_size=1/pp_size=2 to tp_size=2/pp_size=1: every other
+    # 2-node DeepSeek recipe in this repo uses TP, and every public 2x-GB10
+    # DeepSeek-V4-Flash recipe found externally (tonyd2wild's repos,
+    # hazyumps, MiaAI-Lab, vLLM's own recipes page) uses TP=2 as well --
+    # vLLM's own recipe page cites a single GB10's 128GB unified memory
+    # being below the checkpoint footprint as the reason TP over PP.
+    # PP=2 was untested anywhere else we could find for this model/hardware
+    # combo. VLLM_USE_V1=0 removed -- confirmed ignored on this image.
+    # gpu_util dropped 0.90 -> 0.82 to match sibling recipes and the
+    # 0.78-0.85 range seen across every external 1M-context recipe found.
     vllm_args: >-
       --attention-backend B12X_ATTN --moe-backend flashinfer_cutlass
       --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
       --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
       --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
       --max-num-seqs 1 --enable-prefix-caching
-      
+

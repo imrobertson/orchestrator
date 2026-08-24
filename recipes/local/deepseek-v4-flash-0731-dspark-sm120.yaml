@@ -1,0 +1,59 @@
+recipe_version: '1'
+hf_path: deepseek-ai/DeepSeek-V4-Flash-0731
+image: orthozany/vllm-jasl-dsv4:pr41834-2026-05-13
+gpu_util: 0.85
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+topologies:
+  2_node:
+    # UNVALIDATED -- first smoke test of this image against this checkpoint.
+    # Deliberately small max_model_len/max_num_seqs: the goal here is a fast
+    # yes/no on "does DSpark even load and generate coherent output on 0731
+    # with this image", not a real serving config. The full model (~167GB)
+    # cannot fit on a single GB10 (128GB unified memory) regardless of
+    # context length, so this still has to be a 2-node boot -- there's no
+    # cheaper single-node version of this test for this checkpoint.
+    # Once this boots and produces coherent, correctly-accepted output,
+    # scale max_model_len/max_num_seqs up from here rather than jumping
+    # straight to the 1M profile.
+    max_model_len: 32768
+    tp_size: 2
+    pp_size: 1
+    env_vars:
+    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+    - OMP_NUM_THREADS=16
+    - NCCL_CUMEM_ENABLE=0
+    - NCCL_IB_GID_INDEX=3
+    - NCCL_SOCKET_IFNAME=enp1s0f0np0
+    - GLOO_SOCKET_IFNAME=enp1s0f0np0
+    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=3600
+    - VLLM_RPC_TIMEOUT=3600
+    # No --attention-backend / --moe-backend b12x flags here: this is a
+    # different kernel lineage from eugr/spark-vllm-b12x (jasl's fork uses
+    # its own SM12x Triton/CuTeDSL fallback kernels, not B12X_ATTN/b12x).
+    # Those flags likely don't exist on this image and would fail to parse
+    # or silently no-op. Leaving attention backend unset lets vLLM
+    # auto-select the DeepSeek-V4 sparse MLA path, per third-party
+    # troubleshooting notes for this exact image lineage -- unverified by us
+    # directly, first thing to confirm from boot logs.
+    #
+    # num_speculative_tokens: 7 / draft_sample_method: greedy matches
+    # DeepSeek's own official recommended command for 0731 DSpark (per the
+    # eugr project's own issue tracker quoting it). Third-party reports on a
+    # *different* DSpark checkpoint build found num_speculative_tokens must
+    # equal that checkpoint's dspark_block_size (5, not 7) or generation
+    # crashes after boot -- if this fails the same way, that's the first
+    # thing to try changing.
+    vllm_args: >-
+      --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
+      --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
+      --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
+      --max-num-seqs 1 --enable-prefix-caching
+      --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy"}'
+    # --enforce-eager kept for this first attempt to reduce the number of
+    # unfamiliar failure modes (CUDA graph capture on an untested kernel
+    # path) stacked on top of an already-untested image/checkpoint/spec-decode
+    # combination. Drop it once this boots cleanly and generates correctly.
