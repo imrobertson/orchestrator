@@ -154,6 +154,25 @@
         .btn-action { background: #0891b2; margin-bottom: 10px; }
         .btn-action:hover:not(:disabled) { background: #0e7490; }
 
+        /* Small inline button for the log panel -- distinct from .btn,
+           which is full-width and meant for the primary deploy/teardown
+           actions. This one sits inline next to the host selector. */
+        .btn-copy-logs {
+            background: #334155;
+            color: #cbd5e1;
+            border: 1px solid #475569;
+            padding: 5px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+            transition: background 0.15s, color 0.15s;
+        }
+        .btn-copy-logs:hover { background: #475569; color: var(--text-main); }
+        .btn-copy-logs.copied { background: #065f46; color: #34d399; border-color: #065f46; }
+        .btn-copy-logs.copy-failed { background: #7f1d1d; color: #f87171; border-color: #7f1d1d; }
+
         /* Toast Line */
         .status-toast {
             margin-top: 6px;
@@ -204,6 +223,7 @@
         }
         .log-header-row h2 { margin: 0; border: none; padding: 0; }
         .log-header-row select { width: auto; min-height: 32px; padding: 4px 10px; margin: 0; font-size: 12px; }
+        .log-header-controls { display: flex; align-items: center; gap: 8px; }
         
         pre#logBox {
             background: var(--bg-dark);
@@ -344,10 +364,13 @@
         <div class="card log-card">
             <div class="log-header-row">
                 <h2>Live Logs (<span id="logHostLabel">spark-4</span>)</h2>
-                <select id="logHostSelect" onchange="updateLogHost()">
-                    <option value="spark-4">spark-4 Node</option>
-                    <option value="spark-3">spark-3 Node</option>
-                </select>
+                <div class="log-header-controls">
+                    <button id="copyLogsBtn" class="btn-copy-logs" onclick="copyLogs()" title="Copy the currently displayed logs to clipboard">📋 Copy</button>
+                    <select id="logHostSelect" onchange="updateLogHost()">
+                        <option value="spark-4">spark-4 Node</option>
+                        <option value="spark-3">spark-3 Node</option>
+                    </select>
+                </div>
             </div>
             <pre id="logBox">Loading logs...</pre>
         </div>
@@ -806,6 +829,68 @@
         currentLogHost = document.getElementById('logHostSelect').value;
         document.getElementById('logHostLabel').innerText = currentLogHost;
         fetchLogs();
+    }
+
+    // Copies exactly what's currently rendered in the log panel. Reads the
+    // text directly from the DOM via JS rather than relying on the user
+    // manually selecting text and hitting Cmd/Ctrl+C -- fetchLogs() runs
+    // every 5s and replaces logBox's content wholesale, which can
+    // interrupt or silently invalidate a manual selection mid-copy.
+    //
+    // navigator.clipboard requires a secure context (https, or localhost)
+    // and is unavailable on a plain http://<lan-hostname>:port origin like
+    // this dashboard's -- so it can't be relied on alone here. Falls back
+    // to the older execCommand('copy') path via a hidden textarea, which
+    // still works over plain HTTP.
+    async function copyLogs() {
+        const logBox = document.getElementById('logBox');
+        const btn = document.getElementById('copyLogsBtn');
+        const text = logBox.innerText;
+        const origLabel = btn.innerText;
+
+        async function viaClipboardApi() {
+            if (!navigator.clipboard || !window.isSecureContext) return false;
+            try {
+                await navigator.clipboard.writeText(text);
+                return true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        function viaExecCommand() {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.top = '0';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            let ok = false;
+            try {
+                ok = document.execCommand('copy');
+            } catch (e) {
+                ok = false;
+            }
+            document.body.removeChild(ta);
+            return ok;
+        }
+
+        const success = (await viaClipboardApi()) || viaExecCommand();
+
+        btn.classList.remove('copied', 'copy-failed');
+        if (success) {
+            btn.innerText = '✓ Copied';
+            btn.classList.add('copied');
+        } else {
+            btn.innerText = 'Copy failed';
+            btn.classList.add('copy-failed');
+        }
+        setTimeout(() => {
+            btn.innerText = origLabel;
+            btn.classList.remove('copied', 'copy-failed');
+        }, 1500);
     }
 
     async function triggerDeploy() {

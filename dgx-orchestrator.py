@@ -500,21 +500,36 @@ def parse_iso_time(ts_str: str) -> float:
 
 _LOG_LINE_PREFIX_RE = re.compile(r'^\([^)]*\)\s*')  # e.g. "(APIServer pid=2331) "
 
+_ARGPARSE_ERROR_RE = re.compile(r'^\S+:\s*error:\s')
+
 def _detect_crash_signature(clean_text: str) -> Optional[str]:
     """
-    Returns a short crash reason if the log tail contains an unhandled
-    Python traceback, else None.
+    Returns a short crash reason if the log tail contains either an
+    unhandled Python traceback OR an argparse-style CLI usage error, else
+    None.
 
-    This exists because detect_model_stage()'s keyword scan below matches
-    on substrings anywhere in the log -- including inside an exception's
-    OWN error message. A ValueError reading "nvfp4 KV cache is not
-    supported with MLA backends" contains the literal phrase "kv cache"
-    and silently matched the WARMUP bucket, reporting a definitively
-    crashed engine as "NOT READY - WARMUP" with an ETA that counted up
-    forever since nothing was ever going to finish. Checking for a
-    traceback FIRST and short-circuiting avoids this whole class of false
-    positive regardless of what a future crash's error text happens to
-    contain -- not just this one specific message.
+    Traceback detection exists because detect_model_stage()'s keyword scan
+    below matches on substrings anywhere in the log -- including inside an
+    exception's OWN error message. A ValueError reading "nvfp4 KV cache is
+    not supported with MLA backends" contains the literal phrase "kv
+    cache" and silently matched the WARMUP bucket, reporting a
+    definitively crashed engine as "NOT READY - WARMUP" with an ETA that
+    counted up forever since nothing was ever going to finish. Checking
+    for a traceback FIRST and short-circuiting avoids this whole class of
+    false positive regardless of what a future crash's error text happens
+    to contain -- not just this one specific message.
+
+    The argparse branch exists because a malformed CLI argument (observed
+    live: a flag accidentally inserted between --speculative-config and
+    its JSON value, splitting them) causes vLLM's arg parser to exit via
+    `parser.error()` -- which prints a usage dump and a single
+    "<prog>: error: <message>" line, with NO traceback at all. Without
+    this branch, that failure fell through every keyword bucket below
+    (hyphenated flag names like `--kv-cache-dtype` don't collide with the
+    space-delimited "kv cache" WARMUP keyword the way natural-language
+    error prose does) and landed on the default "NOT READY - INITIALIZING"
+    -- still wrong, still counting an ETA against a process that's already
+    exited, just less dramatically wrong than the WARMUP misfire.
 
     Also matters because in a 2-node Ray deploy, the container's PID 1 is
     `ray start --block`, not the vLLM engine -- the engine runs as a
@@ -523,20 +538,33 @@ def _detect_crash_signature(clean_text: str) -> Optional[str]:
     fine) even after the engine itself has crashed, so container-level
     health alone can't be trusted here; the logs are the only signal.
     """
-    if "traceback (most recent call last)" not in clean_text.lower():
-        return None
-
-    # Walk backward for the actual exception line -- by Python convention
-    # the last non-empty line after a traceback is "SomeError: message" or
-    # "pkg.mod.SomeError: message". vLLM's multi-process API server
-    # prefixes every log line with e.g. "(APIServer pid=2331) ", which has
-    # to be stripped first or the line-start anchor never matches.
+    lower = clean_text.lower()
     lines = [l.strip() for l in clean_text.splitlines() if l.strip()]
+
+    if "traceback (most recent call last)" in lower:
+        # Walk backward for the actual exception line -- by Python
+        # convention the last non-empty line after a traceback is
+        # "SomeError: message" or "pkg.mod.SomeError: message". vLLM's
+        # multi-process API server prefixes every log line with e.g.
+        # "(APIServer pid=2331) ", which has to be stripped first or the
+        # line-start anchor never matches.
+        for line in reversed(lines):
+            stripped = _LOG_LINE_PREFIX_RE.sub('', line)
+            if re.match(r'^[\w.]+(?:Error|Exception):\s', stripped):
+                return stripped[:160]
+        return "Unhandled exception (see logs)"
+
+    # No traceback -- check for an argparse-style usage error instead.
+    # This happens early in process startup, before vLLM's multi-process
+    # logging wrapper is even active, so the "(APIServer pid=...)" prefix
+    # is typically absent -- the strip below is a no-op in that case,
+    # which is fine.
     for line in reversed(lines):
         stripped = _LOG_LINE_PREFIX_RE.sub('', line)
-        if re.match(r'^[\w.]+(?:Error|Exception):\s', stripped):
+        if _ARGPARSE_ERROR_RE.match(stripped):
             return stripped[:160]
-    return "Unhandled exception (see logs)"
+
+    return None
 
 def detect_model_stage(ip: str, user: str, c_name: str) -> str:
     res = run_ssh(ip, user, ["docker", "logs", "--tail", "250", c_name], timeout=10)
