@@ -33,5 +33,5 @@ topologies:
       --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
       --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
       --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
-      --max-num-seqs 2 --enable-prefix-caching
-      --speculative-config '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic","moe_backend":"flashinfer_cutlass"}'
+      --max-num-seqs 1 --enable-prefix-caching
+      --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","moe_backend":"flashinfer_cutlass"}'
