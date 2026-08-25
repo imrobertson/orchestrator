@@ -245,6 +245,7 @@
             flex-shrink: 0;
         }
         .log-header-row h2 { margin: 0; border: none; padding: 0; }
+        .log-tz-label { font-size: 11px; font-weight: 400; opacity: 0.55; margin-left: 6px; text-transform: none; }
         .log-header-row select { width: auto; min-height: 32px; padding: 4px 10px; margin: 0; font-size: 12px; }
         .log-header-controls { display: flex; align-items: center; gap: 8px; }
         
@@ -406,7 +407,7 @@
     <div class="log-section">
         <div class="card log-card">
             <div class="log-header-row">
-                <h2>Live Logs (<span id="logHostLabel">spark-4</span>)</h2>
+                <h2>Live Logs (<span id="logHostLabel">spark-4</span>) <span class="log-tz-label">timestamps: UTC</span></h2>
                 <div class="log-header-controls">
                     <button id="copyLogsBtn" class="btn-copy-logs" onclick="copyLogs()" title="Copy the currently displayed logs to clipboard">📋 Copy</button>
                     <select id="logHostSelect" onchange="updateLogHost()">
@@ -560,11 +561,22 @@
         if (benchBtn) benchBtn.disabled = benchBtn.disabled || busy;
     }
 
+    // Backend always emits UTC as an unambiguous ISO 8601 string
+    // (e.g. "2026-08-25T13:51:00Z"). Deliberately NOT converted to
+    // browser-local -- this clock exists to be diffed directly against
+    // the UTC timestamps in the log pane below, not to tell time of day.
+    function formatUtc(isoString) {
+        if (!isoString) return '--';
+        const d = new Date(isoString);
+        if (isNaN(d.getTime())) return isoString; // fallback: show raw value rather than hide it
+        return d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
+    }
+
     async function fetchStatus() {
         try {
             const res = await fetch(`${API_BASE}/status`);
             const data = await res.json();
-            document.getElementById('serverClock').innerText = `Server Time: ${data.server_time}`;
+            document.getElementById('serverClock').innerText = `Server Time: ${formatUtc(data.server_time)}`;
             
             latestSessionStats = data.session_stats;
             isBenchmarking = data.is_benchmarking || false;

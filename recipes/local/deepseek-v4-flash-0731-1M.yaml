@@ -1,7 +1,7 @@
 recipe_version: '1'
 hf_path: deepseek-ai/DeepSeek-V4-Flash-0731
 image: eugr/spark-vllm-b12x:latest
-gpu_util: 0.82
+gpu_util: 0.75
 capability:
   task: null
   context_class: null
