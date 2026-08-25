@@ -56,6 +56,20 @@ class TuningConfig(BaseModel):
     deploy_poll_interval_sec: int = 15
     jit_cache_maxsize_bytes: int = 10_737_418_240  # 10GB
 
+    # Opt-in debug mode for chasing silent worker deaths (e.g. an unlogged
+    # RayWorkerProc crash from a bad CUDA kernel launch): forces synchronous
+    # kernel launches so a fault raises at its actual call site instead of
+    # surfacing later as an opaque "died unexpectedly". Costs real decode
+    # throughput -- leave false for normal serving.
+    debug_launch_blocking: bool = False
+
+    # Age-based retention for the per-deploy Ray/crash log dirs persisted
+    # under ~/.cache/ray-logs/<deploy_run_id>/<host> (see
+    # dgx-orchestrator.py's _jit_cache_mounts_and_env). Consumed by
+    # prune_cluster_ray_logs(); unlike JIT cache eviction this is not tied
+    # to a free-space floor since these logs are tiny by comparison.
+    crash_log_retention_days: int = 7
+
 
 class ClusterConfig(BaseModel):
     ssh_user: str

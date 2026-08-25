@@ -48,6 +48,20 @@ tuning:
   # into every deployed container -- see _jit_cache_mounts_and_env().
   jit_cache_maxsize_bytes: 10737418240  # 10GB
 
+  # When true, sets CUDA_LAUNCH_BLOCKING=1 in every deployed container,
+  # forcing synchronous kernel launches so a kernel-level fault raises a
+  # normal traceback at its actual call site instead of surfacing later as
+  # an opaque "RayWorkerProc died unexpectedly" with no stack. Costs real
+  # decode throughput -- only flip on while actively chasing a repro of a
+  # silent crash, then flip back off.
+  debug_launch_blocking: false
+
+  # Retention (days) for the per-deploy Ray/crash log dirs under
+  # ~/.cache/ray-logs/<deploy_run_id>/<host>, consumed by
+  # `dgx-config prune-ray-logs`. These are tiny relative to JIT/HF caches,
+  # so cleanup is time-based rather than tied to a free-space floor.
+  crash_log_retention_days: 7
+
 hosts:
   spark-4:
     alias: spark-9dbe

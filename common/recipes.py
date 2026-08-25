@@ -40,6 +40,8 @@ objects. See build_catalog_response() below.
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -98,7 +100,62 @@ class RecipeConfig(BaseModel):
     gpu_util: float
     capability: CapabilityConfig = Field(default_factory=CapabilityConfig)
     mods: list = Field(default_factory=list)
+    # Free-form, optional. Human-readable context that doesn't fit any
+    # structured field -- known quirks, why a flag is set the way it is,
+    # links to an upstream issue, etc. Surfaced under the model
+    # characteristics strip in the dashboard. Not read by anything in the
+    # deploy path; purely informational.
+    notes: Optional[str] = None
     topologies: dict[str, TopologyConfig]
+
+
+def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
+    """
+    Stable content hash identifying "this exact launch configuration" for
+    (recipe, topo_key) -- i.e. the fields that actually reach `docker run` /
+    `vllm serve`, not the filename. A recipe can be edited into a materially
+    different config without a rename (a changed vllm_args stanza, a bumped
+    gpu_util, a swapped image), and the previous filename-keyed notion of
+    "this model has launched successfully" can't tell that apart from "this
+    exact configuration has launched successfully" -- it would keep
+    reporting stale success for a config that was never actually run. This
+    hash is the join key that fixes that: see _record_launch_success() /
+    enrich_catalog() in dgx-orchestrator.py for where it's compared against
+    launch history.
+
+    Deliberately narrow about what's included:
+      - hf_path, image, gpu_util, and topo_key's max_model_len / tp_size /
+        pp_size / env_vars / vllm_args -- everything that changes what
+        actually gets launched.
+      - env_vars is sorted before hashing: reordering entries in the list
+        changes nothing about the resulting `docker run -e ...` flags, so it
+        shouldn't invalidate "tested" status. vllm_args is hashed as the raw
+        string (not shlex-split/reordered) -- simpler, and fine unless flags
+        get reordered without changing them in practice.
+      - Deliberately EXCLUDES capability/mods (inert metadata, Phase 4) and
+        notes (documentation, never reaches the container).
+      - Deliberately EXCLUDES the HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE
+        env_vars injection build_catalog_response() performs based on
+        cluster_config.yaml's global offline flags -- that's a runtime,
+        cluster-wide toggle applied on top of the recipe, not part of the
+        recipe itself, and flipping online/offline mode must not silently
+        invalidate every recipe's tested status. This function must only
+        ever be called against the raw, as-loaded RecipeConfig/TopologyConfig
+        (i.e. via load_recipes()), never against the enriched catalog dict.
+    """
+    topo = recipe.topologies[topo_key]
+    payload = {
+        "hf_path": recipe.hf_path,
+        "image": recipe.image,
+        "gpu_util": recipe.gpu_util,
+        "max_model_len": topo.max_model_len,
+        "tp_size": topo.tp_size,
+        "pp_size": topo.pp_size,
+        "env_vars": sorted(topo.env_vars),
+        "vllm_args": topo.vllm_args,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def _load_single_recipe(path: Path) -> RecipeConfig:
@@ -249,6 +306,8 @@ def build_catalog_response() -> dict:
             model_entry: dict = {"hf_path": recipe.hf_path, "gpu_util": recipe.gpu_util}
             if recipe.image is not None:
                 model_entry["image"] = recipe.image
+            if recipe.notes is not None:
+                model_entry["notes"] = recipe.notes
 
             topologies: dict = {}
             for topo_name, topo in recipe.topologies.items():
@@ -256,6 +315,14 @@ def build_catalog_response() -> dict:
                 # mutate below without touching the cached RecipeConfig.
                 topo_dict = topo.model_dump(include=set(_TOPOLOGY_OUTPUT_FIELDS))
                 env_vars = list(topo_dict.get("env_vars") or [])
+
+                # config_hash is computed from the RAW (pre-injection) topo
+                # -- i.e. via compute_config_hash(recipe, topo_name), not
+                # from topo_dict after the HF/transformers offline env_vars
+                # get appended below. Flipping the cluster's online/offline
+                # toggle must not change what "this configuration" means for
+                # launch-history matching purposes -- see compute_config_hash().
+                topo_dict["config_hash"] = compute_config_hash(recipe, topo_name)
 
                 if global_hf == 1:
                     env_vars = [e for e in env_vars if not e.startswith("HF_HUB_OFFLINE=")]

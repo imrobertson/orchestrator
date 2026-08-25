@@ -130,8 +130,31 @@
         .meta-val-secondary { font-family: monospace; font-size: 10px; color: #94a3b8; font-weight: normal; line-height: 1.2; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
         .recipe-yaml-drawer { margin-bottom: 10px; font-size: 11px; }
-        .recipe-yaml-drawer summary { cursor: pointer; color: var(--accent); font-size: 11px; font-weight: bold; user-select: none; }
-        .recipe-yaml-drawer pre { background: var(--bg-dark); padding: 8px; border-radius: 4px; max-height: 120px; overflow-y: auto; font-size: 10px; color: #cbd5e1; margin-top: 4px; font-family: monospace; }
+        .recipe-yaml-drawer summary { cursor: pointer; color: var(--accent); font-size: 11px; font-weight: bold; user-select: none; display: inline; }
+        .recipe-yaml-drawer .drawer-header-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .yaml-wrap-toggle { display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-muted); cursor: pointer; user-select: none; font-weight: normal; }
+        .yaml-wrap-toggle input { width: auto; margin: 0; min-height: auto; cursor: pointer; }
+        .recipe-yaml-drawer pre { background: var(--bg-dark); padding: 8px; border-radius: 4px; max-height: 120px; overflow-y: auto; font-size: 10px; color: #cbd5e1; margin-top: 4px; font-family: monospace; white-space: pre; }
+        .recipe-yaml-drawer pre.wrapped { white-space: pre-wrap; word-break: break-word; overflow-x: hidden; }
+
+        /* Recipe notes + last-launch marker -- sit just under the meta strip,
+           outside its grid so they don't disturb the existing 4/5-column
+           layout logic in updateRecipeMetadata(). */
+        .recipe-notes-line {
+            font-size: 11px;
+            color: #cbd5e1;
+            background: var(--bg-dark);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 8px 10px;
+            margin-bottom: 10px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .recipe-notes-line .notes-label { color: var(--text-muted); font-size: 9px; text-transform: uppercase; font-weight: 600; display: block; margin-bottom: 3px; }
+        .last-launch-line { font-size: 10px; color: var(--text-muted); font-family: monospace; margin-bottom: 10px; margin-top: -4px; }
+        .last-launch-line.is-tested { color: #34d399; }
+        .last-launch-line.is-untested { color: #f59e0b; }
         
         /* Buttons */
         .btn {
@@ -335,8 +358,28 @@
                 </div>
             </div>
 
+            <!-- Last-launch marker: reflects THIS exact configuration
+                 (recipe fields, hashed server-side), not just this model
+                 name -- editing a recipe's flags/gpu_util/etc. correctly
+                 shows this as untested again until it's actually been
+                 confirmed healthy in this new form. -->
+            <div id="lastLaunchLine" class="last-launch-line" style="display: none;"></div>
+
+            <!-- Recipe notes: optional free-form field from the YAML,
+                 hidden entirely when the recipe has none. -->
+            <div id="recipeNotesLine" class="recipe-notes-line" style="display: none;">
+                <span class="notes-label">Notes</span>
+                <span id="recipeNotesText"></span>
+            </div>
+
             <details class="recipe-yaml-drawer">
-                <summary>Inspect Recipe YAML</summary>
+                <div class="drawer-header-row">
+                    <summary>Inspect Recipe YAML</summary>
+                    <label class="yaml-wrap-toggle">
+                        <input type="checkbox" id="yamlWrapToggle" onchange="toggleYamlWrap()">
+                        Wrap
+                    </label>
+                </div>
                 <pre><code id="rawYamlViewer">Select a recipe...</code></pre>
             </details>
 
@@ -399,6 +442,15 @@
         if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
         if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
         return num.toString();
+    }
+
+    function formatRelativeTime(unixSeconds) {
+        if (!unixSeconds) return null;
+        const diffSec = Math.max(0, (Date.now() / 1000) - unixSeconds);
+        if (diffSec < 60) return 'just now';
+        if (diffSec < 3600) return `${Math.round(diffSec / 60)}m ago`;
+        if (diffSec < 86400) return `${Math.round(diffSec / 3600)}h ago`;
+        return `${Math.round(diffSec / 86400)}d ago`;
     }
 
     function formatRam(mbVal) {
@@ -804,7 +856,50 @@
             mtpContainer.style.display = 'none';
         }
 
+        // Notes: optional field, hide the whole line when absent so it
+        // doesn't leave empty chrome for every recipe that doesn't use it.
+        const notesLine = document.getElementById('recipeNotesLine');
+        if (recipe.notes) {
+            document.getElementById('recipeNotesText').textContent = recipe.notes;
+            notesLine.style.display = 'block';
+        } else {
+            notesLine.style.display = 'none';
+        }
+
+        // Last-launch marker: keyed server-side on config_hash, so this
+        // correctly reads as "untested" the moment the selected recipe's
+        // fields differ from whatever configuration actually last passed a
+        // health check -- not just whatever last ran under this filename.
+        const launchLine = document.getElementById('lastLaunchLine');
+        const lastTs = top.last_launch_success_ts;
+        const launchCount = top.last_launch_success_count || 0;
+        if (lastTs) {
+            const rel = formatRelativeTime(lastTs);
+            const countLabel = launchCount === 1 ? '1 launch' : `${launchCount} launches`;
+            launchLine.textContent = `\u2713 This configuration last launched successfully ${rel} (${countLabel})`;
+            launchLine.className = 'last-launch-line is-tested';
+        } else {
+            launchLine.textContent = `\u26a0 This exact configuration has not been confirmed to launch successfully yet`;
+            launchLine.className = 'last-launch-line is-untested';
+        }
+        launchLine.style.display = 'block';
+
         document.getElementById('rawYamlViewer').textContent = JSON.stringify(recipe, null, 2);
+    }
+
+    function toggleYamlWrap() {
+        const pre = document.querySelector('.recipe-yaml-drawer pre');
+        const checked = document.getElementById('yamlWrapToggle').checked;
+        pre.classList.toggle('wrapped', checked);
+        try { localStorage.setItem('dgxYamlWrapPref', checked ? '1' : '0'); } catch (e) { /* ignore */ }
+    }
+
+    function initYamlWrapPref() {
+        let pref = '0';
+        try { pref = localStorage.getItem('dgxYamlWrapPref') || '0'; } catch (e) { /* ignore */ }
+        const toggle = document.getElementById('yamlWrapToggle');
+        toggle.checked = pref === '1';
+        document.querySelector('.recipe-yaml-drawer pre').classList.toggle('wrapped', toggle.checked);
     }
 
     async function fetchLogs() {
@@ -1040,6 +1135,7 @@
         }
     });
 
+    initYamlWrapPref();
     fetchCatalog();
     fetchStatus();
     fetchLogs();

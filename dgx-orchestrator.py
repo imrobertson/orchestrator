@@ -31,7 +31,7 @@ import yaml
 
 from common.config import legacy_hosts_dict, load_cluster_config
 from common.constants import ContainerRole
-from common.recipes import build_catalog_response
+from common.recipes import build_catalog_response, compute_config_hash, load_recipes
 from common.ssh import get_hf_token, resolve_user_identity_key, run_ssh
 
 try:
@@ -198,6 +198,63 @@ if free_before < target_free:
 result["bytes_freed"] = reclaimed if free_before < target_free else 0
 result["shortfall_bytes"] = max(0, target_free - free_before)
 result["free_after"] = free_bytes()
+print(json.dumps(result))
+'''
+
+# Age-based (not free-space-based) cleanup of ~/.cache/ray-logs/<run_id>/.
+# Each top-level entry under the root is one deploy's run_id directory,
+# created by _execute_deployment_impl()'s mkdir step and bind-mounted to
+# /tmp/ray inside the container (see _jit_cache_mounts_and_env) so Ray's
+# session dir -- including any crashed worker's stdout/stderr -- survives
+# teardown. These are tiny relative to JIT/HF caches, so unlike
+# _REMOTE_PRUNE_SCRIPT above, eviction here is unconditional on age alone,
+# not gated behind a free-space floor. argv: <root> <retention_seconds> <dry_run:0|1>
+_REMOTE_RAY_LOG_PRUNE_SCRIPT = r'''
+import json, os, shutil, sys, time
+
+root = os.path.expanduser(sys.argv[1])
+cutoff = time.time() - float(sys.argv[2])
+dry_run = sys.argv[3] == "1"
+
+def dir_size_and_latest_mtime(path):
+    total = 0
+    latest = 0.0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            try:
+                st = os.lstat(fp)
+            except OSError:
+                continue
+            total += st.st_size
+            latest = max(latest, st.st_mtime)
+    return total, latest
+
+result = {"root": root, "evicted": [], "bytes_freed": 0, "kept": 0, "dry_run": dry_run, "errors": []}
+
+if os.path.isdir(root):
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        size, latest = dir_size_and_latest_mtime(path)
+        # No files yet (e.g. mkdir just ran, deploy about to start) --
+        # nothing to age off of, fall back to the dir's own mtime so a
+        # just-created empty run dir is never mistaken for stale.
+        age_ref = latest if latest > 0 else os.path.getmtime(path)
+        if age_ref < cutoff:
+            age_days = round((time.time() - age_ref) / 86400, 1)
+            if not dry_run:
+                try:
+                    shutil.rmtree(path)
+                except OSError as exc:
+                    result["errors"].append("%s: %s" % (path, exc))
+                    continue
+            result["evicted"].append({"path": path, "bytes": size, "age_days": age_days})
+            result["bytes_freed"] += size
+        else:
+            result["kept"] += 1
+
 print(json.dumps(result))
 '''
 
@@ -496,6 +553,30 @@ TEARDOWN_STATE = {
     "last_run": None
 }
 TEARDOWN_STATE_LOCK = threading.Lock()
+
+# --- Pending Launch Confirmation State ---
+# "Last launched successfully" is keyed on config_hash (see
+# common/recipes.py's compute_config_hash), not just model+topo, so it
+# can't report stale success for a recipe that's since been edited into a
+# materially different configuration. Recording it requires an actual
+# post-deploy health confirmation, not just "the container didn't crash in
+# the first 4 seconds" -- so it can't be recorded synchronously inside
+# execute_deployment() for the common case (a plain dashboard "Deploy"
+# click, which doesn't pass wait=True). Instead execute_deployment() drops
+# a pending record here describing what it's waiting to see confirmed
+# healthy, and _compute_cluster_status_impl() -- which already polls
+# cluster_ready/matched_model/topo every 4s for the dashboard regardless --
+# consumes it the moment a matching model+topo reports healthy. A deploy
+# that gets torn down or overwritten before that happens just leaves the
+# pending record to age out (see PENDING_LAUNCH_STALE_SEC) with nothing
+# recorded, which is the correct outcome, not a bug to special-case.
+PENDING_LAUNCH_STATE: dict = {"pending": None}
+PENDING_LAUNCH_LOCK = threading.Lock()
+# Generous on purpose: some recipes set VLLM_ENGINE_INITIALIZATION_TIMEOUT
+# up to 3600s for cold multi-hour JIT compiles. This just bounds how long a
+# stale/superseded pending record can linger before being ignored -- it is
+# not a deploy timeout and doesn't affect deploy behavior at all.
+PENDING_LAUNCH_STALE_SEC = 3600 * 3
 
 # --- Global Thread Pool ---
 WORKER_POOL = ThreadPoolExecutor(max_workers=len(HOSTS) * 2)
@@ -827,6 +908,34 @@ def record_load_time(model: str, topo_key: str, duration_sec: int, load_type: st
 
     data[key].setdefault(load_type, []).append(duration_sec)
     data[key][load_type] = data[key][load_type][-20:]
+    try: LEDGER_PATH.write_text(json.dumps(data, indent=2))
+    except Exception: pass
+
+def _record_launch_success(model: str, topo_key: str, config_hash: str):
+    """
+    Records that this exact (model, topo_key, config_hash) combination was
+    confirmed healthy by a post-deploy health check. Called from the status
+    polling loop (_compute_cluster_status_impl), not from execute_deployment
+    directly -- see PENDING_LAUNCH_STATE's comment for why. Failure here
+    must never break status polling, so this fails silently like
+    record_load_time()/SessionTracker._commit_session() do.
+    """
+    data = {}
+    if LEDGER_PATH.exists():
+        try: data = json.loads(LEDGER_PATH.read_text())
+        except Exception: data = {}
+
+    key = f"{model}::{topo_key}"
+    if key not in data or not isinstance(data[key], dict):
+        data[key] = {"cached": [], "compiled": [], "downloaded": [], "lifetime": {"in": 0, "out": 0, "draft": 0, "accepted": 0}}
+
+    launch_history = data[key].setdefault("launch_history", {})
+    prior = launch_history.get(config_hash, {})
+    launch_history[config_hash] = {
+        "last_success_ts": time.time(),
+        "count": prior.get("count", 0) + 1,
+    }
+
     try: LEDGER_PATH.write_text(json.dumps(data, indent=2))
     except Exception: pass
 
@@ -1374,6 +1483,82 @@ def prune_cluster_cache(min_free_gb: int = 50, headroom_gb: int = 20, dry_run: b
 
     return {"status": "success", "details": results}
 
+def prune_cluster_ray_logs(retention_days: int = None, dry_run: bool = False) -> dict:
+    """
+    Age-based cleanup of ~/.cache/ray-logs/<run_id>/ across the cluster --
+    the per-deploy Ray session dirs bind-mounted into every container so a
+    crashed worker's logs survive teardown (see _jit_cache_mounts_and_env).
+
+    Deliberately NOT modeled on prune_cluster_cache()'s free-space-floor
+    eviction: these dirs are tiny relative to JIT/HF caches, so instead of
+    reacting to disk pressure, anything older than retention_days is
+    removed on every call regardless of current free space.
+
+    retention_days -- defaults to cluster_config.yaml's
+                       tuning.crash_log_retention_days.
+    dry_run        -- report exactly what would be evicted and its age,
+                       without deleting anything. Read-only; safe against
+                       production.
+    """
+    tuning = load_cluster_config().tuning
+    if retention_days is None:
+        retention_days = getattr(tuning, "crash_log_retention_days", 7)
+    retention_seconds = retention_days * 86400
+
+    verb = "Dry-run evaluating" if dry_run else "Evaluating"
+    print(f"[+] {verb} ray-logs for cleanup (retention: {retention_days}d)...")
+
+    results = {}
+    for host, meta in HOSTS.items():
+        ip = meta["ip"]
+        cmd = [
+            "python3", "-c", _REMOTE_RAY_LOG_PRUNE_SCRIPT,
+            "~/.cache/ray-logs",
+            str(retention_seconds),
+            "1" if dry_run else "0",
+        ]
+        res = run_ssh(ip, None, cmd, capture=True, timeout=120)
+
+        if res.returncode != 0:
+            msg = res.stderr.strip() or "prune script failed"
+            print(f"  [{host}] ERROR: {msg}")
+            results[host] = {"status": "error", "message": msg}
+            continue
+
+        try:
+            data = json.loads(res.stdout.strip())
+        except Exception as exc:
+            results[host] = {"status": "error", "message": f"unparseable output: {exc}"}
+            continue
+
+        gb = lambda b: round(b / (1024 ** 3), 3)
+        summary = {
+            "status": "ok",
+            "runs_evicted": len(data["evicted"]),
+            "runs_kept": data["kept"],
+            "evicted": data["evicted"],
+            "gb_freed": gb(data["bytes_freed"]),
+            "dry_run": data["dry_run"],
+            "errors": data["errors"],
+        }
+
+        action = "would evict" if dry_run else "evicted"
+        if summary["runs_evicted"] == 0:
+            print(f"  [{host}] {summary['runs_kept']} run(s) within retention. Nothing to evict.")
+        else:
+            print(f"  [{host}] {action} {summary['runs_evicted']} run(s) older than {retention_days}d "
+                  f"({summary['gb_freed']} GB), kept {summary['runs_kept']}.")
+            for ev in summary["evicted"]:
+                print(f"      - {ev['path']} ({gb(ev['bytes'])} GB, {ev['age_days']}d old)")
+
+        if summary["errors"]:
+            for err in summary["errors"]:
+                print(f"  [{host}] eviction error: {err}")
+
+        results[host] = summary
+
+    return {"status": "success", "details": results}
+
 def _discover_host_container(host: str, meta: dict) -> dict:
     ip = meta["ip"]
     user = None
@@ -1625,6 +1810,27 @@ def _compute_cluster_status_impl() -> dict:
     if cluster_ready:
         SESSION_TRACKER.update(vllm_metrics, matched_model, topo)
 
+    # Consume any pending launch-confirmation record. See PENDING_LAUNCH_STATE's
+    # comment for why this happens here (in the already-running status poll)
+    # rather than synchronously in execute_deployment(). This must never
+    # raise or block status polling -- wrapped defensively.
+    try:
+        with PENDING_LAUNCH_LOCK:
+            pending = PENDING_LAUNCH_STATE.get("pending")
+        if pending is not None:
+            age = time.time() - pending["started_ts"]
+            if age > PENDING_LAUNCH_STALE_SEC:
+                with PENDING_LAUNCH_LOCK:
+                    if PENDING_LAUNCH_STATE.get("pending") is pending:
+                        PENDING_LAUNCH_STATE["pending"] = None
+            elif cluster_ready and pending["model"] == matched_model and pending["topo_key"] == topo:
+                _record_launch_success(pending["model"], pending["topo_key"], pending["config_hash"])
+                with PENDING_LAUNCH_LOCK:
+                    if PENDING_LAUNCH_STATE.get("pending") is pending:
+                        PENDING_LAUNCH_STATE["pending"] = None
+    except Exception:
+        pass
+
     with BENCHMARK_STATE_LOCK:
         is_benchmarking = BENCHMARK_STATE["running"]
         benchmark_msg = BENCHMARK_STATE["message"]
@@ -1757,8 +1963,7 @@ def enrich_catalog(catalog_dict: dict) -> dict:
                 if not isinstance(t_data, dict): continue
 
                 vllm_args = str(t_data.get("vllm_args", ""))
-                vllm_args_lower = vllm_args.lower()
-                
+
                 seq_match = re.search(r'--max-num-seqs\s+(\d+)', vllm_args)
                 t_data["max_num_seqs"] = seq_match.group(1) if seq_match else "Uncapped"
 
@@ -1766,15 +1971,46 @@ def enrich_catalog(catalog_dict: dict) -> dict:
                 t_data["kv_dtype"] = (kv_match.group(1).upper() + " KV") if kv_match else "AUTO KV"
                 
                 l_key = f"{m_key}::{t_key}"
-                lt_stats = ledger_data.get(l_key, {}).get("lifetime", {})
+                ledger_entry = ledger_data.get(l_key, {})
+                lt_stats = ledger_entry.get("lifetime", {})
                 d_tok = lt_stats.get("draft", 0)
                 a_tok = lt_stats.get("accepted", 0)
 
-                mtp_keywords = ["speculative", "mtp", "draft", "nextn", "proposal", "ngram", "lookahead"]
-                has_spec_flag = any(kw in vllm_args_lower for kw in mtp_keywords)
-                has_spec_name = any(kw in m_key_lower or kw in hf_path for kw in ["flash", "deepseek-v4", "mtp", "speculative"])
-                
-                t_data["mtp_enabled"] = has_spec_flag or has_spec_name or (d_tok > 0)
+                # "Last launched successfully" is looked up by config_hash
+                # (injected into t_data by build_catalog_response(), see
+                # compute_config_hash()'s docstring), not just m_key/t_key --
+                # so editing a recipe's flags/gpu_util/etc. correctly shows
+                # as untested again rather than reporting stale success for
+                # a configuration that was never actually the one launched.
+                launch_history = ledger_entry.get("launch_history", {})
+                cfg_hash = t_data.get("config_hash")
+                launch_record = launch_history.get(cfg_hash) if cfg_hash else None
+                t_data["last_launch_success_ts"] = launch_record["last_success_ts"] if launch_record else None
+                t_data["last_launch_success_count"] = launch_record["count"] if launch_record else 0
+
+                # mtp_enabled reflects ONLY whether the CURRENT recipe
+                # actually configures speculative decoding. Deliberately NOT
+                # a name-based heuristic ("flash"/"deepseek-v4" in the model
+                # key or hf_path) and deliberately NOT "have we ever seen
+                # nonzero draft/accepted counters for this model+topo key" --
+                # both of those keep reporting true forever after a recipe
+                # is edited to remove spec decode entirely, which is exactly
+                # what happened here: deepseek-v4-flash-0731-nvfp4 ran dspark
+                # earlier, it was found broken (near-zero acceptance), and
+                # the recipe now carries no --speculative-config at all --
+                # but the name heuristic still matches "flash"/"deepseek-v4"
+                # regardless, and the old draft/accepted counters from that
+                # earlier dspark run are still sitting in the ledger under
+                # this same model::topo key (that ledger entry isn't scoped
+                # by config_hash the way launch_history now is), so d_tok > 0
+                # kept the panel alive independently even if the name check
+                # were removed. "--speculative-config" is the literal vLLM
+                # flag this orchestrator emits for every spec-decode recipe
+                # (see _execute_deployment_impl's container_args
+                # construction) -- checking for its presence directly is a
+                # precise, unambiguous signal tied to what's actually
+                # configured right now, not a fuzzy/stale proxy for it.
+                t_data["mtp_enabled"] = "--speculative-config" in vllm_args
 
                 est_c, has_c = get_estimated_load_time(m_key, t_key, "cached")
                 est_j, has_j = get_estimated_load_time(m_key, t_key, "compiled")
@@ -2067,6 +2303,17 @@ def _run_benchmark_worker(head: str, nodes: int, model_key: Optional[str] = None
         with BENCHMARK_STATE_LOCK:
             BENCHMARK_STATE["message"] = f"Benchmark failed: {e}"
     finally:
+        # Flush whatever tokens this benchmark run generated into the
+        # lifetime ledger immediately, rather than leaving them sitting in
+        # SESSION_TRACKER's live accumulator until its own 10-minute-idle or
+        # 1-hour-active commit triggers fire. Without this, the dashboard's
+        # Lifetime Tokens figure could sit stale for up to 10 minutes after
+        # a benchmark completes even though the tokens were genuinely
+        # generated -- _commit_session() itself already no-ops safely if
+        # there's no real delta, so this is safe to call unconditionally,
+        # including on the failure/timeout paths above (a failed or timed-
+        # out run may still have generated real tokens before it died).
+        SESSION_TRACKER._commit_session()
         with BENCHMARK_STATE_LOCK:
             BENCHMARK_STATE["running"] = False
 
@@ -2137,6 +2384,12 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     use_ray = (nodes > 1) and ("--distributed-executor-backend" in vllm_args_list) and ("ray" in vllm_args_list)
     tuning = load_cluster_config().tuning
 
+    # Per-deploy id for crash log persistence (see _jit_cache_mounts_and_env below).
+    # Keyed by model+timestamp so concurrent/successive deploys never clobber each
+    # other's Ray session dir, and each host gets its own subdir so head/worker
+    # logs from the same run don't collide.
+    deploy_run_id = f"{re.sub(r'[^A-Za-z0-9._-]', '-', model)}-{int(time.time())}"
+
     if not dry_run:
         SESSION_TRACKER._commit_session()
         SESSION_TRACKER.active = False
@@ -2145,12 +2398,13 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             ip = HOSTS[h]["ip"]
             run_ssh(ip, None, ["sudo", "nvidia-smi", "-lgc", tuning.gpu_clock_lock], timeout=10)
             run_ssh(ip, None, ["bash", "-c", "mkdir -p ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton ~/.cache/vllm ~/.cache/flashinfer"], timeout=10)
+            run_ssh(ip, None, ["bash", "-c", f"mkdir -p ~/.cache/ray-logs/{deploy_run_id}/{h}"], timeout=10)
 
     default_img = catalog_resp.get("catalog", {}).get("default_image", load_cluster_config().default_image)
     image_tag = model_config.get("image", default_img)
     compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"
 
-    def _jit_cache_mounts_and_env(vol_mount: str) -> tuple[list[str], list[str]]:
+    def _jit_cache_mounts_and_env(vol_mount: str, log_subdir: str) -> tuple[list[str], list[str]]:
         host_hf_dir = vol_mount.split(":", 1)[0]
         host_cache_root = str(Path(host_hf_dir).parent)
         mounts = [
@@ -2159,7 +2413,13 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             "-v", f"{host_cache_root}/deepgemm:/root/.cache/deepgemm",
             "-v", f"{host_cache_root}/vllm:/root/.cache/vllm",
             "-v", f"{host_cache_root}/flashinfer:/root/.cache/flashinfer",
-            "-v", f"{host_cache_root}/nv_compute_cache:/root/.nv/ComputeCache"
+            "-v", f"{host_cache_root}/nv_compute_cache:/root/.nv/ComputeCache",
+            # Ray writes its session dir (including per-worker stdout/stderr and any
+            # crash traceback) under /tmp/ray by default. That's container-local and
+            # vanishes on teardown, which is exactly what left us with nothing to
+            # inspect after the 2026-08-25 silent RayWorkerProc death. Binding it to
+            # a host path keyed by deploy_run_id + host makes it survive teardown.
+            "-v", f"{host_cache_root}/ray-logs/{deploy_run_id}/{log_subdir}:/tmp/ray",
         ]
         env = [
             "-e", "TRITON_CACHE_DIR=/root/.cache/triton",
@@ -2170,6 +2430,13 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             "-e", "VLLM_CACHE_DIR=/root/.cache/vllm",
             "-e", f"CUDA_CACHE_MAXSIZE={tuning.jit_cache_maxsize_bytes}",
         ]
+        # Opt-in debug mode: forces synchronous CUDA kernel launches so a kernel-level
+        # fault raises a normal Python/CUDA traceback at the actual failing launch
+        # instead of surfacing later as an opaque "died unexpectedly" with no stack.
+        # Costs real throughput (kernels no longer queue async) - leave off for normal
+        # serving and flip on in cluster_config.yaml only while chasing a repro.
+        if getattr(tuning, "debug_launch_blocking", False):
+            env += ["-e", "CUDA_LAUNCH_BLOCKING=1"]
         return mounts, env
 
     head_ip = HOSTS[head]["ip"]
@@ -2178,7 +2445,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     if nodes == 1:
         ip = HOSTS[head]["ip"]
         vol_mount = load_cluster_config().hosts[head].volume_mount
-        jit_mounts, jit_env = _jit_cache_mounts_and_env(vol_mount)
+        jit_mounts, jit_env = _jit_cache_mounts_and_env(vol_mount, head)
         env_flags = [
             "-e", "PYTHONUNBUFFERED=1",
             "-e", "NVIDIA_DISABLE_REQUIRE=true",
@@ -2219,7 +2486,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         for host in target_hosts:
             ip = HOSTS[host]["ip"]
             vol_mount = load_cluster_config().hosts[host].volume_mount
-            jit_mounts, jit_env = _jit_cache_mounts_and_env(vol_mount)
+            jit_mounts, jit_env = _jit_cache_mounts_and_env(vol_mount, host)
             role_name = ContainerRole.HEAD if host == head else ContainerRole.WORKER
             node_rank = 0 if host == head else 1
 
@@ -2330,6 +2597,30 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             log_res = run_ssh(ip, None, ["docker", "logs", "--tail", "50", target_role], timeout=10)
             err_log = log_res.stdout.strip() or log_res.stderr.strip() or "No logs captured."
             return {"status": "error", "message": f"Container '{target_role}' crashed on {host} immediately after startup.\nLogs:\n{err_log}"}
+
+    # Drop a pending launch-confirmation record regardless of wait/
+    # run_benchmark -- this is what lets a plain "Deploy" click (which
+    # doesn't pass wait=True) still eventually get marked as launched
+    # successfully, via the status-polling loop rather than blocking this
+    # request on a full health-check wait. Silently skipped under the
+    # legacy models.yaml catalog, which has no per-recipe config_hash to
+    # key against, and silently skipped (not fatal) if hashing fails for
+    # any other reason -- this is a QoL marker, not load-bearing for deploy
+    # itself.
+    if os.environ.get("USE_LEGACY_CATALOG") != "1":
+        try:
+            recipe = load_recipes().get(model)
+            if recipe is not None:
+                cfg_hash = compute_config_hash(recipe, topo_key)
+                with PENDING_LAUNCH_LOCK:
+                    PENDING_LAUNCH_STATE["pending"] = {
+                        "model": model,
+                        "topo_key": topo_key,
+                        "config_hash": cfg_hash,
+                        "started_ts": time.time(),
+                    }
+        except Exception:
+            pass
 
     if wait or run_benchmark:
         head_ip = HOSTS[head]["ip"]
@@ -2467,6 +2758,10 @@ if HAS_FASTAPI:
         headroom_gb: int = 20
         dry_run: bool = False
 
+    class PruneRayLogsRequest(BaseModel):
+        retention_days: Optional[int] = None  # None -> tuning.crash_log_retention_days
+        dry_run: bool = False
+
     class FlushModelCacheRequest(BaseModel):
         model: str  # catalog key, or a raw HF repo_id (org/repo) for an already-retired model
         include_jit: bool = False
@@ -2516,6 +2811,10 @@ if HAS_FASTAPI:
     @app.post("/api/prune-cache")
     def api_prune_cache(req: PruneCacheRequest):
         return prune_cluster_cache(req.min_free_gb, req.headroom_gb, req.dry_run)
+
+    @app.post("/api/prune-ray-logs")
+    def api_prune_ray_logs(req: PruneRayLogsRequest):
+        return prune_cluster_ray_logs(req.retention_days, req.dry_run)
 
     @app.post("/api/flush-model-cache")
     def api_flush_model_cache(req: FlushModelCacheRequest):
@@ -2581,6 +2880,10 @@ def main():
     prune_parser.add_argument("--headroom-gb", type=int, default=20, help="When evicting, free up to floor+headroom so the next deploy doesn't re-trigger immediately.")
     prune_parser.add_argument("--dry-run", action="store_true", help="Report what would be evicted and why, without deleting anything. Safe against production.")
 
+    prune_ray_logs_parser = subparsers.add_parser("prune-ray-logs", help="Age-based cleanup of persisted Ray/crash logs under ~/.cache/ray-logs. Not free-space-gated like prune-cache -- runs older than --retention-days are removed regardless of disk pressure.")
+    prune_ray_logs_parser.add_argument("--retention-days", type=int, default=None, help="Defaults to cluster_config.yaml's tuning.crash_log_retention_days.")
+    prune_ray_logs_parser.add_argument("--dry-run", action="store_true", help="Report what would be evicted and its age, without deleting anything. Safe against production.")
+
     flush_parser = subparsers.add_parser("flush-model-cache", help="Clear one model's HuggingFace weights cache (and optionally JIT caches) to recover from corruption or reclaim space for a retired model.")
     flush_parser.add_argument("--model", required=True, help="Catalog key (live or historically-recorded), or a raw HF repo_id (org/repo) as a last resort.")
     flush_parser.add_argument("--jit", action="store_true", help="Also wipe ALL JIT/compute caches on the target host(s) -- affects every model's compiled kernels on that host, not just this one.")
@@ -2622,6 +2925,10 @@ def main():
     cli_prune.add_argument("--min-free-gb", type=int, default=50)
     cli_prune.add_argument("--headroom-gb", type=int, default=20)
     cli_prune.add_argument("--dry-run", action="store_true")
+
+    cli_prune_ray_logs = cli_sub.add_parser("prune-ray-logs")
+    cli_prune_ray_logs.add_argument("--retention-days", type=int, default=None)
+    cli_prune_ray_logs.add_argument("--dry-run", action="store_true")
 
     cli_flush = cli_sub.add_parser("flush-model-cache")
     cli_flush.add_argument("--model", required=True)
@@ -2680,6 +2987,20 @@ def main():
                 print("  Above floor -- nothing considered.")
             else:
                 print(f"  {verb} {s['entries_evicted']}/{s['entries_total']} entries, {s['gb_freed']} GB, oldest-first.")
+        print("\n--- full detail ---")
+        print(json.dumps(res, indent=2))
+    elif subcommand == "prune-ray-logs":
+        res = prune_cluster_ray_logs(getattr(args, "retention_days", None), getattr(args, "dry_run", False))
+        for host, s in res["details"].items():
+            if s.get("status") != "ok":
+                print(f"[{host}] ERROR: {s.get('message')}")
+                continue
+            verb = "WOULD EVICT" if s["dry_run"] else "EVICTED"
+            print(f"\n=== {host} ===")
+            if s["runs_evicted"] == 0:
+                print(f"  {s['runs_kept']} run(s) within retention -- nothing to evict.")
+            else:
+                print(f"  {verb} {s['runs_evicted']} run(s), {s['gb_freed']} GB, kept {s['runs_kept']}.")
         print("\n--- full detail ---")
         print(json.dumps(res, indent=2))
     elif subcommand == "flush-model-cache":
