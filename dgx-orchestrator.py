@@ -18,6 +18,7 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -1619,6 +1620,179 @@ def prune_cluster_ray_logs(retention_days: int = None, dry_run: bool = False) ->
 
     return {"status": "success", "details": results}
 
+def _detect_live_model_topo_metrics() -> dict:
+    """
+    Fresh, uncached detection of "what's actually running right now" --
+    serving host, catalog-resolved model key, topology, and live vLLM
+    /metrics values. Mirrors the same resolution _compute_cluster_status_impl()
+    uses (so the key this produces matches what SESSION_TRACKER itself
+    would use), but deliberately does NOT go through get_cluster_status()'s
+    cache: correct_ledger_entry() exists specifically to recover from
+    situations where that cache went stale/wedged, so relying on it here
+    would be circular.
+    """
+    host_order = list(HOSTS.keys())
+    futures = [WORKER_POOL.submit(_discover_host_container, host, meta) for host, meta in HOSTS.items()]
+    deadline = time.monotonic() + STATUS_CALL_TIMEOUT_SEC
+    results = _collect_bounded(futures, host_order, deadline, "Live detection")
+    container_info = {h: (r if r is not None else {"host": h, "reachable": False}) for h, r in results.items()}
+
+    serving_host = None
+    for host in HOSTS:
+        if container_info.get(host, {}).get("active_container") in (ContainerRole.STANDALONE, ContainerRole.HEAD):
+            serving_host = host
+            break
+    if serving_host is None:
+        return {"status": "error", "message": "No host has an active head/standalone vLLM container right now -- nothing to detect."}
+
+    serving_ip = HOSTS[serving_host]["ip"]
+    if not check_vllm_health(serving_ip):
+        return {"status": "error", "message": f"vLLM on {serving_host} ({serving_ip}) is not responding to /health -- can't fetch live metrics."}
+
+    vllm_metrics = get_vllm_metrics(serving_ip)
+    catalog_models = load_model_catalog().get("catalog", {}).get("models", {})
+    raw_loaded_model = container_info.get(serving_host, {}).get("loaded_model", "Unknown")
+    matched_model = _resolve_catalog_key(raw_loaded_model, catalog_models)
+    topo = "2_node" if len([h for h, i in container_info.items() if i.get("active_container") != "None"]) > 1 else "1_node"
+
+    return {
+        "status": "success",
+        "serving_host": serving_host,
+        "model": matched_model,
+        "topo": topo,
+        "prompt_tokens": vllm_metrics["prompt_tokens"],
+        "gen_tokens": vllm_metrics["gen_tokens"],
+        "draft_tokens": vllm_metrics["draft_tokens"],
+        "accepted_tokens": vllm_metrics["accepted_tokens"],
+    }
+
+def correct_ledger_entry(
+    model: Optional[str] = None,
+    topo: Optional[str] = None,
+    prompt_tokens: Optional[float] = None,
+    gen_tokens: Optional[float] = None,
+    draft_tokens: Optional[float] = None,
+    accepted_tokens: Optional[float] = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict:
+    """
+    One-off manual correction for a model_ledger.json entry's `lifetime`
+    totals and `last_seen_raw` checkpoint, using values observed from
+    vLLM's own /metrics endpoint (vllm:prompt_tokens_total /
+    vllm:generation_tokens_total etc).
+
+    Any of model/topo/prompt_tokens/gen_tokens left as None triggers
+    live auto-detection via _detect_live_model_topo_metrics() -- i.e. the
+    default, argument-free call corrects whatever's currently deployed
+    using its own current live counters. Pass explicit values instead to
+    correct a DIFFERENT (not currently loaded) model+topo key, or to
+    supply a metrics snapshot you captured earlier rather than "right now".
+    draft_tokens/accepted_tokens default to 0.0 if left unset and not
+    auto-detected (e.g. explicit model/topo given without those two).
+
+    This exists to repair drift caused by the SessionTracker restart bug
+    (see SessionTracker._load_last_seen_raw()'s docstring) -- a fresh
+    tracker instance re-baselining to "now" instead of resuming from a
+    checkpoint, silently discarding real usage. That bug is fixed going
+    forward; this is for correcting a ledger entry already damaged by it.
+
+    Sets (does not add to) lifetime.in/out/draft/accepted, since a
+    single-launch key's whole lifetime history IS its current live
+    cumulative counters -- the existing (wrong, small) numbers are a
+    subset of what's being provided here, not something to add on top
+    of. If the key has had more than one distinct launch historically,
+    this "set" semantics doesn't apply cleanly; don't use it as-is.
+
+    Refuses to overwrite with smaller numbers than currently recorded
+    unless force=True, as a sanity check against stale/transposed values.
+
+    Writes a timestamped .bak of the whole ledger file before any write.
+    Only touches the matched key's "lifetime" and "last_seen_raw" fields;
+    every other key, and "cached"/"compiled"/"downloaded" on the matched
+    key, are left untouched.
+    """
+    detected = None
+    if model is None or topo is None or prompt_tokens is None or gen_tokens is None:
+        detected = _detect_live_model_topo_metrics()
+        if detected["status"] != "success":
+            return detected
+        model = model if model is not None else detected["model"]
+        topo = topo if topo is not None else detected["topo"]
+        prompt_tokens = prompt_tokens if prompt_tokens is not None else detected["prompt_tokens"]
+        gen_tokens = gen_tokens if gen_tokens is not None else detected["gen_tokens"]
+        if draft_tokens is None:
+            draft_tokens = detected["draft_tokens"]
+        if accepted_tokens is None:
+            accepted_tokens = detected["accepted_tokens"]
+
+    draft_tokens = draft_tokens if draft_tokens is not None else 0.0
+    accepted_tokens = accepted_tokens if accepted_tokens is not None else 0.0
+
+    if not LEDGER_PATH.exists():
+        return {"status": "error", "message": f"ledger file not found: {LEDGER_PATH}"}
+
+    try:
+        data = json.loads(LEDGER_PATH.read_text())
+    except Exception as exc:
+        return {"status": "error", "message": f"could not parse {LEDGER_PATH} as JSON: {exc}"}
+
+    key = f"{model}::{topo}"
+    entry = data.get(key)
+    if not isinstance(entry, dict):
+        return {"status": "error", "message": f"key {key!r} not found in ledger", "available_keys": list(data.keys())}
+
+    current_lifetime = entry.get("lifetime", {"in": 0, "out": 0, "draft": 0, "accepted": 0})
+
+    new_lifetime = {
+        "in": int(prompt_tokens),
+        "out": int(gen_tokens),
+        "draft": int(draft_tokens),
+        "accepted": int(accepted_tokens),
+    }
+
+    if not force:
+        for field in ("in", "out", "draft", "accepted"):
+            if new_lifetime[field] < current_lifetime.get(field, 0):
+                return {
+                    "status": "error",
+                    "message": (
+                        f"new lifetime.{field}={new_lifetime[field]} is LESS than the currently "
+                        f"recorded {current_lifetime.get(field, 0)}. Refusing to overwrite -- this "
+                        f"usually means stale/transposed values. Pass force=True if this is "
+                        f"genuinely intended."
+                    ),
+                }
+
+    new_raw = {"p": prompt_tokens, "g": gen_tokens, "d": draft_tokens, "a": accepted_tokens}
+
+    result = {
+        "status": "success",
+        "key": key,
+        "auto_detected": detected is not None,
+        "detected_serving_host": detected.get("serving_host") if detected else None,
+        "current_lifetime": current_lifetime,
+        "current_last_seen_raw": entry.get("last_seen_raw"),
+        "new_lifetime": new_lifetime,
+        "new_last_seen_raw": new_raw,
+        "dry_run": dry_run,
+        "backup_path": None,
+    }
+
+    if dry_run:
+        return result
+
+    backup_path = LEDGER_PATH.with_suffix(f".json.bak.{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}")
+    shutil.copy2(LEDGER_PATH, backup_path)
+    result["backup_path"] = str(backup_path)
+
+    entry["lifetime"] = new_lifetime
+    entry["last_seen_raw"] = new_raw
+    data[key] = entry
+    LEDGER_PATH.write_text(json.dumps(data, indent=2))
+
+    return result
+
 def _discover_host_container(host: str, meta: dict) -> dict:
     ip = meta["ip"]
     user = None
@@ -2833,6 +3007,16 @@ if HAS_FASTAPI:
         retention_days: Optional[int] = None  # None -> tuning.crash_log_retention_days
         dry_run: bool = False
 
+    class CorrectLedgerRequest(BaseModel):
+        model: Optional[str] = None
+        topo: Optional[str] = None
+        prompt_tokens: Optional[float] = None
+        gen_tokens: Optional[float] = None
+        draft_tokens: Optional[float] = None
+        accepted_tokens: Optional[float] = None
+        dry_run: bool = False
+        force: bool = False
+
     class FlushModelCacheRequest(BaseModel):
         model: str  # catalog key, or a raw HF repo_id (org/repo) for an already-retired model
         include_jit: bool = False
@@ -2886,6 +3070,13 @@ if HAS_FASTAPI:
     @app.post("/api/prune-ray-logs")
     def api_prune_ray_logs(req: PruneRayLogsRequest):
         return prune_cluster_ray_logs(req.retention_days, req.dry_run)
+
+    @app.post("/api/correct-ledger")
+    def api_correct_ledger(req: CorrectLedgerRequest):
+        return correct_ledger_entry(
+            req.model, req.topo, req.prompt_tokens, req.gen_tokens,
+            req.draft_tokens, req.accepted_tokens, req.dry_run, req.force,
+        )
 
     @app.post("/api/flush-model-cache")
     def api_flush_model_cache(req: FlushModelCacheRequest):
@@ -2955,6 +3146,16 @@ def main():
     prune_ray_logs_parser.add_argument("--retention-days", type=int, default=None, help="Defaults to cluster_config.yaml's tuning.crash_log_retention_days.")
     prune_ray_logs_parser.add_argument("--dry-run", action="store_true", help="Report what would be evicted and its age, without deleting anything. Safe against production.")
 
+    correct_ledger_parser = subparsers.add_parser("correct-ledger", help="Manually correct a model_ledger.json entry's lifetime totals and last_seen_raw checkpoint. With no args, auto-detects whatever's currently deployed and its live /metrics values. Pass --model/--topo/--prompt-tokens/--gen-tokens explicitly to override or to correct a different (not currently loaded) key. One-off repair tool, not for routine use -- see correct_ledger_entry()'s docstring.")
+    correct_ledger_parser.add_argument("--model", default=None, help="Omit to auto-detect the currently-deployed model's catalog key.")
+    correct_ledger_parser.add_argument("--topo", default=None, help="Omit to auto-detect (1_node/2_node) from what's currently running.")
+    correct_ledger_parser.add_argument("--prompt-tokens", type=float, default=None, help="Omit to auto-fetch live vllm:prompt_tokens_total from the currently-serving host.")
+    correct_ledger_parser.add_argument("--gen-tokens", type=float, default=None, help="Omit to auto-fetch live vllm:generation_tokens_total from the currently-serving host.")
+    correct_ledger_parser.add_argument("--draft-tokens", type=float, default=None)
+    correct_ledger_parser.add_argument("--accepted-tokens", type=float, default=None)
+    correct_ledger_parser.add_argument("--dry-run", action="store_true", help="Preview the change without writing anything.")
+    correct_ledger_parser.add_argument("--force", action="store_true", help="Allow overwriting with smaller values than currently recorded.")
+
     flush_parser = subparsers.add_parser("flush-model-cache", help="Clear one model's HuggingFace weights cache (and optionally JIT caches) to recover from corruption or reclaim space for a retired model.")
     flush_parser.add_argument("--model", required=True, help="Catalog key (live or historically-recorded), or a raw HF repo_id (org/repo) as a last resort.")
     flush_parser.add_argument("--jit", action="store_true", help="Also wipe ALL JIT/compute caches on the target host(s) -- affects every model's compiled kernels on that host, not just this one.")
@@ -3000,6 +3201,16 @@ def main():
     cli_prune_ray_logs = cli_sub.add_parser("prune-ray-logs")
     cli_prune_ray_logs.add_argument("--retention-days", type=int, default=None)
     cli_prune_ray_logs.add_argument("--dry-run", action="store_true")
+
+    cli_correct_ledger = cli_sub.add_parser("correct-ledger")
+    cli_correct_ledger.add_argument("--model", default=None)
+    cli_correct_ledger.add_argument("--topo", default=None)
+    cli_correct_ledger.add_argument("--prompt-tokens", type=float, default=None)
+    cli_correct_ledger.add_argument("--gen-tokens", type=float, default=None)
+    cli_correct_ledger.add_argument("--draft-tokens", type=float, default=None)
+    cli_correct_ledger.add_argument("--accepted-tokens", type=float, default=None)
+    cli_correct_ledger.add_argument("--dry-run", action="store_true")
+    cli_correct_ledger.add_argument("--force", action="store_true")
 
     cli_flush = cli_sub.add_parser("flush-model-cache")
     cli_flush.add_argument("--model", required=True)
@@ -3072,6 +3283,34 @@ def main():
                 print(f"  {s['runs_kept']} run(s) within retention -- nothing to evict.")
             else:
                 print(f"  {verb} {s['runs_evicted']} run(s), {s['gb_freed']} GB, kept {s['runs_kept']}.")
+        print("\n--- full detail ---")
+        print(json.dumps(res, indent=2))
+    elif subcommand == "correct-ledger":
+        res = correct_ledger_entry(
+            getattr(args, "model", None), getattr(args, "topo", None),
+            getattr(args, "prompt_tokens", None), getattr(args, "gen_tokens", None),
+            getattr(args, "draft_tokens", None), getattr(args, "accepted_tokens", None),
+            getattr(args, "dry_run", False), getattr(args, "force", False),
+        )
+        if res["status"] != "success":
+            print(f"ERROR: {res['message']}")
+            if "available_keys" in res:
+                print("Available keys:")
+                for k in res["available_keys"]:
+                    print(f"    {k}")
+        else:
+            if res["auto_detected"]:
+                print(f"Auto-detected from currently-serving host: {res['detected_serving_host']}")
+            verb = "Would set" if res["dry_run"] else "Set"
+            print(f"Key: {res['key']}")
+            print(f"Current lifetime:     {res['current_lifetime']}")
+            print(f"Current last_seen_raw: {res['current_last_seen_raw']}")
+            print(f"\n{verb} lifetime:      {res['new_lifetime']}")
+            print(f"{verb} last_seen_raw:  {res['new_last_seen_raw']}")
+            if res["backup_path"]:
+                print(f"\nBackup written to: {res['backup_path']}")
+            if res["dry_run"]:
+                print("\n--dry-run: no changes written.")
         print("\n--- full detail ---")
         print(json.dumps(res, indent=2))
     elif subcommand == "flush-model-cache":
