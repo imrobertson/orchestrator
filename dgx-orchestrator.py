@@ -616,6 +616,32 @@ class SessionTracker:
         self.cur_d_tok = 0.0
         self.cur_a_tok = 0.0
 
+    def _load_last_seen_raw(self, key: str) -> Optional[dict]:
+        """
+        Read the ledger's persisted raw-counter checkpoint for `key`
+        (model::topo), if any. This is what makes update()'s active
+        transition (below) durable across an orchestrator restart: without
+        it, a freshly-instantiated tracker has cur_p_tok/cur_g_tok == 0.0,
+        so the very first real metrics it sees always look like "growth
+        from zero" -- which incorrectly re-baselines flushed_* to
+        vLLM's CURRENT cumulative total and permanently discards
+        everything generated before that moment, no matter how large.
+        (Confirmed in production: 2026-08-25/26 outage, ~29M real prompt
+        tokens and ~730K real generation tokens silently reduced to 190/763
+        in the ledger after an orchestrator restart -- exactly this bug.)
+        """
+        if not LEDGER_PATH.exists():
+            return None
+        try:
+            data = json.loads(LEDGER_PATH.read_text())
+        except Exception:
+            return None
+        entry = data.get(key)
+        if not isinstance(entry, dict):
+            return None
+        raw = entry.get("last_seen_raw")
+        return raw if isinstance(raw, dict) else None
+
     def update(self, metrics: dict, model: str, topo: str):
         with self.lock:
             p_tok = metrics.get("prompt_tokens", 0.0)
@@ -634,16 +660,39 @@ class SessionTracker:
                 self.first_active_ts = now
                 self.last_active_ts = now
                 self.last_flush_ts = now
-                
-                self.start_p_tok = p_tok
-                self.start_g_tok = g_tok
-                self.start_d_tok = d_tok
-                self.start_a_tok = a_tok
 
-                self.flushed_p_tok = p_tok
-                self.flushed_g_tok = g_tok
-                self.flushed_d_tok = d_tok
-                self.flushed_a_tok = a_tok
+                # Default (no prior checkpoint, or engine genuinely
+                # restarted since): baseline to current -- this is the
+                # original "fresh start" behavior, correct when there's
+                # nothing to resume from.
+                baseline_p, baseline_g, baseline_d, baseline_a = p_tok, g_tok, d_tok, a_tok
+
+                raw = self._load_last_seen_raw(f"{model}::{topo}")
+                if raw is not None:
+                    ckpt_p = raw.get("p", 0.0)
+                    ckpt_g = raw.get("g", 0.0)
+                    # Only resume from the checkpoint if vLLM's counters are
+                    # still >= it -- i.e. the same engine process is still
+                    # running (or a later one that's already surpassed the
+                    # old count). If current counters are LOWER than the
+                    # checkpoint, the engine itself was redeployed/reset
+                    # since, and resuming would produce a negative diff --
+                    # fall back to the fresh-start baseline set above.
+                    if p_tok >= ckpt_p and g_tok >= ckpt_g:
+                        baseline_p = ckpt_p
+                        baseline_g = ckpt_g
+                        baseline_d = raw.get("d", 0.0) if d_tok >= raw.get("d", 0.0) else d_tok
+                        baseline_a = raw.get("a", 0.0) if a_tok >= raw.get("a", 0.0) else a_tok
+
+                self.start_p_tok = baseline_p
+                self.start_g_tok = baseline_g
+                self.start_d_tok = baseline_d
+                self.start_a_tok = baseline_a
+
+                self.flushed_p_tok = baseline_p
+                self.flushed_g_tok = baseline_g
+                self.flushed_d_tok = baseline_d
+                self.flushed_a_tok = baseline_a
             elif self.active and is_moving:
                 self.last_active_ts = now
             
@@ -688,7 +737,18 @@ class SessionTracker:
             data[key]["lifetime"]["out"] += int(g_diff)
             data[key]["lifetime"]["draft"] += int(d_diff)
             data[key]["lifetime"]["accepted"] += int(a_diff)
-            
+
+            # Raw cumulative-since-engine-boot counters as of this commit,
+            # independent of the lifetime totals above. This is what
+            # update() resumes from after a restart -- see
+            # _load_last_seen_raw()'s docstring for why this matters.
+            data[key]["last_seen_raw"] = {
+                "p": self.cur_p_tok,
+                "g": self.cur_g_tok,
+                "d": self.cur_d_tok,
+                "a": self.cur_a_tok,
+            }
+
             try: LEDGER_PATH.write_text(json.dumps(data, indent=2))
             except Exception: pass
 
@@ -1841,7 +1901,18 @@ def _compute_cluster_status_impl() -> dict:
         teardown_msg = TEARDOWN_STATE["message"]
 
     status_data = {
-        "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S EST"),
+        # Emit real, unambiguous UTC. Previously this used naive
+        # datetime.datetime.now() (which, since this container's system
+        # clock is UTC, was already correct-in-value) with a hardcoded
+        # " EST" string suffix -- the value was never Eastern time, just
+        # mislabeled. That mislabel is the likely cause of the dashboard
+        # showing a ~5h-into-the-future clock: something downstream
+        # apparently read "EST", assumed it needed EST->UTC conversion
+        # (+5h, and DST-unaware even if it hadn't been a mislabel to begin
+        # with), and applied that offset to data that didn't need it.
+        # Explicit tz-aware UTC with an unambiguous "UTC" suffix removes
+        # any excuse for a consumer to apply its own offset "correction".
+        "server_time": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "network_mode": "Working in OFFLINE mode" if offline_mode else "Working in ONLINE mode",
         "cluster_ready": cluster_ready,
         "serving_host": serving_host,
