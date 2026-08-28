@@ -13,6 +13,7 @@ import argparse
 import datetime
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
+import glob
 import json
 import os
 import pathlib
@@ -2155,11 +2156,29 @@ def get_cluster_status() -> dict:
     try:
         result = inflight.result(timeout=STATUS_CALL_TIMEOUT_SEC + 2)
     except Exception as e:
-        print(f"[!] get_cluster_status(): in-flight computation failed or timed out: {e}")
         with _STATUS_LOCK:
             if _STATUS_CACHE is not None:
-                return _STATUS_CACHE
+                # Serving a stale snapshot rather than propagating the
+                # failure. This is deliberate (a transient blip shouldn't
+                # 500 the dashboard), but silently doing this indefinitely
+                # is exactly what let a wedged WORKER_POOL serve the same
+                # frozen status for hours undetected (2026-08-25 and
+                # 2026-08-27 incidents). Stamp the response with how stale
+                # it actually is so a consumer -- dashboard banner, alert,
+                # whatever -- can tell "slow poll" apart from "this has
+                # been dead for hours" instead of both looking identically
+                # fresh.
+                stale_for = round(time.monotonic() - _STATUS_CACHE_TS, 1)
+                print(f"[!] get_cluster_status(): in-flight computation failed or timed out ({e}); "
+                      f"serving cache that is {stale_for}s stale.")
+                stale_result = dict(_STATUS_CACHE)
+                stale_result["stale"] = True
+                stale_result["stale_for_seconds"] = stale_for
+                return stale_result
         raise
+
+    result["stale"] = False
+    result["stale_for_seconds"] = 0.0
 
     with _STATUS_LOCK:
         _STATUS_CACHE = result
@@ -2453,21 +2472,42 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
     try:
         _set_teardown_state(True, "signaling",
                              f"Signaling processes on {host_list} (SIGTERM, up to {TEARDOWN_GRACE_SEC}s grace)...")
+        # Bounded waits below, sized to each phase's own known worst case
+        # (sum of its sequential run_ssh timeouts -- see each function's
+        # docstring), not unbounded .result(). A genuinely wedged
+        # container (e.g. left in a bad state by an OOM kill or a hung
+        # engine) can make these leaf functions slow, but they were
+        # already individually timeout-bounded at the run_ssh layer; nothing
+        # here previously stopped an orchestration-level wait from blocking
+        # longer than that anyway, and left no defense if a future change
+        # to one of these functions ever removed that bound by accident.
+        # Confirmed by direct test: an unbounded .result() here, combined
+        # with a genuinely stuck sub-operation, starves get_cluster_status()
+        # of the WORKER_POOL threads it needs -- dashboard status freezes
+        # for as long as the stuck operation runs.
         proc_futures = {h: WORKER_POOL.submit(_teardown_host_processes, ip) for h, ip in ips.items()}
         internal_futures = {h: WORKER_POOL.submit(_teardown_host_container_internals, ip) for h, ip in ips.items()}
-        for f in proc_futures.values(): f.result()
-        for f in internal_futures.values(): f.result()
+        _collect_bounded(list(proc_futures.values()), list(proc_futures.keys()),
+                          time.monotonic() + TEARDOWN_GRACE_SEC + 25, "Teardown: process signaling")
+        _collect_bounded(list(internal_futures.values()), list(internal_futures.keys()),
+                          time.monotonic() + 3 * (TEARDOWN_GRACE_SEC + 40) + 10, "Teardown: container-internal signaling")
 
         _set_teardown_state(True, "stopping",
                              f"Gracefully stopping containers on {host_list} (up to {TEARDOWN_GRACE_SEC}s)...")
         stop_futures = {h: WORKER_POOL.submit(_teardown_host_containers, ip) for h, ip in ips.items()}
-        for f in stop_futures.values(): f.result()
+        _collect_bounded(list(stop_futures.values()), list(stop_futures.keys()),
+                          time.monotonic() + 3 * (TEARDOWN_GRACE_SEC + 10) + 10, "Teardown: docker stop")
 
         _set_teardown_state(True, "removing", f"Removing containers on {host_list}...")
         rm_futures = {h: WORKER_POOL.submit(_teardown_host_rm, ip) for h, ip in ips.items()}
-        for h, f in rm_futures.items():
-            res = f.result()
-            results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
+        rm_results = _collect_bounded(list(rm_futures.values()), list(rm_futures.keys()),
+                                       time.monotonic() + 30, "Teardown: container removal")
+        for h in hosts_to_clean:
+            res = rm_results.get(h)
+            if res is None:
+                results[h] = "Error: docker rm timed out -- host may still have stale containers, check manually."
+            else:
+                results[h] = "Purged" if res.returncode == 0 else f"Error: {res.stderr.strip()}"
 
         _set_teardown_state(True, "sweeping", f"Sweeping orphaned shared memory on {host_list}...")
         sweep_result = sweep_ipc_orphans(target_hosts=hosts_to_clean, dry_run=False)
@@ -3096,13 +3136,59 @@ if HAS_FASTAPI:
     def api_sweep_ipc_orphans(req: SweepIpcRequest):
         return sweep_ipc_orphans(dry_run=req.dry_run)
 
+_SSH_MUX_FLUSH_INTERVAL_SEC = 300  # every 5 minutes
+
+def _flush_stale_ssh_multiplex_sockets():
+    """
+    Remove this container's own SSH ControlMaster multiplex sockets
+    (~/.ssh/cm-* and /tmp/cm-*). This is the exact same hygiene step
+    dgx-config's CLI wrapper already runs before every single invocation
+    ("Flush Stale SSH Multiplex Sockets inside Container") -- but every
+    CLI call is short-lived and gets a fresh flush for free, while this
+    long-running daemon process never flushes for itself across a
+    multi-day uptime.
+
+    Why it matters here specifically: run_ssh()'s caller-side timeout
+    (e.g. .result(timeout=...)) only stops the CALLER from waiting: it
+    does not kill the underlying SSH subprocess if that subprocess is
+    itself hung (e.g. on a dead/stale multiplexed control connection).
+    WORKER_POOL has only len(HOSTS)*2 threads total; a thread stuck
+    forever on a hung SSH call never comes back to the pool. Losing all
+    of them one at a time over a long enough uptime is believed to be
+    what caused get_cluster_status() to wedge and silently serve a
+    stale cache for hours on 2026-08-25 and again on 2026-08-27.
+
+    Removing the socket FILE while a live connection still has it open
+    is safe on Linux -- the open fd keeps working, and the next SSH
+    invocation through that ControlPath just establishes a fresh master.
+    This is prophylactic housekeeping, not a fix for an SSH call that's
+    ALREADY hung (see run_ssh()'s own timeout handling for that half).
+    """
+    removed = 0
+    for pattern in ("/root/.ssh/cm-*", "/tmp/cm-*"):
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"[+] Flushed {removed} stale SSH multiplex socket(s)")
+
 def _telemetry_daemon_loop():
     """Background polling loop for maintaining lifetime and session analytics."""
+    iterations = 0
     while True:
         try:
             get_cluster_status()
         except Exception:
             pass
+        iterations += 1
+        if iterations % max(1, _SSH_MUX_FLUSH_INTERVAL_SEC // 10) == 0:
+            try:
+                _flush_stale_ssh_multiplex_sockets()
+            except Exception:
+                pass
         time.sleep(10)
 
 def handle_shutdown(signum, frame):

@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -124,7 +125,24 @@ def run_ssh(
     pseudo-TTY (needed for progress bars to render over SSH).
 
     connect_timeout populates -o ConnectTimeout=N; timeout is the overall
-    subprocess timeout passed to subprocess.run.
+    subprocess timeout.
+
+    Process-tree cleanup on timeout: the ssh child is launched via
+    os.setsid (its own session/process group, separate from ours) so that
+    a timeout kills the WHOLE tree via os.killpg, not just the immediate
+    ssh process plain subprocess.run(..., timeout=...) would track.
+    Confirmed by direct test that this matters: with ControlPersist
+    backgrounding, the tracked ssh process can exit/be killed well within
+    `timeout` while a persisted control-master child it spawned keeps
+    running as an orphan indefinitely afterward -- subprocess.run's
+    single-process kill does correctly bound OUR wait time (it does not
+    hang), but leaves that orphan behind. Over a long daemon uptime that
+    orphan accumulation is real, undesirable process/fd/PID leakage, even
+    though it isn't what caused a WORKER_POOL thread to look "stuck"
+    (that thread does get its result back on schedule either way -- see
+    dgx-orchestrator.py's WORKER_POOL sizing/sharing for the more likely
+    explanation for actual multi-hour status-poll staleness, which is a
+    separate concern from this file).
     """
     if user is None:
         user = load_cluster_config().ssh_user
@@ -142,6 +160,17 @@ def run_ssh(
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", f"ConnectTimeout={connect_timeout}",
+        # Detect a connection that LOOKS established at the TCP level but
+        # is actually dead (peer vanished without a clean FIN/RST -- host
+        # reboot, network partition, VM pause, etc.) instead of relying
+        # solely on our own outer subprocess timeout to eventually notice.
+        # 2 missed keepalives at 5s apart = ssh gives up on its own within
+        # ~10-15s of genuine silence. Harmless during an active transfer
+        # (data flow itself demonstrates liveness); only matters for
+        # otherwise-idle connections, which is exactly the long-lived,
+        # mostly-idle ControlPersist master case this is aimed at.
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=2",
         # Reuse one TCP+auth handshake per host across calls instead of
         # paying a fresh SSH negotiation every time. dgx-config already
         # cleans up /tmp/cm-* sockets on every invocation - this is what
@@ -154,13 +183,36 @@ def run_ssh(
         quoted_remote_cmd,
     ])
 
+    popen_kwargs = {"preexec_fn": os.setsid}
+    if capture:
+        popen_kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # capture=False: no stdout/stderr kwargs at all, same as before -- the
+    # child inherits our real stdout/stderr so progress bars stream live.
+
+    proc = subprocess.Popen(ssh_cmd, **popen_kwargs)
     try:
-        if capture:
-            res = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
-        else:
-            res = subprocess.run(ssh_cmd, timeout=timeout)
-        return res
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(args=ssh_cmd, returncode=proc.returncode, stdout=stdout, stderr=stderr)
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(args=ssh_cmd, returncode=124, stdout="", stderr="Command execution timed out.")
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # already gone
+        try:
+            # Short, not a second full timeout budget: if anything is
+            # still holding the pipe open at this point, it's because it
+            # deliberately detached into its own session (e.g. a real
+            # ControlPersist master, by design -- see this function's
+            # docstring) and killpg cannot reach it regardless of how
+            # long we wait here. Waiting longer only adds latency without
+            # improving the outcome.
+            stdout, stderr = proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        return subprocess.CompletedProcess(args=ssh_cmd, returncode=124, stdout=stdout, stderr=stderr or "Command execution timed out.")
     except Exception as e:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         return subprocess.CompletedProcess(args=ssh_cmd, returncode=1, stdout="", stderr=str(e))
