@@ -24,7 +24,9 @@ Models are cached on the host at `/home/tetrel/.cache/huggingface` to prevent re
 * '''Management:''' 10.0.14.x subnet for SSH, Gloo, and the `--master-addr`/`--master-port` rendezvous (confirmed against the deploy code — this rides the management network, not the RoCE fabric).
 * '''RoCEv2:''' ConnectX-7 (`rocep1s0f0`) for the actual NCCL tensor/all-reduce traffic, steered there via `NCCL_SOCKET_IFNAME` / `NCCL_IB_HCA` / `NCCL_IB_GID_INDEX` env vars.
 
-Host/port/network values all live in `cluster_config.yaml` at the repo root, not hardcoded in the Python — see `README.md`'s "Configuration" section if you need to change any of them.
+Host/port/network values all live in `cluster_config.yaml` at the repo root, not hardcoded in the Python — see `README.md`'s "Configuration" section if you need to change any of them. Host identity throughout `dgx-orchestrator.py` (`PRIMARY_HOST`/`SECONDARY_HOST`/`PRIMARY_HOST_IP`) is now derived from this file rather than hardcoded, so pointing the orchestrator at a different host pair is a config change, not a code change — see `docs/TOMBSTONES.md` #73 for the history and `README.md`'s host mapping section for the current pair.
+
+After editing and redeploying `dgx-orchestrator.py`, confirm the new code actually landed before trusting it: check the version badge next to Server Time on the dashboard, or `orchestrator_version` in `dgx-config status` / `/api/status`, against what you expect. A forgotten `git push` before `git pull`-ing on `maestro` silently leaves the daemon running the old code with no error surfaced anywhere — this has happened for real (see `docs/TOMBSTONES.md` #65).
 
 == Setup ==
 

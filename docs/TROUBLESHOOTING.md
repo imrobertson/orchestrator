@@ -112,6 +112,14 @@ bind.
 
 **Known-bad (under speculation):** `--attention-backend B12X_ATTN` when combined with DeepSeek-V4 Sparse MLA attention and speculative draft tokens on GB10 (SM120). FlashInfer's JIT autotuner (`sparse_mla_sm120_decode_dsv4`) fails to match non-standard draft tensor shapes to pre-compiled tuning buckets, falling back to unoptimized runners or timing out during startup.
 
+### Host identity — don't hardcode `spark-3`/`spark-4`
+
+**Validated:** deriving host identity from `HOSTS` / `cluster_config.yaml` via the `PRIMARY_HOST` / `SECONDARY_HOST` / `PRIMARY_HOST_IP` constants.
+
+**Known-bad:** hardcoding the literal strings `spark-3` / `spark-4` or the management IP anywhere in a new code path. This bit for real once already — a hardcoded `target_hosts` in the 2-node deploy path meant a deploy aimed at a different host pair would have silently targeted, and torn down, spark-3/4 instead (see `TOMBSTONES.md` #73). This matters more than it used to: a future host pair is not guaranteed to share a network segment or ConnectX-7 fabric with spark-3/4, so anything that assumes "the cluster" means exactly these two nodes on one fabric is a landmine, not just inflexible code.
+
+**Open gap:** the primary/secondary derivation is naming-only — it doesn't yet express the constraint that a deployed pair must actually share a fabric. See `ARCHITECTURE-MIGRATION-PLAN.md`'s Phase 3 section.
+
 ### Recipe naming discipline
 
 Not a `vllm_args` issue, but earned the hard way: two recipes with catalog
@@ -154,3 +162,13 @@ unambiguous. See `docs/USERMANUAL.md`'s "Adding a New Model" section and
 * **Failure:** Dashboard shows `NOT READY - WARMUP` indefinitely, ETA counting up with no historic data, for a container that's actually dead.
 * **Cause:** In a 2-node Ray deploy, the container's PID 1 is `ray start --block`, not the vLLM engine — the engine runs as a separate detached `docker exec -d` process. Docker correctly reports the container `RUNNING` long after the engine itself crashed. The status logic's log-keyword scanner could also match words inside a crash's own error message (e.g. "kv cache") as if they were progress indicators.
 * **Rule:** Status detection now checks for an actual Python traceback in the logs first and reports `CRASHED (ENGINE EXITED: ...)` before falling through to keyword matching. If a model ever looks stuck loading far past its estimate with no error surfaced, check `dgx-config logs` directly rather than trusting the status badge alone — container-level "running" doesn't guarantee the engine inside it is alive.
+
+### 7. Silent Worker Death From Ray's Own Memory Monitor, Not a Driver Fault
+* **Failure:** A worker container dies mid-session with no obvious error in `docker logs`; prior investigation on this exact symptom wrongly suspected a DeepGEMM/CUDA kernel bug from a compile warning logged right before the death.
+* **Cause:** Ray's own node-memory monitor (`threshold_memory_monitor.cc`) OOM-kills a worker once host memory usage crosses ~95%, independent of GPU/VRAM headroom. On the GB10's unified LPDDR5x pool, a `gpu_util` set too high for the model/context size leaves too little headroom for JIT caches, page cache, and Ray/Python overhead over a multi-hour session — confirmed on the 1M-context DeepSeek recipe at `gpu_util: 0.82` (now lowered to `0.75`).
+* **Rule:** Don't trust a compile warning near a crash timestamp as the cause without checking Ray's own logs first. This diagnosis is only possible at all because Ray's session directory (`/tmp/ray`) is now bind-mounted to a persistent, per-deploy host path — before that fix, a crashed worker's logs vanished the moment its container was torn down, which is exactly what left an earlier, likely-identical crash unconfirmed and permanently undiagnosable. If a worker dies with no persisted logs to check, that's the first gap to close, not a reason to guess.
+
+### 8. Multi-Hour Dashboard Freeze From a Self-Deadlocked Tracker
+* **Failure:** The dashboard shows a single frozen snapshot for hours — model status, telemetry, everything — with no error surfaced anywhere except container stdout. Restarting the daemon provides only temporary relief; the freeze recurs roughly an hour into the next real serving session.
+* **Cause:** `SessionTracker`'s internal lock was a plain (non-reentrant) `threading.Lock()`. Its own periodic flush path re-acquires that same lock from the same thread once a session runs long enough (>1hr) — which a plain `Lock` cannot do, so the thread deadlocks itself permanently. Because status polling only ever keeps one computation in flight at a time, this single wedged thread freezes the entire dashboard, not just telemetry.
+* **Rule:** Fixed by switching to `threading.RLock()`. If the dashboard ever looks frozen again with data that never changes across multiple polls, check `/api/status`'s `stale` / `stale_for_seconds` fields first — a value that's actually growing over minutes/hours (not just under a couple of seconds of normal poll latency) means the backend computation is genuinely stuck, not just slow, and is worth a `py-spy dump` against the live process rather than a guess.

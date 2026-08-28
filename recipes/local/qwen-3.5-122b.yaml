@@ -1,6 +1,7 @@
 recipe_version: '1'
 hf_path: Qwen/Qwen3.5-122B-A10B-FP8
-gpu_util: 0.8
+image: eugr/spark-vllm-b12x:latest
+gpu_util: 0.70
 capability:
   task: null
   context_class: null
@@ -22,4 +23,5 @@ topologies:
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
     - VLLM_USE_DEEP_GEMM=0
     vllm_args: >-
-      --disable-custom-all-reduce --trust-remote-code --max-num-seqs 2 --enforce-eager -moe-backend flashinfer_cutlass
+      --disable-custom-all-reduce --trust-remote-code --distributed-executor-backend ray
+      --max-num-seqs 2 --enforce-eager --moe-backend flashinfer_cutlass

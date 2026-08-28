@@ -12,7 +12,7 @@ The dashboard is the easiest way to visualize cluster health and manage models.
 * '''Access the Dashboard:''' Open your web browser and navigate to <code>http://<MAESTRO_IP>:5000</code>.
 
 === Dashboard Features ===
-* '''Header bar:''' live cluster-wide throughput (<code>SPEED: X tok/s</code>) and request concurrency (<code>THREADS: X active (Y queued)</code>) whenever a model is serving, plus server time and an '''ONLINE MODE''' / '''OFFLINE MODE''' indicator.
+* '''Header bar:''' live cluster-wide throughput (<code>SPEED: X tok/s</code>) and request concurrency (<code>THREADS: X active (Y queued)</code>) whenever a model is serving, plus server time (UTC — a log-comparison reference, not a wall clock), a version badge showing the running <code>ORCHESTRATOR_VERSION</code> (useful for confirming a fix you just deployed actually landed), and an '''ONLINE MODE''' / '''OFFLINE MODE''' indicator.
 * '''Per-host panels (<code>spark-4</code>, <code>spark-3</code>):''' Docker daemon status, active container name and state, currently loaded model, model status, an ETA while a model is still loading, and live '''TEMP''' / '''GPU''' / '''MEM''' readings. Model status is one of: <code>READY</code>, a warmup/loading stage, <code>CRASHED</code> (the engine process itself has died — shown in red, with a reason where one could be determined; check that host's logs), <code>ORPHANED</code> (a worker whose head crashed out from under it — needs a teardown), or <code>NONE</code>.
 * '''Deploy a Model (Model Deployer panel):'''
 # Select a model from the '''Select Model''' dropdown — populated live from the current recipe catalog, not a fixed list (see the catalog note below the table).
@@ -72,7 +72,26 @@ Evicts whole JIT cache entries, oldest-first, but only on a host currently below
 <syntaxhighlight lang="bash">
 dgx-config authorize-key --key ~/.ssh/id_ed25519.pub
 </syntaxhighlight>
-Appends the given public key to <code>~/.ssh/authorized_keys</code> on both <code>spark-3</code> and <code>spark-4</code>. Rarely needed day-to-day — mainly for onboarding a new admin identity directly to the Spark hosts (separate from your Tailscale access to <code>maestro</code> itself).
+Appends the given public key to <code>~/.ssh/authorized_keys</code> on every configured host (currently <code>spark-3</code> and <code>spark-4</code> — this now follows whatever's listed in <code>cluster_config.yaml</code>, not a hardcoded pair). Rarely needed day-to-day — mainly for onboarding a new admin identity directly to the Spark hosts (separate from your Tailscale access to <code>maestro</code> itself).
+* '''Inspect orphaned shared-memory segments (read-only):'''
+<syntaxhighlight lang="bash">
+dgx-config ipc-inventory
+</syntaxhighlight>
+* '''Sweep orphaned shared-memory segments:'''
+<syntaxhighlight lang="bash">
+dgx-config sweep-ipc-orphans --dry-run
+</syntaxhighlight>
+Only ever removes SysV shared-memory segments with a kernel-tracked <code>nattch == 0</code> (i.e. genuinely unattached), so this can't touch anything still in use. Runs automatically as part of every deploy's pre-deploy teardown; this command is for ad-hoc inspection between deploys. Drop <code>--dry-run</code> to actually remove.
+* '''Reclaim persisted crash log space:'''
+<syntaxhighlight lang="bash">
+dgx-config prune-ray-logs --retention-days 7 --dry-run
+</syntaxhighlight>
+Every deploy now persists a crashed worker's Ray session logs (see Troubleshooting) so they survive teardown — this ages them out on a schedule rather than letting them accumulate forever. Drop <code>--dry-run</code> to actually delete.
+* '''Repair a ledger entry after a restart-induced undercount:'''
+<syntaxhighlight lang="bash">
+dgx-config correct-ledger --dry-run
+</syntaxhighlight>
+With no arguments, auto-detects the currently-serving model/topology and live <code>/metrics</code> values and previews the correction. Refuses to overwrite with a smaller value than what's currently recorded unless you pass <code>--force</code>. Backs up the whole ledger file (timestamped) before any real write. See Troubleshooting for the incident that prompted this.
 
 === Previewing a deploy (<code>--dry-run</code>) ===
 Before deploying something unfamiliar, or if you're not sure a model/topology combination will actually work, run:

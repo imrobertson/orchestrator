@@ -16,6 +16,7 @@ topologies:
     - OMP_NUM_THREADS=16
     - VLLM_CPU_OMP_THREADS=16
     vllm_args: >-
-      --trust-remote-code --enable-chunked-prefill --enable-auto-tool-choice 
-      --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer 
-      --generation-config auto --max-num-seqs 8
+      --trust-remote-code --kv-cache-dtype fp8 --enable-chunked-prefill 
+      --enable-auto-tool-choice --tool-call-parser muse_glimmer 
+      --reasoning-parser muse_glimmer --compilation-config '{"mode": 0}' 
+      --max-num-seqs 8
