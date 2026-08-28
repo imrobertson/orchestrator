@@ -605,7 +605,24 @@ _STATUS_CACHE_TTL_SEC = 2  # dedupe bursts of near-simultaneous polls
 # --- Telemetry Session State ---
 class SessionTracker:
     def __init__(self):
-        self.lock = threading.Lock()
+        # RLock, not Lock: update() holds this lock for its entire body,
+        # and can itself call _commit_session() (which also acquires this
+        # lock) when its periodic-flush-while-active condition fires --
+        # any sustained session eventually hits this. A plain Lock cannot
+        # be re-acquired by the thread already holding it and deadlocks
+        # permanently right there, with no possible recovery short of
+        # restarting the process. Confirmed via py-spy dump against a live
+        # wedged production process on 2026-08-28 (Thread "ThreadPoolExecutor-0_1",
+        # blocked inside _commit_session, called from update, called from
+        # _compute_cluster_status_impl) -- this is the actual root cause of
+        # the get_cluster_status() staleness incidents on 2026-08-25,
+        # 2026-08-27, and 2026-08-28, not any of the WORKER_POOL/SSH-layer
+        # theories investigated earlier the same day. Since
+        # get_cluster_status() only ever keeps one _STATUS_INFLIGHT future
+        # at a time, this single self-deadlocked thread wedges status
+        # polling entirely, indefinitely, the first time any session runs
+        # long enough to hit the 1-hour periodic flush.
+        self.lock = threading.RLock()
         self.active = False
         self.first_active_ts = 0.0
         self.last_active_ts = 0.0
