@@ -1,6 +1,7 @@
 recipe_version: '1'
 hf_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
-gpu_util: 0.7
+image: eugr/spark-vllm-b12x:latest
+gpu_util: 0.70
 capability:
   task: null
   context_class: null
@@ -15,5 +16,7 @@ topologies:
     - OMP_NUM_THREADS=16
     - VLLM_CPU_OMP_THREADS=16
     vllm_args: >-
-      --trust-remote-code --kv-cache-dtype fp8 --max-num-seqs 4 --speculative-model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
-      --speculative-config '{"method":"dspark"}'
+      --trust-remote-code --kv-cache-dtype fp8 --max-num-seqs 4 
+      --compilation-config '{"mode": 0}'
+      --speculative-model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
+      --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
