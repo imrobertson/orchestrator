@@ -11,6 +11,13 @@ of multi-node LLM serving over a 100GbE backplane via NCCL.
 
 import argparse
 import datetime
+
+# Bump this on every meaningful change and confirm it after every deploy --
+# "did my push/pull/restart actually take" should be one glance, not
+# remembering which specific line to grep for. Surfaced in /api/status,
+# the CLI's `status` command, daemon startup logs, and the dashboard header.
+ORCHESTRATOR_VERSION = "2026-08-28-primary-secondary-host-refactor"
+
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
 import glob
@@ -62,6 +69,22 @@ BENCHMARK_RESULTS_PATH = BASE_DIR / "benchmark_results.txt"
 HF_PATH_LEDGER_PATH = BASE_DIR / "hf_path_ledger.json"
 
 HOSTS = legacy_hosts_dict()
+
+# Every "default host" and "the 2-node pair" in this file used to be the
+# literal strings "spark-4"/"spark-3", hardcoded independently in ~10
+# different places. That's silently wrong the moment this same code is
+# pointed at a different cluster_config.yaml (e.g. a second orchestrator
+# instance scoped to a different node pair, like spark-5/spark-6) -- a
+# 2-node deploy would target hosts that don't even exist in that config's
+# HOSTS, and get_cluster_status()'s serving_host fallback would KeyError
+# constantly whenever nothing happened to be deployed. Deriving these from
+# HOSTS itself (in cluster_config.yaml's own listed order) means the exact
+# same code is correct for any 2-host cluster_config.yaml with zero
+# further changes -- and is a no-op for the existing spark-4/spark-3 setup,
+# since spark-4 is still listed first there.
+PRIMARY_HOST = next(iter(HOSTS), "spark-4")
+SECONDARY_HOST = list(HOSTS.keys())[1] if len(HOSTS) > 1 else PRIMARY_HOST
+PRIMARY_HOST_IP = HOSTS.get(PRIMARY_HOST, {}).get("ip", "10.0.14.43")
 
 NETWORK_STATE_FILE = BASE_DIR / ".network_mode"
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9?]*[ -/]*[@-~])')
@@ -853,7 +876,7 @@ def get_lightweight_telemetry(ip: str, user: str) -> dict:
             
     return telemetry
 
-def check_vllm_health(head_ip: str = "10.0.14.43", port: int = 8000) -> bool:
+def check_vllm_health(head_ip: str = PRIMARY_HOST_IP, port: int = 8000) -> bool:
     url = f"http://{head_ip}:{port}/health"
     try:
         req = urllib.request.Request(url, method="GET")
@@ -862,7 +885,7 @@ def check_vllm_health(head_ip: str = "10.0.14.43", port: int = 8000) -> bool:
     except Exception:
         return False
 
-def wait_for_cluster_ready(head_ip: str = "10.0.14.43", timeout_sec: int = 900, poll_interval: int = 15) -> bool:
+def wait_for_cluster_ready(head_ip: str = PRIMARY_HOST_IP, timeout_sec: int = 900, poll_interval: int = 15) -> bool:
     start_time = time.time()
     print(f"[+] Polling http://{head_ip}:8000/health until serving ready (Timeout: {timeout_sec}s)...")
     
@@ -1049,7 +1072,7 @@ def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached"
         pass
     return default_est, False
 
-def get_vllm_metrics(head_ip: str = "10.0.14.43", port: int = 8000) -> dict:
+def get_vllm_metrics(head_ip: str = PRIMARY_HOST_IP, port: int = 8000) -> dict:
     metrics = {
         "tps": 0.0, "running_requests": 0, "waiting_requests": 0,
         "prompt_tokens": 0.0, "gen_tokens": 0.0, "draft_tokens": 0.0, "accepted_tokens": 0.0
@@ -2050,7 +2073,7 @@ def _compute_cluster_status_impl() -> dict:
         for host, res in phase1_results.items()
     }
 
-    serving_host = "spark-4"
+    serving_host = PRIMARY_HOST
     for host in HOSTS:
         if container_info.get(host, {}).get("active_container") in (ContainerRole.STANDALONE, ContainerRole.HEAD):
             serving_host = host
@@ -2105,6 +2128,7 @@ def _compute_cluster_status_impl() -> dict:
         teardown_msg = TEARDOWN_STATE["message"]
 
     status_data = {
+        "orchestrator_version": ORCHESTRATOR_VERSION,
         # Emit real, unambiguous UTC. Previously this used naive
         # datetime.datetime.now() (which, since this container's system
         # clock is UTC, was already correct-in-value) with a hardcoded
@@ -2151,8 +2175,8 @@ def _compute_cluster_status_impl() -> dict:
             status_data["hosts"][host] = host_status
 
     # Strictly guarded worker state mirroring
-    head_s = status_data["hosts"].get("spark-4")
-    worker_s = status_data["hosts"].get("spark-3")
+    head_s = status_data["hosts"].get(PRIMARY_HOST)
+    worker_s = status_data["hosts"].get(SECONDARY_HOST)
     if head_s and worker_s:
         head_is_active = (head_s["container_state"] == "RUNNING" and 
                           head_s["active_model"] != "None" and 
@@ -2578,7 +2602,7 @@ def _run_benchmark_worker(head: str, nodes: int, model_key: Optional[str] = None
         BENCHMARK_STATE["message"] = f"Executing 3-pass benchmark against {head}..."
 
     try:
-        head_ip = HOSTS[head]["ip"] if head in HOSTS else "10.0.14.43"
+        head_ip = HOSTS[head]["ip"] if head in HOSTS else PRIMARY_HOST_IP
         print(f"[+] Running background 3-pass benchmark against {head} ({head_ip})...")
 
         cmd = [sys.executable, str(BASE_DIR / "benchmark.py"), "--host", head_ip, "--nodes", str(nodes)]
@@ -2637,7 +2661,7 @@ def execute_standalone_benchmark(head: str, nodes: int, model_key: Optional[str]
         if BENCHMARK_STATE["running"]:
             return {"status": "error", "message": "A benchmark pass is already running in the background."}
 
-    head_ip = HOSTS[head]["ip"] if head in HOSTS else "10.0.14.43"
+    head_ip = HOSTS[head]["ip"] if head in HOSTS else PRIMARY_HOST_IP
     if not check_vllm_health(head_ip):
         return {"status": "error", "message": f"vLLM engine on {head} ({head_ip}) is not responding to health checks."}
 
@@ -2664,7 +2688,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     if nodes not in (1, 2): return {"status": "error", "message": f"Invalid 'nodes' value {nodes!r}: must be 1 or 2."}
     if head not in HOSTS: return {"status": "error", "message": f"Invalid 'head' value {head!r}: must be one of {list(HOSTS.keys())}."}
 
-    target_hosts = ["spark-4", "spark-3"] if nodes == 2 else [head]
+    target_hosts = [PRIMARY_HOST, SECONDARY_HOST] if nodes == 2 else [head]
     catalog_resp = load_model_catalog()
     models_catalog = catalog_resp.get("catalog", {}).get("models", {})
 
@@ -2978,7 +3002,7 @@ def get_container_logs(host: str, tail: int = 40) -> dict:
 def interactive_menu():
     print("=== [ TETREL SECURITY ] DGX Cluster Orchestrator ===")
     status = get_cluster_status()
-    print(f"Server Time: {status['server_time']} | Mode: {status['network_mode']} | API: {'READY' if status['cluster_ready'] else 'OFFLINE'} (serving: {status.get('serving_host', 'spark-4')}) | TPS: {status.get('system_tps', 0.0)} tok/s | Streams: {status.get('running_requests', 0)} active ({status.get('waiting_requests', 0)} queued)\n")
+    print(f"[{status.get('orchestrator_version', 'unknown')}] Server Time: {status['server_time']} | Mode: {status['network_mode']} | API: {'READY' if status['cluster_ready'] else 'OFFLINE'} (serving: {status.get('serving_host', PRIMARY_HOST)}) | TPS: {status.get('system_tps', 0.0)} tok/s | Streams: {status.get('running_requests', 0)} active ({status.get('waiting_requests', 0)} queued)\n")
 
     for h, data in status["hosts"].items():
         tele = data.get("telemetry", {})
@@ -3023,11 +3047,11 @@ def interactive_menu():
 
         selected_topo = topo_keys[int(t_choice) - 1]
         nodes = 2 if selected_topo == "2_node" else 1
-        head = "spark-4"
+        head = PRIMARY_HOST
 
         if nodes == 1:
-            h_choice = input("Target head node for 1-node deploy (1: spark-4, 2: spark-3) [1]: ").strip()
-            if h_choice == "2": head = "spark-3"
+            h_choice = input(f"Target head node for 1-node deploy (1: {PRIMARY_HOST}, 2: {SECONDARY_HOST}) [1]: ").strip()
+            if h_choice == "2": head = SECONDARY_HOST
 
         user_name = os.environ.get("USER") or getpass.getuser()
         user_id = input(f"Enter User ID / Auditor [{user_name}]: ").strip() or user_name
@@ -3053,14 +3077,14 @@ if HAS_FASTAPI:
     class DeployRequest(BaseModel):
         model: str
         nodes: Literal[1, 2]
-        head: str = "spark-4"
+        head: str = PRIMARY_HOST
         user_id: str = "dashboard_user"
         wait: bool = False
         run_benchmark: bool = False
         dry_run: bool = False
 
     class BenchmarkRequest(BaseModel):
-        head: str = "spark-4"
+        head: str = PRIMARY_HOST
         nodes: Literal[1, 2] = 2
         model: Optional[str] = None  # catalog key, threaded to benchmark.py --model-key for ledger join
 
@@ -3239,14 +3263,14 @@ def main():
     deploy_parser = subparsers.add_parser("deploy")
     deploy_parser.add_argument("--model", required=True)
     deploy_parser.add_argument("--nodes", type=int, default=2, choices=[1, 2])
-    deploy_parser.add_argument("--head", default="spark-4")
+    deploy_parser.add_argument("--head", default=PRIMARY_HOST)
     deploy_parser.add_argument("--wait", action="store_true", help="Block until HTTP /health passes")
     deploy_parser.add_argument("--benchmark", action="store_true", help="Automatically run benchmark.py when ready")
     deploy_parser.add_argument("--dry-run", action="store_true", help="Print the docker run command(s) this deploy would send, without SSHing or executing anything")
     deploy_parser.add_argument("-y", "--yes", action="store_true")
 
     logs_parser = subparsers.add_parser("logs")
-    logs_parser.add_argument("--host", default="spark-4")
+    logs_parser.add_argument("--host", default=PRIMARY_HOST)
     logs_parser.add_argument("--tail", type=int, default=40)
 
     auth_parser = subparsers.add_parser("authorize-key")
@@ -3295,14 +3319,14 @@ def main():
     cli_deploy = cli_sub.add_parser("deploy")
     cli_deploy.add_argument("--model", required=True)
     cli_deploy.add_argument("--nodes", type=int, default=2, choices=[1, 2])
-    cli_deploy.add_argument("--head", default="spark-4")
+    cli_deploy.add_argument("--head", default=PRIMARY_HOST)
     cli_deploy.add_argument("--wait", action="store_true")
     cli_deploy.add_argument("--benchmark", action="store_true")
     cli_deploy.add_argument("--dry-run", action="store_true", help="Print the docker run command(s) this deploy would send, without SSHing or executing anything")
     cli_deploy.add_argument("-y", "--yes", action="store_true")
 
     cli_logs = cli_sub.add_parser("logs")
-    cli_logs.add_argument("--host", default="spark-4")
+    cli_logs.add_argument("--host", default=PRIMARY_HOST)
     cli_logs.add_argument("--tail", type=int, default=40)
 
     cli_auth = cli_sub.add_parser("authorize-key")
@@ -3347,6 +3371,7 @@ def main():
         signal.signal(signal.SIGTERM, handle_shutdown)
         
         port = getattr(args, "port", 5001)
+        print(f"[+] dgx-orchestrator daemon starting -- version: {ORCHESTRATOR_VERSION}")
         t = threading.Thread(target=_telemetry_daemon_loop, daemon=True)
         t.start()
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

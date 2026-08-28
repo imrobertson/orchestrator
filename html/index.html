@@ -289,6 +289,7 @@
             <div class="clock" id="speedoMeter" style="border-color: var(--accent); color: var(--accent);">SPEED: 0.0 tok/s</div>
             <div class="clock" id="streamThreads">THREADS: 0 active</div>
             <div class="clock" id="serverClock">Connecting...</div>
+            <div class="clock" id="versionBadge" title="dgx-orchestrator.py's ORCHESTRATOR_VERSION -- confirms the running code matches what you last pushed/pulled/restarted">v: --</div>
         </div>
     </header>
 
@@ -424,6 +425,7 @@
     const API_PORT = 5001;
     const API_BASE = `http://${window.location.hostname}:${API_PORT}/api`;
     let currentLogHost = 'spark-4';
+    let currentServingHost = 'spark-4';
     let currentOfflineState = false;
     let globalCatalog = {};
     let lastSyncedActiveModel = null;
@@ -577,11 +579,31 @@
             const res = await fetch(`${API_BASE}/status`);
             const data = await res.json();
             document.getElementById('serverClock').innerText = `Server Time: ${formatUtc(data.server_time)}`;
+            const versionBadge = document.getElementById('versionBadge');
+            if (versionBadge) versionBadge.innerText = `v: ${data.orchestrator_version || 'unknown'}`;
             
             latestSessionStats = data.session_stats;
             isBenchmarking = data.is_benchmarking || false;
             isTearingDown = data.is_tearing_down || false;
             teardownMessage = data.teardown_message || '';
+
+            // Keep the head/target selector in sync with whatever's
+            // actually serving, not just its hardcoded default option.
+            // Without this, triggerBenchmarkNow() (and a fresh Deploy
+            // form) silently reads spark-4 forever for any recipe whose
+            // topologyRow is hidden (single-topology models -- see
+            // updateTopologyOptions()), since the user has no visible
+            // control to ever change it. Benchmark in particular targets
+            // "the active container", so it should always reflect reality
+            // regardless of whether the picker happens to be visible.
+            if (data.serving_host) {
+                currentServingHost = data.serving_host;
+                const headSelect = document.getElementById('headSelect');
+                if (headSelect && headSelect.value !== currentServingHost
+                        && headSelect.querySelector(`option[value="${currentServingHost}"]`)) {
+                    headSelect.value = currentServingHost;
+                }
+            }
             
             if (latestSessionStats && latestSessionStats.active) {
                 document.getElementById('speedoMeter').innerText = `SESSION SPEED: ${latestSessionStats.tps} tok/s`;
