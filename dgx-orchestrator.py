@@ -415,6 +415,16 @@ print(json.dumps(report))
 # host, which is a real check worth building but isn't safe to rush
 # without testing against the actual hosts -- deliberately deferred, see
 # docs/ROADMAP.md. argv: <dry_run:0|1>
+#
+# Only the actual `ipcrm -m` removal call is sudo'd (inside the script,
+# below) -- NOT the outer python3 invocation. Reading /proc/sysvipc/shm
+# needs no privilege at all. This matters because the call site
+# deliberately does NOT wrap this whole script in sudo anymore: doing so
+# would need a sudoers rule matching "python3 -c *", which grants
+# passwordless root execution of arbitrary Python, not just this sweep.
+# Scoping sudo to just "ipcrm -m *" here means the corresponding sudoers
+# entry can be scoped that narrowly too -- see sweep_ipc_orphans()'s
+# call site for the exact command this expects to be permitted.
 _REMOTE_IPC_SWEEP_SCRIPT = r'''
 import json, subprocess, sys
 
@@ -447,7 +457,7 @@ if lines:
         if dry_run:
             removed.append({"shmid": shmid, "bytes": size, "status": "would remove"})
             continue
-        res = subprocess.run(["ipcrm", "-m", shmid], capture_output=True, text=True)
+        res = subprocess.run(["sudo", "ipcrm", "-m", shmid], capture_output=True, text=True)
         if res.returncode == 0:
             removed.append({"shmid": shmid, "bytes": size, "status": "removed"})
         else:
@@ -1432,11 +1442,13 @@ def sweep_ipc_orphans(target_hosts: list = None, dry_run: bool = False) -> dict:
     results = {}
     for host in hosts_to_check:
         ip = HOSTS[host]["ip"]
-        # ipcrm on a segment owned by a different uid (containers commonly
-        # run as root inside; the SSH user may not be root) needs
-        # elevated privileges, same as the sudo usage already established
-        # elsewhere in this file (e.g. sudo nvidia-smi, sudo kill).
-        cmd = ["sudo", "python3", "-c", _REMOTE_IPC_SWEEP_SCRIPT, "1" if dry_run else "0"]
+        # NOT sudo'd here -- the script itself only escalates for the
+        # actual `ipcrm -m` removal call (see _REMOTE_IPC_SWEEP_SCRIPT's
+        # comment). Reading /proc/sysvipc/shm needs no privilege, and
+        # keeping the outer invocation unprivileged means the sudoers
+        # entry on each host only needs to permit "ipcrm -m *", not
+        # arbitrary "python3 -c *".
+        cmd = ["python3", "-c", _REMOTE_IPC_SWEEP_SCRIPT, "1" if dry_run else "0"]
         res = run_ssh(ip, None, cmd, capture=True, timeout=30)
 
         if res.returncode != 0:
