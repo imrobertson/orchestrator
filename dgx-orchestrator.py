@@ -14,16 +14,17 @@ import datetime
 
 # Human-maintained descriptive slug -- still bump this on every meaningful
 # change, since "what was this deploy about" at a glance is genuinely
-# useful and a git hash alone doesn't convey it. The hash suffix appended
-# to ORCHESTRATOR_VERSION below (see _compute_git_version_suffix(), defined
-# after BASE_DIR since it needs it as the git working directory) is what
-# actually answers "did my push/pull/restart take" now -- it's derived,
-# not typed, so it can't be forgotten the way this slug already has been.
+# useful and a hash alone doesn't convey it. The source-hash suffix
+# appended to ORCHESTRATOR_VERSION below (see _compute_source_hash_suffix())
+# is what actually answers "did my push/pull/restart take" now -- it's
+# derived, not typed, so it can't be forgotten the way this slug already
+# has been.
 ORCHESTRATOR_VERSION_SLUG = "2026-08-28-primary-secondary-host-refactor"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
 import glob
+import hashlib
 import json
 import os
 import pathlib
@@ -58,50 +59,56 @@ except ImportError:
 # --- Core Configurations ---
 BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
 
-def _compute_git_version_suffix() -> str:
+def _compute_source_hash_suffix() -> str:
     """
-    Best-effort short git commit hash for whatever code is actually
-    running in this process (+ "-dirty" if the working tree has
-    uncommitted changes), computed once at import time. Exists to remove
-    the "forgot to bump ORCHESTRATOR_VERSION_SLUG" failure mode --  the
-    descriptive slug is still useful for "what was this deploy about" at
-    a glance, but it's manually maintained and has already been forgotten
-    before. The hash is derived, not typed, so "did my push/pull/restart
-    actually take" -- the exact question the version badge exists to
-    answer -- stays answerable even if a commit ships without a slug
-    bump, and the "-dirty" flag catches the case of the daemon running
-    with uncommitted local edits (a real risk given how directly this
-    gets iterated on against live production).
+    Short hash of THIS FILE's own on-disk bytes, computed once at import
+    time. Replaces an earlier git-commit-hash approach that assumed a
+    live git checkout (with .git history) was reachable at runtime --
+    not a safe assumption for a Dockerized daemon: a COPY-based image
+    build routinely excludes .git (image size, avoiding leaked history),
+    and a slim base image may not even have the git binary installed.
+    Confirmed exactly this problem in production: `git rev-parse` had
+    nothing to read inside the running container, silently and
+    permanently falling back to "unknown" on every startup. It also
+    would have made this code annoying to hand to anyone without access
+    to this specific git history -- a real constraint the moment this
+    needs to be shared outside this one repo.
 
-    Falls back to "unknown" if git isn't on PATH, BASE_DIR isn't a git
-    checkout (e.g. a stripped deployment tarball), or anything else goes
-    wrong -- never raises, since a version string failing to compute must
-    never stop the daemon from starting.
+    Hashing the file's own bytes needs nothing external: no git binary,
+    no .git directory, no build-time plumbing to thread a commit hash
+    into the container. It's arguably a MORE accurate answer to "is this
+    exact code running" than a commit hash ever was, too -- it reflects
+    literally what's on disk in this process right now, not what was
+    last committed (which drifts the moment anyone hand-edits a file
+    without committing, something this project's own interactive-
+    against-production workflow makes a real possibility, not a
+    hypothetical).
+
+    Falls back to "unknown" if the file can't be read for any reason --
+    never raises, since a version string failing to compute must never
+    stop the daemon from starting. Prints the actual exception when this
+    happens (unlike the silent "unknown" fallback this shipped with
+    originally) -- that first version failed exactly this way in
+    production with zero diagnostic trail, which is the same silent-
+    except mistake this whole logging pass elsewhere in the file exists
+    to catch. Use Path(__file__).resolve() rather than the bare __file__
+    string: __file__ isn't guaranteed to already be an absolute path --
+    it reflects how the interpreter was invoked, so a relative path
+    resolved against a working directory that doesn't match where the
+    file actually lives (a real risk in a containerized daemon's launch
+    command) fails a bare read_bytes() silently.
     """
     try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=5,
-        )
-        if commit.returncode != 0 or not commit.stdout.strip():
-            return "unknown"
-        commit_hash = commit.stdout.strip()
-
-        dirty_check = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=5,
-        )
-        dirty_suffix = "-dirty" if (dirty_check.returncode == 0 and dirty_check.stdout.strip()) else ""
-
-        return f"{commit_hash}{dirty_suffix}"
-    except Exception:
+        return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()[:8]
+    except Exception as exc:
+        print(f"[!] _compute_source_hash_suffix: failed to hash {__file__} - {exc}")
         return "unknown"
 
 # Surfaced in /api/status, the CLI's `status` command, daemon startup logs,
 # and the dashboard header. Confirm this after every deploy -- see
-# _compute_git_version_suffix()'s docstring for why the hash half of this
+# _compute_source_hash_suffix()'s docstring for why the hash half of this
 # is the load-bearing part.
-ORCHESTRATOR_VERSION = f"{ORCHESTRATOR_VERSION_SLUG}+{_compute_git_version_suffix()}"
+ORCHESTRATOR_VERSION = f"{ORCHESTRATOR_VERSION_SLUG}+{_compute_source_hash_suffix()}"
 MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 LEDGER_PATH = BASE_DIR / "model_ledger.json"
 BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
@@ -688,7 +695,7 @@ BENCHMARK_STATE_LOCK = threading.Lock()
 # updates without teardown itself needing to become async.
 TEARDOWN_STATE = {
     "running": False,
-    "phase": "idle",  # idle | signaling | stopping | removing | sweeping | done
+    "phase": "idle",  # idle | signaling | stopping | removing | sweeping | done | error
     "message": "Idle",
     "last_run": None
 }
@@ -2699,6 +2706,27 @@ def _set_teardown_state(running: bool, phase: str, message: str, mark_last_run: 
         if mark_last_run:
             TEARDOWN_STATE["last_run"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def _teardown_results_are_clean(results: dict, hosts_to_clean: list) -> bool:
+    """
+    True only if every host we set out to tear down has a recorded result
+    and none of them indicate a failure (results[h] is either "Purged",
+    or that plus a shm-sweep suffix, or an "Error: ..." string -- see the
+    "removing" phase above). An empty or partial `results` -- e.g. an
+    exception raised before the "removing" phase ever populated it --
+    counts as NOT clean: treating "we don't actually know what happened"
+    as success is the exact bug this exists to close. See
+    _execute_teardown_impl's `finally` block and api_teardown() for the
+    two places this matters: the live teardown_message shown while
+    polling, and whether /api/teardown returns an error status the
+    dashboard's existing error-toast handling can react to.
+    """
+    if not hosts_to_clean:
+        return True
+    return all(
+        h in results and not str(results[h]).lower().startswith("error")
+        for h in hosts_to_clean
+    )
+
 def _execute_teardown_impl(target_hosts: list = None) -> dict:
     """
     Runs each teardown phase across ALL target hosts CONCURRENTLY, not one
@@ -2790,13 +2818,34 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
     finally:
         # Always resets, whether teardown succeeded or a phase raised --
         # otherwise a mid-teardown exception would leave the dashboard
-        # showing "in progress" forever with no way to clear it.
-        _set_teardown_state(False, "done", f"Teardown complete for {host_list}.", mark_last_run=True)
+        # showing "in progress" forever with no way to clear it. But
+        # "resets" must not mean "always claims success": previously this
+        # message was hardcoded to "Teardown complete" regardless of what
+        # `results` actually says, so a genuine per-host docker-rm failure
+        # was reported identically to a clean teardown -- both to whatever
+        # polls teardown_message live, AND (via api_teardown(), see below)
+        # to the dashboard's final toast. That's what let a host silently
+        # keep its container running while the UI said "done" until
+        # someone noticed the drift and killed it by hand.
+        teardown_ok = _teardown_results_are_clean(results, hosts_to_clean)
+        if teardown_ok:
+            final_message = f"Teardown complete for {host_list}."
+        else:
+            failed = {h: results.get(h, "no result recorded (exception before this host's teardown finished)")
+                      for h in hosts_to_clean
+                      if h not in results or str(results[h]).lower().startswith("error")}
+            final_message = f"Teardown completed WITH ERRORS on {list(failed.keys())} -- check manually: {failed}"
+        _set_teardown_state(False, "done" if teardown_ok else "error", final_message, mark_last_run=True)
         # Always clear ACTIVE_DEPLOYMENT_STATE for these hosts too, same
         # unconditional-reset reasoning as TEARDOWN_STATE above -- a host
         # with no container running must never keep reporting a stale
         # "this recipe is active" record, whether teardown fully succeeded
-        # or a phase raised partway through.
+        # or a phase raised partway through. If the container is actually
+        # still running because teardown failed, _resolve_active_recipe()'s
+        # live-discovery corroboration (see its docstring) will surface
+        # that honestly via the fuzzy-match fallback instead of continuing
+        # to show a stale exact record that teardown was already trying to
+        # invalidate.
         _clear_active_deployment(hosts_to_clean)
 
 def execute_teardown(target_hosts: list = None) -> dict:
@@ -3400,7 +3449,27 @@ if HAS_FASTAPI:
         return res
 
     @app.post("/api/teardown")
-    def api_teardown(): return execute_teardown()
+    def api_teardown():
+        results = execute_teardown()
+        # execute_teardown() has two possible shapes: a top-level
+        # {"status": "error", "message": ...} if it never even started
+        # (e.g. CLUSTER_OP_LOCK busy -- see execute_teardown()'s own early
+        # return), or a per-host results map on the normal path where each
+        # value is "Purged" (+ optional shm-sweep suffix) or "Error: ...".
+        # Previously this endpoint returned either shape as a bare 200 OK
+        # with no inspection at all, so the dashboard's existing
+        # `!response.ok` error-toast branch (see index.html's
+        # teardownRuntimes()) never fired even when a host genuinely
+        # failed to tear down -- the CLI surfaced the same failure because
+        # it prints the raw results dict instead of discarding it. This
+        # brings /api/teardown in line with api_deploy()/api_benchmark()
+        # above, which already both check their result's status.
+        if isinstance(results, dict) and results.get("status") == "error":
+            raise HTTPException(status_code=409, detail=results.get("message", "Teardown could not start."))
+        failed = {h: r for h, r in results.items() if isinstance(r, str) and r.lower().startswith("error")}
+        if failed:
+            raise HTTPException(status_code=500, detail=f"Teardown failed on: {failed}")
+        return results
 
     @app.post("/api/toggle-network")
     def api_toggle_network(req: NetworkToggleRequest):
