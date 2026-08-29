@@ -1,6 +1,6 @@
 recipe_version: '1'
 hf_path: meta-models/Muse-Glimmer-30B
-image: eugr/spark-vllm-b12x:latest
+image: vllm/vllm-openai:nightly
 gpu_util: 0.75
 capability:
   task: null
