@@ -742,38 +742,48 @@ PENDING_LAUNCH_LOCK = threading.Lock()
 # (including the pre-deploy teardown inside execute_deployment(), so a new
 # deploy always starts from a clean record, never a stale one from whatever
 # was previously running on that host).
+#
+# Deliberately has NO in-memory cache/global -- every read below goes
+# straight to disk via _load_active_deployment_state(), same as
+# model_ledger.json and hf_path_ledger.json already do via
+# _read_json_state(). An earlier version of this DID cache the dict in a
+# module-level global, mutated in place by _set_active_deployment()/
+# _clear_active_deployment() -- which broke the moment a deploy or teardown
+# ran through a *different process* than the long-running daemon (e.g. the
+# `dgx-config`/CLI path, which is a genuine one-off process, not a request
+# handled by the daemon). The CLI process wrote the correct record to disk
+# and exited; the daemon's own in-memory copy never saw that write and kept
+# serving a stale (or entirely absent) record via /api/status indefinitely
+# -- confirmed in production: the file on disk had the correct
+# catalog_key, /api/status still reported active_recipe_key: null. Always
+# reading fresh trades a small JSON read (this file is a few hundred bytes)
+# on every status poll for correctness across every process that can write
+# it, which is the same trade-off the other two ledgers already made.
 ACTIVE_DEPLOYMENT_STATE_LOCK = threading.Lock()
 
 def _load_active_deployment_state() -> dict:
     return _read_json_state(ACTIVE_DEPLOYMENT_STATE_PATH) or {}
 
-# Loaded once at import time so a daemon restart immediately knows what's
-# running on each host, before the first status poll even completes.
-ACTIVE_DEPLOYMENT_STATE: dict = _load_active_deployment_state()
-
-def _save_active_deployment_state() -> None:
-    # Best-effort like _record_launch_success()/record_load_time() -- a
-    # failed write here must never break a deploy or teardown in progress.
-    _write_json_state(ACTIVE_DEPLOYMENT_STATE_PATH, ACTIVE_DEPLOYMENT_STATE)
-
 def _set_active_deployment(host: str, catalog_key: str, topo_key: str, config_hash: Optional[str]) -> None:
     with ACTIVE_DEPLOYMENT_STATE_LOCK:
-        ACTIVE_DEPLOYMENT_STATE[host] = {
+        data = _load_active_deployment_state()
+        data[host] = {
             "catalog_key": catalog_key,
             "topo_key": topo_key,
             "config_hash": config_hash,
             "set_ts": time.time(),
         }
-        _save_active_deployment_state()
+        _write_json_state(ACTIVE_DEPLOYMENT_STATE_PATH, data)
 
 def _clear_active_deployment(hosts: list) -> None:
     with ACTIVE_DEPLOYMENT_STATE_LOCK:
+        data = _load_active_deployment_state()
         changed = False
         for h in hosts:
-            if ACTIVE_DEPLOYMENT_STATE.pop(h, None) is not None:
+            if data.pop(h, None) is not None:
                 changed = True
         if changed:
-            _save_active_deployment_state()
+            _write_json_state(ACTIVE_DEPLOYMENT_STATE_PATH, data)
 # Generous on purpose: some recipes set VLLM_ENGINE_INITIALIZATION_TIMEOUT
 # up to 3600s for cold multi-hour JIT compiles. This just bounds how long a
 # stale/superseded pending record can linger before being ignored -- it is
@@ -2117,7 +2127,7 @@ def _resolve_active_recipe(host: str, catalog_models: dict, loaded_model: str,
     confirmed the host is actively serving (e.g. via check_vllm_health()),
     so there's nothing further to gate on.
     """
-    deployment = ACTIVE_DEPLOYMENT_STATE.get(host)
+    deployment = _load_active_deployment_state().get(host)
     if require_active and active_container == "None":
         deployment = None
     if deployment and deployment.get("catalog_key") in catalog_models:
