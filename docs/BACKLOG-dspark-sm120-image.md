@@ -15,6 +15,17 @@ NVFP4 checkpoint author's own model card. Running with it enabled either
 crashes (wrong method) or silently produces near-zero draft acceptance
 (generic fallback routing) — see incident writeups below.
 
+**Bumped to the top of the active priority list, 2026-08-28:** production
+decode throughput on this recipe has been measured at ~14 tok/s, against
+30-60 tok/s reported by third parties on comparable GB10/SM120 hardware
+(see "What we found" below) — a gap wide enough that it's unlikely to be
+explained by tuning alone, and consistent with running without any working
+speculative decoding path at all. Worth confirming this is actually the
+gap (rather than something else entirely) before assuming the DSpark work
+below is guaranteed to close it, but it's the most concrete, best-understood
+lever available right now and the only one with this much external
+corroboration.
+
 DSpark's real speedup on this model class is substantial when it works
 correctly — 2-4x decode throughput in third-party benchmarks — so this is
 worth pursuing as its own project rather than leaving on the table

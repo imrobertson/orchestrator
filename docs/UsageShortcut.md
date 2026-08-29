@@ -9,6 +9,7 @@ Go to `http://maestro:5000` or use `dgx-config menu` in the terminal.
 * '''Grace Blackwell Unified Memory:''' GB10 uses LPDDR5x memory shared between the CPU and GPU. Standard memory queries return `[N/A]`, so the dashboard safely reports this as '''Unified / 131072 MB'''. Watch the `GPU: %` metric for compute saturation.
 * '''Live Log Routing:''' The dashboard defaults to the `spark-4` (Head) node logs. If a 2-node deployment hangs, use the dropdown to switch to the `spark-3 Node` (Worker). Worker logs often contain the actual stack trace for cross-node networking timeouts.
 * '''User ID / Auditor Tracking:''' The input box defaults to `dashboard_user`. Type your identifier here to inject your identity into the Docker execution context. This is self-reported, not authenticated — it helps distinguish who ran what in casual review, but don't treat it as a verified audit trail.
+* '''Version Badge:''' The header, next to Server Time (shown in UTC), displays the currently-running orchestrator version. Useful for confirming a fix actually deployed rather than assuming it did.
 
 == Essential Secrets & Key Management ==
 
@@ -46,7 +47,7 @@ python3 cache_cluster_assets.py
 
 Click "Teardown Runtimes" or run `dgx-config teardown`.
 
-'''Note:''' This is a global nuke. It executes a forceful `docker rm -f` against all vLLM containers across '''both''' physical nodes simultaneously to instantly flush LPDDR5x memory pools and release port 8000.
+'''Note:''' This is graceful, not instant. It sends SIGTERM to the engine and Ray inside each container, then `docker stop` (with a grace period), and only falls back to `docker rm -f` for anything still standing — this protects in-progress JIT compiles from corruption, which a hard kill can leave half-written. Expect it to take up to roughly a minute on a 2-node cluster; the dashboard's Teardown button shows live phase progress for the duration rather than a static "in progress" label. It also sweeps orphaned shared-memory segments left behind by Ray/vLLM on both hosts as its final step. While teardown (or a deploy) is running, the other dashboard controls lock to prevent a conflicting operation starting mid-flight.
 
 == Performance Benchmarking ==
 
@@ -60,4 +61,5 @@ All runs are automatically appended to `benchmark_ledger.csv` with precise Time-
 == If something looks wrong ==
 
 * '''Model dropdown totally empty''' (not just missing one model): a single malformed recipe file can currently break the whole catalog, not just itself. Worth flagging rather than assuming it's just slow to load — see `USERMANUAL.md`'s Troubleshooting section.
+* '''Dashboard frozen — same numbers for a long time:''' a stale backend computation is possible, not just a slow poll. Check `stale`/`stale_for_seconds` at the API level if you can, and flag it rather than assuming it'll clear itself — see `docs/TOMBSTONES.md` #76 for the history.
 * '''Everything else:''' `USERMANUAL.md` has the fuller troubleshooting list; this page is deliberately just the fast path.

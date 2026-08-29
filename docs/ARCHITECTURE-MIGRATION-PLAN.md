@@ -319,6 +319,34 @@ whole catalog) remains an open item, moved to Phase 5 below.
 **Goal:** remove the places where "2" is hardcoded as a fact about the
 universe rather than a fact about your current hardware.
 
+**Already landed, ahead of this phase (V4.8.5):** the ten places that
+hardcoded the literal strings `spark-3`/`spark-4`/`10.0.14.43` are gone —
+`PRIMARY_HOST`/`SECONDARY_HOST`/`PRIMARY_HOST_IP` now derive from
+`cluster_config.yaml`'s `hosts:` list instead (see `docs/TOMBSTONES.md`
+#73). This is naming/derivation only, done opportunistically while fixing
+a real bug (a hardcoded `target_hosts` in the 2-node deploy path), not a
+start on Phase 3 proper — it doesn't touch node-count assumptions,
+locking, or teardown scoping below.
+
+**Network topology constraint — new, not yet reflected in code:**
+a Spark host pair may sit on a network segment with no RoCEv2/ConnectX-7
+fabric to another pair. This wasn't a real constraint to design against
+while there was exactly one pair; it becomes load-bearing the moment a
+second pair (e.g. `spark-5`/`spark-6`) exists, since NCCL/Gloo rendezvous
+assumes fabric connectivity between whatever hosts a deploy targets.
+Concretely: **hosts are a set of fabric-connected pools, not one flat
+pool** — an N-node deploy or the eventual allocator must select all of its
+targets from within a single pool, never span pools. The current sidestep
+(a second `maestro2` orchestrator instance per pool, discussed but not
+built — see `ROADMAP.md`) avoids needing this in code at all, by keeping
+each pool under its own `cluster_config.yaml` and its own orchestrator
+process. That's a reasonable stopgap for two isolated pairs, but the
+underlying single-`serving_host`/single-global-`SessionTracker`
+architecture doesn't go away — it will matter again the moment two pools
+need to be visible from one dashboard, which is exactly when the "pool"
+concept below needs to actually land in the schema and allocator rather
+than being sidestepped.
+
 **Changes (deferred, listed so the direction is clear when the time comes):**
 - `nodes: Literal[1, 2]` → validated `int` checked against active host count
   in `cluster_config.yaml`, both in the Pydantic model and the CLI args.
@@ -327,10 +355,16 @@ universe rather than a fact about your current hardware.
   workers with no real change; the manual NCCL path (`--nnodes` /
   `--node-rank` / `--master-addr`) needs its host-selection logic to pull
   from a pool instead of a fixed pair.
+- `cluster_config.yaml`'s `hosts:` schema gains a `pool:` (or `fabric:`)
+  field per host, so hosts on disconnected segments are distinguishable in
+  config, not just in someone's head. Host selection anywhere in the
+  deploy path validates that all selected hosts share a pool before
+  proceeding, rather than assuming any N hosts can be wired together.
 - `CLUSTER_OP_LOCK` (currently one global lock) → per-host locking, so a
   2-node deploy on spark-3/4 and an independent 2-node deploy on two other
   nodes can run concurrently instead of one blocking the other for no
-  reason.
+  reason. This is what actually removes the need for a `maestro2` stopgap,
+  once it lands.
 - `execute_teardown`'s always-nukes-everything behavior → accept a
   `target_hosts` param at the API/CLI level (the function already accepts
   it internally — this is a pre-identified gap, not new).
@@ -340,7 +374,9 @@ universe rather than a fact about your current hardware.
 
 **Verification:** same `--dry-run` diffing pattern as Phase 1, plus this is
 the first phase worth actually load-testing two concurrent independent
-deploys once the per-host locking lands.
+deploys once the per-host locking lands. Add a dry-run case that
+deliberately spans two pools and confirms it's rejected, not just cases
+that stay within one.
 
 **Depends on:** Phase 2 (recipes must exist first — no reason to
 generalize execution logic against a config format you're about to
@@ -673,16 +709,49 @@ racked, with zero effect on current behavior.
 
 ## Suggested immediate next step
 
-**Update 2026-08-20:** Phase 0 and Phase 1 are done. Phase 2 is mostly
-done (recipe schema, `recipes/{local,eugr}` split, dual-load burn-in all
-shipped) with one real deliverable still open and now concretely scoped
-rather than vague: **the `mods:` execution mechanism** (see Phase 2's new
-entry above) — porting `mods/drop-caches` and `mods/gpu-mem-util-gb` from
-the real eugr repo is the natural first real-world test of it, and both
-are already independently useful for the Phase 5 OOM-watchdog gap. That's
-the recommended next concrete piece of work, ahead of starting Phase 3
-(which is hardware-gated anyway) or Phase 4 (which explicitly depends on
-Phase 3).
+**Update 2026-08-28:** Superseding the 2026-08-20 update below — priorities
+shifted after a real production TPS measurement came in well under
+external reports for this hardware class (~14 tok/s decode observed vs.
+30-60 tok/s reported elsewhere on comparable Spark clusters). That gap is
+almost certainly the missing MTP/speculative decoding path, not a
+migration-architecture problem, so it's tracked as its own document rather
+than a phase here: **`BACKLOG-dspark-sm120-image.md`** (HIGH priority,
+not started) — pulling and smoke-testing the `jasl/vllm` PR #41834 fork
+against `deepseek-v4-flash-0731-dspark-sm120.yaml` is the concrete next
+action, not any of the phases in this doc.
+
+Alongside that: recipe catalog hygiene is now also a real, felt problem —
+several recipes in the catalog can be selected and launched but are known
+or suspected to fail (untested topology combinations, flag combinations
+already documented as known-bad in `docs/TROUBLESHOOTING.md`, or ones that
+were never actually exercised end-to-end). `ROADMAP.md`'s "Recipe-level
+guardrails against known-bad flag combinations" entry already scopes a
+linter for the flag-combination class of this problem but hasn't been
+built. Worth broadening that effort to also cover an explicit
+per-recipe/per-topology status marker (validated / unconfirmed / known-bad,
+matching the confidence framework `docs/TROUBLESHOOTING.md` already uses)
+surfaced in the dashboard dropdown and `dgx-config status`, so a recipe
+that can be selected but is known not to work says so before someone
+spends a cold-start cycle finding out. This needs an actual pass over the
+current `recipes/local/*.yaml` and `recipes/eugr/*.yaml` files to be
+concrete rather than hypothetical — not done as part of this update.
+
+The `mods:` execution mechanism (Phase 2, previously the recommended next
+step) is still open and still real, but no longer ahead of the above in
+priority — it's not blocking anything the other two are blocking, and
+neither performance nor a broken-recipe launch is something `mods:`
+addresses.
+
+---
+
+*2026-08-20 update, superseded above but kept for history:* Phase 0 and
+Phase 1 are done. Phase 2 is mostly done (recipe schema,
+`recipes/{local,eugr}` split, dual-load burn-in all shipped) with one real
+deliverable still open and now concretely scoped rather than vague: **the
+`mods:` execution mechanism** (see Phase 2's new entry above) — porting
+`mods/drop-caches` and `mods/gpu-mem-util-gb` from the real eugr repo is
+the natural first real-world test of it, and both are already
+independently useful for the Phase 5 OOM-watchdog gap.
 
 Original Phase 0 framing, kept for history: it was intentionally small and
 non-disruptive — a git tag, a `.dockerignore`, and a `--dry-run` flag. All
@@ -690,110 +759,17 @@ three happened without touching anything that runs against the live
 cluster, and the `--dry-run` flag turned out to be exactly as useful as
 hoped for verifying every phase since.
 
-========
-# Roadmap: v4 -> v5
-
-Tracks work against the control plane's own API version (`FastAPI(...,
-version="4.8.x")` in `dgx-orchestrator.py`), separate from
-`ARCHITECTURE-MIGRATION-PLAN.md`'s Phase 1-5 numbering, which tracks the
-models.yaml -> recipes/ migration specifically. Put things here when they're
-about runtime robustness/behavior rather than the config-format migration.
-
-Each entry: what's wrong today, why it matters, and a rough shape for the
-fix -- not a full spec. Flesh out into a real prompt (see
-`PHASE-2-PROMPTS.md` for the style) when it's actually picked up.
-
 ---
 
-## Open
+## Runtime robustness backlog
 
-### Teardown robustness: close the orphaned-compile-child gap
+Day-to-day runtime robustness/behavior work (as opposed to the
+config-format migration tracked above) lives in **`ROADMAP.md`**, tracked
+against the control plane's own API version rather than this doc's Phase
+1-5 numbering. It is the only copy — an earlier version of this document
+had a stale, partial duplicate of that content appended below this point;
+it's been removed rather than reconciled entry-by-entry, since `ROADMAP.md`
+was confirmed to be the more current and complete of the two. Check there,
+not here, for anything about teardown hardening, cache integrity, engine
+health monitoring, or recipe-key collision detection.
 
-**Status:** partially addressed in 4.8.4 (`TEARDOWN_GRACE_SEC`, graceful
-`docker stop` before `rm -f`, `--init` on both docker run paths). This
-entry is what's left.
-
-**Context:** the corruption incident on 2026-08-23 was most likely caused
-by teardown's old unconditional `kill -9` + `docker rm -f` sequence hitting
-a container mid-JIT-compile. Triton/TileLang/DeepGEMM shell out to
-`nvcc`/`ptxas`/`cicc` as child subprocesses that write cache artifacts
-non-atomically; SIGKILL on the parent doesn't propagate to those children,
-so a hard-kill mid-compile can leave a half-written artifact at the path
-the loader treats as a cache hit on the next load -- silent, one-time,
-unpredictable recompiles with no error surfaced anywhere.
-
-**What 4.8.4 does NOT fix:**
-
-1. **The grace period has a ceiling.** 20s covers most shutdown paths but
-   a compile still running past the window still gets hard-killed with the
-   same risk as before. There's no way to know from teardown's side
-   whether a compile is in flight, only that model_status *was*
-   `NOT READY - COMPILING KERNELS` moments before teardown was called
-   (visible in `get_cluster_status()`, not currently checked by
-   `_execute_teardown_impl`).
-2. **The host-level cleanup regex still won't match compiler children.**
-   `ps aux | grep -E 'vllm|ray'` doesn't match a bare `ptxas`/`nvcc`/`cicc`
-   process by name, so even the graceful SIGTERM path in 4.8.4 doesn't
-   reach them directly -- they only get cleaned up if `--init`'s reaping
-   and/or the container's own death takes them down as children.
-3. **No teardown-time awareness of compile-in-progress.** Ideally,
-   `execute_teardown()` would check `model_status` before acting and either
-   warn the caller ("teardown requested mid-compile, proceeding after Ns
-   grace") or extend the grace period specifically for that case, rather
-   than using the same fixed 20s regardless of what's happening inside the
-   container.
-
-**Shape of a real fix:**
-- Have teardown consult `get_cluster_status()` (or a cheaper direct check)
-  before killing anything, and log/return a flag when it's interrupting an
-  in-progress compile rather than a ready/idle container.
-- Consider cgroup-based process-group kill instead of name-pattern
-  matching, so compiler children are reachable regardless of process name.
-- Decide whether an in-progress compile should ever be force-interrupted
-  automatically, or whether teardown should require `--force` to proceed
-  past the grace period when status shows `COMPILING KERNELS`, defaulting
-  to wait-and-warn instead.
-
----
-
-### Cache integrity retrospection
-
-**Context:** `cache-inventory` (4.8.4) and `prune-cache` (4.8.4) both
-already walk every JIT cache entry directory on every host -- that's the
-natural place to add integrity checks, since the traversal cost is already
-paid.
-
-**What's missing today:** neither command has any concept of "this entry
-looks incomplete/corrupt," only age and size. The `cache-inventory` run on
-2026-08-23 surfaced one concrete artifact worth generalizing from: a
-`tilelang` entry literally named `tmp` with an implausible ~56-year age
-(epoch-adjacent timestamp), consistent with a partial-extraction directory
-from a process that died before its rename-into-place step.
-
-**Shape of a real fix:**
-- Heuristic pass in the inventory walk: flag entries whose name looks like
-  a working/temp artifact (`tmp`, trailing partial-write suffixes the
-  specific JIT libraries use -- needs checking their actual conventions,
-  not guessed), or whose internal file set looks incomplete relative to
-  what a healthy entry of that type normally contains (e.g. metadata json
-  present without a paired `.so`/`.cubin`, if that pairing convention holds
-  -- needs verifying against actual Triton/TileLang/DeepGEMM cache layouts,
-  we don't currently have documented ground truth on this).
-- Correlate against teardown history: if a `--log-teardowns` or similar
-  timestamp record existed, flag any cache entry whose mtime falls within
-  a narrow window of a past hard-kill teardown as "possibly interrupted,"
-  independent of the structural heuristic above.
-- Surface flagged entries in `cache-inventory` output as a distinct
-  category (not folded into the LRU list), and let `prune-cache` optionally
-  target flagged entries specifically regardless of the free-space floor --
-  a suspected-corrupt entry is worth clearing even when disk space isn't
-  tight, which is a different trigger than the LRU eviction path.
-- This needs real ground-truth on Triton/TileLang/DeepGEMM's actual cache
-  directory contracts before the heuristic can be trusted -- worth reading
-  their source (or the `eugr/spark-vllm-b12x` image's bundled versions of
-  them) rather than guessing the file-pairing convention.
-
-**Depends on:** nothing structurally -- could land independently of the
-teardown work above. Worth doing after a few more `cache-inventory` runs
-across normal operation, so the heuristic is tuned against what a *healthy*
-cache actually looks like, not just the one incident.

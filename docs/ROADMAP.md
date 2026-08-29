@@ -268,6 +268,13 @@ fix, once there's appetite to touch the Ray-exec launch path.
 
 ### Recipe-level guardrails against known-bad flag combinations
 
+**Priority: bumped, 2026-08-28.** Directly requested — several recipes in
+the current catalog can be selected and launched in the dashboard/CLI but
+are known or suspected to fail, which wastes a real cold-start cycle
+(sometimes 30+ minutes) finding that out. This entry (the flag-combination
+linter) and the new "recipe status marker" entry below are the two
+concrete pieces of that ask.
+
 **Context:** two separate incidents on 2026-08-23 were both, at root, a
 recipe carrying a `vllm_args` combination that was invalid and had never
 been validated against a real deploy before being committed:
@@ -304,6 +311,55 @@ someone actually deploys it.
 
 **Depends on:** nothing. Small, and the two known cases above are already
 fully specified.
+
+---
+
+### Per-recipe/topology validation status marker
+
+**New, 2026-08-28.** A narrower linter only catches flag combinations
+someone already knows are bad. It doesn't help with the broader,
+currently-felt problem: a recipe can be schema-valid, carry no known-bad
+flag pattern, and *still* fail on deploy simply because that specific
+model/topology combination has never actually been exercised end-to-end
+-- exactly the distinction `docs/TROUBLESHOOTING.md`'s
+Validated/Known-bad/Unconfirmed framework already draws for individual
+`vllm_args`, but nothing currently draws at the level of "should a person
+even try deploying this recipe right now."
+
+**Context:** the catalog is a living, growing set (see `README.md`'s
+Model Catalog section) where new variants get added as needed. Nothing
+distinguishes, in the dashboard dropdown or `dgx-config status`, a recipe
+that's been deployed and confirmed serving traffic from one that's a
+work-in-progress smoke test (e.g.
+`deepseek-v4-flash-0731-dspark-sm120.yaml`, deliberately built small for a
+fast yes/no and explicitly not expected to be production-ready) or one
+that's simply never been tried. All three currently look identical in the
+UI: selectable, same as any other model.
+
+**Shape of a real fix:**
+- Add an optional `status:` field to the recipe schema (`common/recipes.py`),
+  e.g. `validated` / `unconfirmed` / `known-bad`, defaulting to
+  `unconfirmed` when absent so existing recipes don't need an immediate
+  mass edit.
+- `build_catalog_response()` already has `PENDING_LAUNCH_STATE`'s "last
+  launched successfully" tracking (landed 2026-08-24) keyed by
+  `config_hash` -- a recipe/topology combination that has a recorded
+  successful launch could auto-promote from `unconfirmed` to `validated`
+  without a human touching the YAML at all, keeping the marker honest and
+  low-maintenance rather than another thing to remember to update by hand.
+- Surface the status as a visible badge/color next to each model in the
+  dashboard dropdown and in `dgx-config status`'s catalog listing --
+  something a person glances at before clicking Deploy, not something
+  they have to already know to go check `docs/TROUBLESHOOTING.md` for.
+- Does not replace the flag-combination linter above -- that catches a
+  known-bad pattern before it's ever deployed once; this tracks whether a
+  given recipe has actually been proven to work at all. Both are worth
+  having.
+
+**Depends on:** nothing structurally. Requires an actual pass over the
+current `recipes/local/*.yaml` and `recipes/eugr/*.yaml` files to assign
+initial status values -- not done as part of this roadmap entry, needs the
+real files.
 
 ---
 
