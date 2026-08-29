@@ -1,0 +1,69 @@
+recipe_version: '1'
+hf_path: deepseek-ai/DeepSeek-V4-Flash-0731
+image: hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d
+gpu_util: 0.80
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+topologies:
+  2_node:
+    # INCREMENTAL CONTEXT STEP, not yet run. Base: the validated
+    # deepseek-v4-flash-0731-dspark-gb10-hazyumps.yaml (max_model_len
+    # 393216, max_num_seqs 4, ~42-45 tok/s decode via benchmark.py,
+    # confirmed 2026-08-29). This bumps context to 512K (524288) as a
+    # deliberate mid-step before ever attempting 1M with DSpark -- do NOT
+    # jump straight to 1M from here without running this first.
+    #
+    # max_num_seqs DROPPED from 4 to 1, intentionally, not an oversight.
+    # At 393216/gpu_util 0.8/max_num_seqs 4, the validated run's own boot
+    # log reported a KV pool of 2,172,195 tokens (5.52x concurrency).
+    # Naively scaling to 524288 * 4 concurrent seqs = 2,097,152 tokens
+    # minimum -- uncomfortably close to that same pool size with zero
+    # margin, on an image we have exactly one successful boot on. Matches
+    # the max_num_seqs:1 convention already used in the production
+    # deepseek-v4-flash-0731-1M.yaml recipe for large-context, single-seq
+    # serving rather than concurrent throughput.
+    #
+    # WATCH FOR: this is explicitly testing into the failure mode from
+    # TOMBSTONES.md #71 -- Ray's host-memory monitor OOM-killing a worker
+    # when unified LPDDR5x headroom runs out (JIT caches, page cache,
+    # Ray/Python overhead), which only showed up over a multi-hour real
+    # session, not a quick benchmark. That incident was on a different
+    # image (eugr/spark-vllm-b12x) at gpu_util 0.82, so it's not a direct
+    # precedent, but the underlying constraint (unified memory, not VRAM,
+    # is the actual ceiling) applies here too and this image adds its own
+    # JIT-compiled DSpark kernels on top. Don't validate this recipe on a
+    # single 3-pass benchmark alone -- confirm it survives a longer real
+    # session before treating it as production-ready, and check host
+    # memory headroom (not just nvidia-smi VRAM) if anything looks off.
+    max_model_len: 524288
+    tp_size: 2
+    pp_size: 1
+    env_vars:
+    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+    - OMP_NUM_THREADS=16
+    - NCCL_CUMEM_ENABLE=0
+    - NCCL_IB_GID_INDEX=3
+    - NCCL_SOCKET_IFNAME=enp1s0f0np0
+    - GLOO_SOCKET_IFNAME=enp1s0f0np0
+    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=7200
+    - VLLM_RPC_TIMEOUT=7200
+    - GLOO_TIMEOUT=7200
+    - TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=7200
+    - TORCH_GLOO_TIMEOUT_SECONDS=7200
+    - NCCL_COMM_TIMEOUT=7200
+    vllm_args: >-
+      --trust-remote-code --kv-cache-dtype fp8
+      --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
+      --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
+      --max-num-seqs 1 --enable-prefix-caching
+      --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy"}'
+    # --attention-backend / --moe-backend still left unset, same reasoning
+    # as the validated 384K recipe: this image auto-selects FlashInfer
+    # SM120 sparse-MLA decode + MARLIN MoE correctly on its own, confirmed
+    # working. --enforce-eager also still omitted -- the validated recipe's
+    # numbers were measured with cudagraph capture, keep that consistent
+    # unless boot fails specifically during graph capture at this larger
+    # context.

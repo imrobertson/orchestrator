@@ -1,7 +1,7 @@
 recipe_version: '1'
 hf_path: deepseek-ai/DeepSeek-V4-Flash-0731
-image: eugr/spark-vllm-b12x:latest
-gpu_util: 0.72
+image: hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d
+gpu_util: 0.80
 capability:
   task: null
   context_class: null
@@ -9,7 +9,44 @@ capability:
 mods: []
 topologies:
   2_node:
-    max_model_len: 262144
+    # This filename now belongs to the VALIDATED working DSpark recipe as
+    # of 2026-08-29, taking over from a prior deepseek-v4-flash-0731-dspark
+    # .yaml that never actually ran DSpark (renamed to
+    # deepseek-v4-flash-0731-b12x-nospec.yaml -- see that file and
+    # TROUBLESHOOTING.md's "Recipe naming discipline" note for why).
+    #
+    # SOURCE: hazyumps/deepseek-v4-flash-gb10 README (prebuilt GB10-native
+    # image, jasl PR #41834 fork), confirmed live 2026-08-29. Benchmarked
+    # on real spark-3/spark-4 hardware via benchmark.py (3-pass, temp=0.0):
+    # cold start 44.7 tok/s decode / TTFT 0.12s, warm avg 42.7 tok/s decode
+    # / TTFT 0.13s -- roughly 3x the ~14 tok/s baseline on the stock
+    # eugr/spark-vllm-b12x image with no working spec-decode path.
+    #
+    # DSpark draft model load confirmed in boot log ("DSpark draft model
+    # loaded: 99 params"), Markov sampler engaged, per-request acceptance
+    # metrics logged (~38-46% draft acceptance, mean acceptance length
+    # ~2.9-3.3 out of 5) -- this is a real, exercised spec-decode path, not
+    # just a clean boot with silent fallback.
+    #
+    # --attention-backend / --moe-backend intentionally left unset: this
+    # image auto-selects FlashInfer SM120 sparse-MLA decode + MARLIN MoE
+    # correctly on its own, confirmed in boot log. --enforce-eager
+    # intentionally omitted: the benchmarked numbers above were measured
+    # WITH cudagraph capture (FULL_AND_PIECEWISE), consistent with how this
+    # image's own upstream numbers were measured.
+    #
+    # KNOWN GAPS, not yet resolved (see BACKLOG-dspark-sm120-image.md):
+    # - First real requests after boot pay a JIT-compile tax for a few
+    #   kernels not covered by warmup (eagle_prepare_next_token_padded_
+    #   kernel, _dspark_markov_probs_*_kernel, others) -- likely explains
+    #   early-request throughput looking lower/noisier than steady state.
+    # - Missing tuned FP8 kernel config for shape N=4096,K=12288 on
+    #   NVIDIA_GB10 -- falls back to generic/sub-optimal W8A8 block-FP8.
+    # - benchmark_ledger.csv key from the validating run doesn't match this
+    #   recipe's catalog key -- confirm --model-key is passed correctly on
+    #   future benchmark runs against this recipe, or historical_tps
+    #   lookups won't join.
+    max_model_len: 393216
     tp_size: 2
     pp_size: 1
     env_vars:
@@ -21,16 +58,13 @@ topologies:
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
     - VLLM_ENGINE_INITIALIZATION_TIMEOUT=7200
     - VLLM_RPC_TIMEOUT=7200
-    - TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=7200
     - GLOO_TIMEOUT=7200
+    - TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=7200
     - TORCH_GLOO_TIMEOUT_SECONDS=7200
     - NCCL_COMM_TIMEOUT=7200
-    - FLASHINFER_NVCC_THREADS=8
-    - MAX_JOBS=8
-    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     vllm_args: >-
-      --attention-backend FLASH_ATTN --moe-backend flashinfer_cutlass
-      --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
+      --trust-remote-code --kv-cache-dtype fp8
       --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
       --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
-      --max-num-seqs 1 --enable-prefix-caching
+      --max-num-seqs 4 --enable-prefix-caching
+      --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy"}'

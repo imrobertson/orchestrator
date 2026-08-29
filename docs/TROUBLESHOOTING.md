@@ -131,6 +131,15 @@ context, different tuning), make the distinguishing part of the filename
 unambiguous. See `docs/USERMANUAL.md`'s "Adding a New Model" section and
 `docs/ROADMAP.md`'s near-duplicate-key-detection entry for more.
 
+
+DSpark on GB10-native image (hazyumps/deepseek-v4-flash-gb10)
+
+Validated, 2026-08-29, real hardware: hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d (jasl PR #41834 fork, prebuilt for GB10/sm_121 aarch64) boots and serves DeepSeek-V4-Flash-0731 with DSpark. ~42-45 tok/s decode via benchmark.py (3-pass, temp=0), vs ~14 tok/s on stock eugr/spark-vllm-b12x. No --attention-backend/--moe-backend needed — auto-selects FlashInfer SM120 sparse-MLA decode + MARLIN MoE. --distributed-executor-backend ray works fine on this image too (no no-Ray workaround needed, despite one unrelated third-party repo needing that on a different stack). Config: max_num_seqs: 4, gpu_memory_utilization: 0.8, speculative_config: {method: dspark, num_speculative_tokens: 5, draft_sample_method: greedy}.
+
+Known gap: first requests after boot pay a JIT tax — jit_monitor.py warnings for several kernels (eagle_prepare_next_token_padded_kernel, _dspark_markov_probs_*_kernel, etc.) compiling mid-inference rather than during warmup. Also missing a tuned FP8 kernel config for shape N=4096,K=12288 on NVIDIA_GB10 — falls back to default/sub-optimal. Both plausibly explain early-request throughput being lower than steady-state; not yet quantified separately.
+
+Diagnostic note: don't trust loggers.py:310's periodic "Avg generation throughput" as a real perf number — it's a ~10s-window average diluted by idle/wait gaps within that window. Use benchmark.py's decode_tps (measured strictly first-token-to-last) for real comparisons.
+
 ---
 
 ## Incident Log
@@ -172,3 +181,8 @@ unambiguous. See `docs/USERMANUAL.md`'s "Adding a New Model" section and
 * **Failure:** The dashboard shows a single frozen snapshot for hours — model status, telemetry, everything — with no error surfaced anywhere except container stdout. Restarting the daemon provides only temporary relief; the freeze recurs roughly an hour into the next real serving session.
 * **Cause:** `SessionTracker`'s internal lock was a plain (non-reentrant) `threading.Lock()`. Its own periodic flush path re-acquires that same lock from the same thread once a session runs long enough (>1hr) — which a plain `Lock` cannot do, so the thread deadlocks itself permanently. Because status polling only ever keeps one computation in flight at a time, this single wedged thread freezes the entire dashboard, not just telemetry.
 * **Rule:** Fixed by switching to `threading.RLock()`. If the dashboard ever looks frozen again with data that never changes across multiple polls, check `/api/status`'s `stale` / `stale_for_seconds` fields first — a value that's actually growing over minutes/hours (not just under a couple of seconds of normal poll latency) means the backend computation is genuinely stuck, not just slow, and is worth a `py-spy dump` against the live process rather than a guess.
+
+## 9. Phantom "Link Detected" on Unconnected Second ConnectX-7 Port
+Symptom: ethtool <second-port-iface> reports Link detected: yes and returns full module EEPROM data on both spark-3 and spark-4's second RDMA port, despite only one physical QSFP cable existing between the pair.
+Cause: Driver/firmware returns stale/cached module data from whichever port initialized first — confirmed by identical vendor serial number reported on both ports. Not a real link.
+Rule: Trust enp1s0f0np0 (the actually-cabled port, confirmed via matching real cable's serial). Don't chase this again if it resurfaces.

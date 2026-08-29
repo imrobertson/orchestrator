@@ -1,0 +1,46 @@
+recipe_version: '1'
+hf_path: deepseek-ai/DeepSeek-V4-Flash-0731
+image: eugr/spark-vllm-b12x:latest
+gpu_util: 0.72
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+topologies:
+  2_node:
+    # RENAMED from deepseek-v4-flash-0731-dspark.yaml, 2026-08-29.
+    # Despite the old filename, this recipe has never run DSpark or any
+    # speculative decoding -- there is no --speculative-config anywhere in
+    # vllm_args below, and there never was. It's the stock no-spec-decode
+    # b12x baseline. Content is otherwise byte-for-byte unchanged from the
+    # original file; only the filename/catalog key changed, so any ledger
+    # history under the old key won't join to this one automatically.
+    # See TROUBLESHOOTING.md's "Recipe naming discipline" note and
+    # BACKLOG-dspark-sm120-image.md for the actual working DSpark recipe,
+    # which now owns the deepseek-v4-flash-0731-dspark.yaml name instead.
+    max_model_len: 262144
+    tp_size: 2
+    pp_size: 1
+    env_vars:
+    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+    - OMP_NUM_THREADS=16
+    - NCCL_CUMEM_ENABLE=0
+    - NCCL_IB_GID_INDEX=3
+    - NCCL_SOCKET_IFNAME=enp1s0f0np0
+    - GLOO_SOCKET_IFNAME=enp1s0f0np0
+    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=7200
+    - VLLM_RPC_TIMEOUT=7200
+    - TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=7200
+    - GLOO_TIMEOUT=7200
+    - TORCH_GLOO_TIMEOUT_SECONDS=7200
+    - NCCL_COMM_TIMEOUT=7200
+    - FLASHINFER_NVCC_THREADS=8
+    - MAX_JOBS=8
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    vllm_args: >-
+      --attention-backend FLASH_ATTN --moe-backend flashinfer_cutlass
+      --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --enforce-eager
+      --tokenizer-mode deepseek_v4 --distributed-executor-backend ray --tool-call-parser deepseek_v4
+      --enable-auto-tool-choice --reasoning-parser deepseek_v4 --block-size 256
+      --max-num-seqs 1 --enable-prefix-caching
