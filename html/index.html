@@ -632,33 +632,35 @@
                 netBadge.style.background = '#022c22';
             }
 
-            let detectedActiveModel = null;
+            // Exact, hash-based recipe identity from the backend
+            // (ACTIVE_DEPLOYMENT_STATE, set by execute_deployment() at
+            // launch time) -- not a fuzzy match against the served
+            // checkpoint name. Two recipes can serve the identical
+            // checkpoint under different configs (e.g. deepseek-v4-
+            // flash-0731-1M vs. ...-dspark-sm120), so string-matching
+            // active_model against catalog keys was ambiguous by
+            // construction and would silently snap to whichever catalog
+            // entry happened to iterate first, regardless of what was
+            // actually launched. See dgx-orchestrator.py's
+            // ACTIVE_DEPLOYMENT_STATE module comment for the full story.
+            let detectedActiveRecipeKey = null;
             for (const [host, info] of Object.entries(data.hosts)) {
-                if (info.active_model && info.active_model !== 'None') {
-                    detectedActiveModel = info.active_model;
+                if (info.active_recipe_key) {
+                    detectedActiveRecipeKey = info.active_recipe_key;
                     break;
                 }
             }
 
-            if (detectedActiveModel && Object.keys(globalCatalog).length > 0) {
-                let matchedCatalogKey = null;
-                for (const [catKey, catData] of Object.entries(globalCatalog)) {
-                    const hfPath = catData.hf_path || '';
-                    if (catKey === detectedActiveModel || hfPath.endsWith(detectedActiveModel) || catKey.toLowerCase().includes(detectedActiveModel.toLowerCase()) || detectedActiveModel.toLowerCase().includes(catKey.toLowerCase())) {
-                        matchedCatalogKey = catKey;
-                        break;
-                    }
-                }
-
-                if (matchedCatalogKey && matchedCatalogKey !== lastSyncedActiveModel) {
-                    lastSyncedActiveModel = matchedCatalogKey;
+            if (detectedActiveRecipeKey && globalCatalog[detectedActiveRecipeKey]) {
+                if (detectedActiveRecipeKey !== lastSyncedActiveModel) {
+                    lastSyncedActiveModel = detectedActiveRecipeKey;
                     const modelSelect = document.getElementById('modelSelect');
-                    if (modelSelect.value !== matchedCatalogKey) {
-                        modelSelect.value = matchedCatalogKey;
+                    if (modelSelect.value !== detectedActiveRecipeKey) {
+                        modelSelect.value = detectedActiveRecipeKey;
                         updateTopologyOptions();
                     }
                 }
-            } else if (!detectedActiveModel) {
+            } else if (!detectedActiveRecipeKey) {
                 lastSyncedActiveModel = null;
             }
 
