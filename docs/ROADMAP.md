@@ -401,3 +401,125 @@ similar -- by edit distance, by shared `hf_path`, or both.
 
 **Depends on:** nothing. Could land alongside the flag-combination linter
 above, since both hook into the same `load_recipes()` pass.
+
+---
+
+### Second cabled ConnectX-7 port exists between spark-3/spark-4, unused and undocumented
+
+**Context, 2026-08-29.** While debugging an unrelated `ethtool` false-positive
+(a driver/firmware quirk returning stale link state and cached module EEPROM
+data on the *other* port -- see `docs/TROUBLESHOOTING.md` Incident #9), it
+came out that each Spark has two ConnectX-7 ports, and confirmed
+(`ethtool -m`, matching vendor serial across both nodes' `enP2p1s0f0np0`)
+that one is genuinely cabled between spark-3 and spark-4, currently entirely
+unused -- `enp1s0f0np0` (the RoCE link everything actually runs on today) is
+a separate physical port from the idle one.
+
+**Why this belongs here, not just in the incident log:** `README.md`'s
+network fabric section and `docs/TROUBLESHOOTING.md` both already flag that
+"a deployed pair must actually share a fabric" isn't yet expressed anywhere
+in code (see the Phase 3 section below and the host-identity entries in
+TROUBLESHOOTING). A second real, physically-cabled link between the current
+production pair is exactly the kind of physical-topology fact that
+constraint will eventually need to reason about -- whether as failover
+capacity, a second NCCL channel, or simply something to document so a
+future person doesn't waste time re-discovering it the way tonight did.
+
+**What's missing today:** nothing consumes this. It's not wired into
+`cluster_config.yaml`, not used by NCCL/Gloo binding, not referenced
+anywhere. Currently pure headroom.
+
+**Shape of a real fix:** not a fix so much as a scoping question for
+whoever picks up Phase 3 (`ARCHITECTURE-MIGRATION-PLAN.md`) -- worth
+deciding then whether the second port becomes a second NCCL channel for
+bandwidth, a failover path, or is left alone deliberately. Not urgent on
+its own.
+
+**Depends on:** nothing directly. Informs Phase 3 planning rather than
+blocking anything today.
+
+---
+
+### `benchmark_ledger.csv` key can silently mismatch the recipe actually benchmarked
+
+**Context, 2026-08-29.** `benchmark.py --model-key` exists specifically so
+the ledger's ability to join back to the catalog (`enrich_catalog()`'s
+`historical_tps` lookup) doesn't depend on the served model ID matching the
+catalog key -- per the script's own docstring, those are different strings
+by default. During the DSpark validation run, the benchmark logged under
+key `deepseek-v4-flash-0731-1M` despite validating a completely different
+recipe (`deepseek-v4-flash-0731-dspark`) -- either `--model-key` wasn't
+passed, or was passed with a stale value left over from a previous run.
+
+**What's missing today:** nothing catches this at benchmark time. A wrong
+or missing `--model-key` silently produces a ledger row that looks
+legitimate but attributes historical throughput data to the wrong recipe --
+which then quietly corrupts anything downstream that trusts
+`historical_tps` for that catalog key (the per-recipe status-marker idea
+above, dashboard display, capacity planning) without any error surfacing
+anywhere.
+
+**Shape of a real fix:**
+- Have `execute_standalone_benchmark()`/`_run_benchmark_worker()` (the
+  orchestrator's own caller of `benchmark.py`, per its comment about owning
+  `benchmark_results.txt`) always pass `--model-key` explicitly, derived
+  from whatever recipe/config is actually being benchmarked, rather than
+  relying on it being supplied correctly by whoever invokes the script
+  directly.
+- Consider a sanity check at ledger-write time: if `--model-key` isn't
+  provided and falls back to `model_id.split("/")[-1]`, and that fallback
+  key doesn't match anything in the currently-loaded catalog, warn loudly
+  rather than writing a silently-orphaned row.
+- Worth an audit of existing `benchmark_ledger.csv` rows for other
+  mismatches now that one's confirmed, since this could have been
+  happening quietly before it was noticed.
+
+**Depends on:** nothing structurally. Small, self-contained fix in the
+benchmark invocation path.
+
+---
+
+### `compute_config_hash()` hashes `vllm_args` as a raw string, not parsed
+
+**Context, 2026-08-29.** `common/recipes.py`'s `compute_config_hash()`
+deliberately hashes `vllm_args` as-is rather than `shlex`-splitting it --
+its own docstring calls this out explicitly: *"simpler, and fine unless
+flags get reordered without changing them in practice."* That caveat is
+the bug: two functionally identical `vllm_args` strings that differ only in
+flag order, or in incidental whitespace from a YAML folded-scalar (`>-`)
+reflow, hash differently and spuriously reset a recipe's "validated"/launch-
+history status even though nothing that reaches `docker run` actually
+changed.
+
+**Why this matters more once the per-recipe status marker (above) lands:**
+right now a stale hash only means a slightly-too-conservative "last
+launched successfully" display. Once recipes carry a `validated` /
+`unconfirmed` / `known-bad` badge that auto-promotes off this same hash,
+an incidental reflow -- someone re-wrapping a long `vllm_args` line, or a
+future recipe-editing tool that reorders flags for readability -- would
+silently demote a known-good recipe back to looking unvalidated in the
+dashboard, for a change that altered nothing about actual behavior. A
+false "this hasn't been tested" is a worse failure mode than a false
+"this has" would be, since it either causes needless re-validation or --
+worse -- trains people to stop trusting the badge at all.
+
+**Shape of a real fix:**
+- `shlex.split(topo.vllm_args)`, then sort the resulting token list (or
+  parse into flag/value pairs and sort by flag name) before hashing, so
+  flag order stops mattering the same way `env_vars` already gets sorted
+  before hashing.
+- Watch the interaction with `docs/TROUBLESHOOTING.md` Incident #4 (YAML
+  folded-scalar comment pollution / `shlex.split()` choking on stray `#`)
+  while touching this -- `compute_config_hash()` and the actual launch
+  path's own arg-splitting should probably share one parsing helper rather
+  than two independent implementations of "parse `vllm_args`" that could
+  drift out of sync with each other.
+- Decide whether to also normalize `--speculative-config`'s embedded JSON
+  (currently just a substring of the larger `vllm_args` string) --
+  key-order-insensitive JSON comparison would close the same class of gap
+  one level deeper, though it's a smaller/rarer case than top-level flag
+  reordering.
+
+**Depends on:** nothing structurally. Worth landing before or alongside the
+per-recipe status marker entry above, since that's the feature whose
+correctness actually depends on this hash being order-insensitive.

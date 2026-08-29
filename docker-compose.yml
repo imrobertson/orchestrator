@@ -17,6 +17,10 @@ services:
     image: nginx:alpine
     container_name: dgx-dashboard-ui
     restart: unless-stopped
+    init: true          # <-- reaps orphaned children (SSH ControlPersist
+                         #     masters especially) so they can't accumulate
+                         #     as zombies over a multi-day uptime -- see
+                         #     run_ssh()'s docstring in common/ssh.py
     ports:
       - "5000:80"
     volumes:

@@ -140,6 +140,12 @@ Known gap: first requests after boot pay a JIT tax — jit_monitor.py warnings f
 
 Diagnostic note: don't trust loggers.py:310's periodic "Avg generation throughput" as a real perf number — it's a ~10s-window average diluted by idle/wait gaps within that window. Use benchmark.py's decode_tps (measured strictly first-token-to-last) for real comparisons.
 
+512K context step validated (deepseek-v4-flash-0731-dspark-512k.yaml, max_num_seqs: 1) — boots and serves successfully on the same hazyumps image. Long-session OOM risk (see #7 above) not yet exercised at this context length — only a short benchmark run so far, not a multi-hour soak.
+
+Shared-expert loader bug (tonyd2wild's DSPARK-SHARED-EXPERT-FIX.md) — checked, does NOT apply to this image. Third-party writeup documents a real vLLM bug where DSpark's draft weight loader drops 12 shared-expert tensors on the official 0731 checkpoint (silent, INFO-invisible, roughly halves decode/acceptance elsewhere: 25.7%→60.2% accept, 32.7→55.4 tok/s once patched). Traced our own image's loader (vllm/models/deepseek_v4/nvidia/dspark.py) line by line: it already carries the complete ("gate_up_proj","w1",0)/("gate_up_proj","w3",1) mapping tonyd2wild's patch adds, and the markov-tensor collision their patch carefully anchors around is structurally impossible here (markov tensors never get a layers. prefix, so they never reach the mapping loop at all). Confirmed via direct source trace, not inference — this build isn't affected. Our 38-46% draft acceptance is real but unexplained by this bug; likely just prompt-content-dependent (tonyd2wild's own patched numbers ranged 33-78% by content type).
+
+Terminology trap: "NVFP4" means two unrelated things in this ecosystem. (1) NVFP4-quantized weights (e.g. auroter/DeepSeek-V4-Flash-0731-NVFP4) — a different checkpoint, orthogonal to DSpark. (2) nvfp4_ds_mla, an NVFP4 KV cache dtype — the thing already documented above as known-bad on stock vLLM for MLA models. Getting KV cache dtype working for real (as opposed to weight quantization) requires a heavily-patched third-party runtime (e.g. tonyd2wild's staged A/B/C build), not a flag on either of our current images. Its only benefit is KV pool size/context ceiling — confirmed zero effect on draft acceptance/speed.
+
 ---
 
 ## Incident Log
