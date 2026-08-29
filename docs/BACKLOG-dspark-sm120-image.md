@@ -129,3 +129,35 @@ didn't specify. This is the first thing to verify empirically, not assume.
 6. Benchmark against the current no-spec-decode baseline
    (`deepseek-v4-flash-0731-nvfp4.yaml`) using `benchmark.py --temperature`
    before/after, same methodology as the earlier acceptance-rate debugging.
+
+
+Update 2026-08-29: orthozany image is x86_64-only; found a real GB10-native path
+
+Smoke test attempt result: orthozany/vllm-jasl-dsv4:pr41834-2026-05-13 fails immediately on spark-3/spark-4 with:
+
+[FATAL tini (7)] exec /home/user/jasl-dsv4/.venv/bin/vllm failed: Exec format error
+
+Confirmed via docker image inspect ... --format '{{.Architecture}}' → amd64. This image was built for RTX PRO 6000 Blackwell (workstation, x86_64), not Grace (arm64). No arm64 tag exists — checked Docker Hub; only pr41834-2026-05-13 and tmp-2026-05-05-snap, both same x86_64 lineage. The recipe smoke test never actually ran — this was purely an architecture mismatch, so we still have zero signal on whether jasl's PR #41834 kernel path itself works on our hardware.
+
+Better path found: hazyumps/deepseek-v4-flash-gb10 (GitHub, Apache-2.0)
+
+A maintained reproduction recipe built specifically for 2× GB10/DGX Spark (sm_121, aarch64) on top of the same jasl/vllm PR #41834 enablement. Not a prebuilt image — ships a documented build process, RoCE/NCCL tuning, and an sm_121-specific indexer patch (bf16 + fused Triton top-k; apparently sm_121 has no native lightning-indexer kernel). Reports going from "crashes/wedges/~12 tok/s" to "stable, 384K, ~31 tok/s single-stream decode, ~405 tok/s prefill @ 9k" on real dual-GB10 hardware — in our target 30-60 tok/s decode range.
+
+Repo layout:
+
+docs/BUILD.md — the image build (jasl/vllm fork, CUDA 13, arch 12.1a, NCCL 2.30.4)
+docs/NETWORK.md — RoCE + RDMA passthrough + NCCL 2.30.4 (fixes a documented shm_broadcast deadlock/wedge)
+scripts/start_head.sh / start_worker.sh — tuned launch (TP=2+EP, MTP n=2, 384K/0.80 mem-util, NCCL 2.30.4)
+patches/sm12x_deep_gemm_fallbacks.py — the indexer fix, bind-mounted, no rebuild
+verify/ — boot-watch, patch-correctness gate, prefill/decode probe scripts
+
+Open question before adopting: repo's top-level README targets deepseek-ai/DeepSeek-V4-Flash generically with MTP (n=2) spec decode. A separate page within the same repo references the -0731 GA checkpoint specifically, noting GA moved spec-decode from a single MTP head to 3 DSpark draft groups + a markov head (--speculative-config method dspark, num_speculative_tokens: 5, draft_sample_method: greedy — matches what we're already running). Need to confirm which config path in the repo actually targets -0731/DSpark before treating the default Quickstart as DSpark-ready.
+
+Secondary source, not yet evaluated: blog post at al-engr.com ("DeepSeek V4 Flash on Dual DGX Spark: What Broke, and the Recipe That Works") — independent PR #41834 + jasl-fork writeup with its own failure log. Worth a skim if the hazyumps build path hits problems; hazyumps is the more structured option and should be tried first.
+
+Next steps:
+
+Review hazyumps/deepseek-v4-flash-gb10 docs/BUILD.md and docs/TUNING.md in full, confirm the -0731/DSpark config path.
+Build the image per their instructions (this is real effort — not a docker pull — budget accordingly).
+Run the same smoke-test approach as before: small max_model_len/max_num_seqs, --enforce-eager kept initially, watch for the same failure signatures we've now catalogued (silent worker death during autotune, gloo barrier drops) in case this build has its own issues.
+If it boots and generates coherently, this becomes the new candidate image for deepseek-v4-flash-0731-dspark-sm120.yaml, replacing orthozany/vllm-jasl-dsv4:pr41834-2026-05-13.

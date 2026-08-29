@@ -12,11 +12,14 @@ of multi-node LLM serving over a 100GbE backplane via NCCL.
 import argparse
 import datetime
 
-# Bump this on every meaningful change and confirm it after every deploy --
-# "did my push/pull/restart actually take" should be one glance, not
-# remembering which specific line to grep for. Surfaced in /api/status,
-# the CLI's `status` command, daemon startup logs, and the dashboard header.
-ORCHESTRATOR_VERSION = "2026-08-28-primary-secondary-host-refactor"
+# Human-maintained descriptive slug -- still bump this on every meaningful
+# change, since "what was this deploy about" at a glance is genuinely
+# useful and a git hash alone doesn't convey it. The hash suffix appended
+# to ORCHESTRATOR_VERSION below (see _compute_git_version_suffix(), defined
+# after BASE_DIR since it needs it as the git working directory) is what
+# actually answers "did my push/pull/restart take" now -- it's derived,
+# not typed, so it can't be forgotten the way this slug already has been.
+ORCHESTRATOR_VERSION_SLUG = "2026-08-28-primary-secondary-host-refactor"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
@@ -54,6 +57,51 @@ except ImportError:
 
 # --- Core Configurations ---
 BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
+
+def _compute_git_version_suffix() -> str:
+    """
+    Best-effort short git commit hash for whatever code is actually
+    running in this process (+ "-dirty" if the working tree has
+    uncommitted changes), computed once at import time. Exists to remove
+    the "forgot to bump ORCHESTRATOR_VERSION_SLUG" failure mode --  the
+    descriptive slug is still useful for "what was this deploy about" at
+    a glance, but it's manually maintained and has already been forgotten
+    before. The hash is derived, not typed, so "did my push/pull/restart
+    actually take" -- the exact question the version badge exists to
+    answer -- stays answerable even if a commit ships without a slug
+    bump, and the "-dirty" flag catches the case of the daemon running
+    with uncommitted local edits (a real risk given how directly this
+    gets iterated on against live production).
+
+    Falls back to "unknown" if git isn't on PATH, BASE_DIR isn't a git
+    checkout (e.g. a stripped deployment tarball), or anything else goes
+    wrong -- never raises, since a version string failing to compute must
+    never stop the daemon from starting.
+    """
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=5,
+        )
+        if commit.returncode != 0 or not commit.stdout.strip():
+            return "unknown"
+        commit_hash = commit.stdout.strip()
+
+        dirty_check = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(BASE_DIR), capture_output=True, text=True, timeout=5,
+        )
+        dirty_suffix = "-dirty" if (dirty_check.returncode == 0 and dirty_check.stdout.strip()) else ""
+
+        return f"{commit_hash}{dirty_suffix}"
+    except Exception:
+        return "unknown"
+
+# Surfaced in /api/status, the CLI's `status` command, daemon startup logs,
+# and the dashboard header. Confirm this after every deploy -- see
+# _compute_git_version_suffix()'s docstring for why the hash half of this
+# is the load-bearing part.
+ORCHESTRATOR_VERSION = f"{ORCHESTRATOR_VERSION_SLUG}+{_compute_git_version_suffix()}"
 MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 LEDGER_PATH = BASE_DIR / "model_ledger.json"
 BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
@@ -67,6 +115,63 @@ BENCHMARK_RESULTS_PATH = BASE_DIR / "benchmark_results.txt"
 # from the first deploy after this was introduced; it can't retroactively
 # know about something retired before that.
 HF_PATH_LEDGER_PATH = BASE_DIR / "hf_path_ledger.json"
+# Per-host record of exactly which recipe (catalog_key + topo_key +
+# config_hash) is currently deployed, written at launch time and cleared at
+# teardown time -- see ACTIVE_DEPLOYMENT_STATE below for why this exists and
+# why it's disk-backed rather than memory-only.
+ACTIVE_DEPLOYMENT_STATE_PATH = BASE_DIR / "active_deployment_state.json"
+
+# --- Shared JSON state-file I/O ---
+# model_ledger.json, hf_path_ledger.json, and active_deployment_state.json
+# are three separate files on purpose -- they're indexed on different axes
+# (catalog_key::topo_key, catalog_key, and host respectively) and have
+# different lifecycles (the first two are cumulative/permanent history,
+# the third is ephemeral and explicitly cleared at teardown). Combining
+# them would mean every teardown does a read-modify-write of the entire
+# permanent history just to drop one host's current-state entry, and would
+# require one shared lock across write paths that today can never contend
+# with each other. What they DID share was copy-pasted read/write
+# boilerplate -- these two helpers are just that, factored out, not a step
+# toward merging the data itself.
+def _read_json_state(path: Path):
+    """
+    Best-effort JSON-object read for this module's small on-disk state/
+    ledger files. Returns None if the file doesn't exist, doesn't parse,
+    or doesn't contain a JSON object -- callers pick their own fallback
+    (usually `_read_json_state(path) or {}`), since "never written yet"
+    needs different handling in a couple of read-only callers (e.g.
+    get_estimated_load_time() has a real default estimate to fall back to;
+    _load_last_seen_raw() needs to distinguish "nothing recorded" from
+    "recorded as empty").
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+def _write_json_state(path: Path, data: dict) -> bool:
+    """
+    Best-effort JSON write for the same family of files. Failures are
+    swallowed -- matching every existing writer this replaces
+    (record_load_time(), _record_launch_success(), _record_hf_path(),
+    SessionTracker._commit_session(), etc): a lost stats/state write must
+    never break the deploy, teardown, or status-poll path that triggered
+    it. Returns whether the write succeeded, for the rare caller that
+    wants to know. NOT used by correct_ledger_parser's ledger-repair path
+    (see ledger_set_lifetime() / the CLI command around line ~1930+) --
+    that tool deliberately surfaces read/parse errors as explicit
+    status="error" results and writes a timestamped backup before an
+    unguarded write, since a human operator is meant to see exactly what
+    went wrong there, not have it silently swallowed.
+    """
+    try:
+        path.write_text(json.dumps(data, indent=2))
+        return True
+    except Exception:
+        return False
 
 HOSTS = legacy_hosts_dict()
 
@@ -607,6 +712,61 @@ TEARDOWN_STATE_LOCK = threading.Lock()
 # recorded, which is the correct outcome, not a bug to special-case.
 PENDING_LAUNCH_STATE: dict = {"pending": None}
 PENDING_LAUNCH_LOCK = threading.Lock()
+
+# --- Active Deployment State (hash-based, disk-backed) ---
+# The dashboard needs to know, per host, exactly which recipe is running --
+# not "a model whose loaded checkpoint name happens to resemble this catalog
+# entry". Two recipes can serve the identical checkpoint under different
+# configs (e.g. deepseek-v4-flash-0731-1M vs. deepseek-v4-flash-0731-dspark-
+# sm120 both report the same served model name), so anything that tries to
+# reverse-guess the recipe from the served name alone is ambiguous by
+# construction and will silently pick whichever catalog entry it happens to
+# iterate to first. This record sidesteps that: execute_deployment() already
+# knows exactly which recipe it launched and computes config_hash for it
+# (see PENDING_LAUNCH_STATE above), so it writes that same identity here as
+# the authoritative "what's actually running" record, and
+# _finalize_host_status() reads it back directly instead of re-deriving it.
+#
+# Disk-backed (unlike PENDING_LAUNCH_STATE, which is fine to lose) because
+# this needs to survive an orchestrator daemon restart while a model is
+# still running on a host -- a memory-only version would silently fall back
+# to the old ambiguous guessing after every restart, which is exactly the
+# failure mode this exists to eliminate. Cleared per-host on teardown
+# (including the pre-deploy teardown inside execute_deployment(), so a new
+# deploy always starts from a clean record, never a stale one from whatever
+# was previously running on that host).
+ACTIVE_DEPLOYMENT_STATE_LOCK = threading.Lock()
+
+def _load_active_deployment_state() -> dict:
+    return _read_json_state(ACTIVE_DEPLOYMENT_STATE_PATH) or {}
+
+# Loaded once at import time so a daemon restart immediately knows what's
+# running on each host, before the first status poll even completes.
+ACTIVE_DEPLOYMENT_STATE: dict = _load_active_deployment_state()
+
+def _save_active_deployment_state() -> None:
+    # Best-effort like _record_launch_success()/record_load_time() -- a
+    # failed write here must never break a deploy or teardown in progress.
+    _write_json_state(ACTIVE_DEPLOYMENT_STATE_PATH, ACTIVE_DEPLOYMENT_STATE)
+
+def _set_active_deployment(host: str, catalog_key: str, topo_key: str, config_hash: Optional[str]) -> None:
+    with ACTIVE_DEPLOYMENT_STATE_LOCK:
+        ACTIVE_DEPLOYMENT_STATE[host] = {
+            "catalog_key": catalog_key,
+            "topo_key": topo_key,
+            "config_hash": config_hash,
+            "set_ts": time.time(),
+        }
+        _save_active_deployment_state()
+
+def _clear_active_deployment(hosts: list) -> None:
+    with ACTIVE_DEPLOYMENT_STATE_LOCK:
+        changed = False
+        for h in hosts:
+            if ACTIVE_DEPLOYMENT_STATE.pop(h, None) is not None:
+                changed = True
+        if changed:
+            _save_active_deployment_state()
 # Generous on purpose: some recipes set VLLM_ENGINE_INITIALIZATION_TIMEOUT
 # up to 3600s for cold multi-hour JIT compiles. This just bounds how long a
 # stale/superseded pending record can linger before being ignored -- it is
@@ -682,11 +842,8 @@ class SessionTracker:
         tokens and ~730K real generation tokens silently reduced to 190/763
         in the ledger after an orchestrator restart -- exactly this bug.)
         """
-        if not LEDGER_PATH.exists():
-            return None
-        try:
-            data = json.loads(LEDGER_PATH.read_text())
-        except Exception:
+        data = _read_json_state(LEDGER_PATH)
+        if data is None:
             return None
         entry = data.get(key)
         if not isinstance(entry, dict):
@@ -773,10 +930,7 @@ class SessionTracker:
             if p_diff <= 0 and g_diff <= 0 and d_diff <= 0 and a_diff <= 0:
                 return
             
-            data = {}
-            if LEDGER_PATH.exists():
-                try: data = json.loads(LEDGER_PATH.read_text())
-                except Exception: pass
+            data = _read_json_state(LEDGER_PATH) or {}
                 
             key = f"{self.model}::{self.topo}"
             if key not in data or not isinstance(data[key], dict):
@@ -801,8 +955,7 @@ class SessionTracker:
                 "a": self.cur_a_tok,
             }
 
-            try: LEDGER_PATH.write_text(json.dumps(data, indent=2))
-            except Exception: pass
+            _write_json_state(LEDGER_PATH, data)
 
             self.flushed_p_tok = self.cur_p_tok
             self.flushed_g_tok = self.cur_g_tok
@@ -1005,10 +1158,7 @@ _RECORDED_LOAD_STARTS_LOCK = threading.Lock()
 
 def record_load_time(model: str, topo_key: str, duration_sec: int, load_type: str = "cached"):
     if duration_sec > MAX_RECORDABLE_LOAD_SEC or duration_sec < 10: return
-    data = {}
-    if LEDGER_PATH.exists():
-        try: data = json.loads(LEDGER_PATH.read_text())
-        except Exception: data = {}
+    data = _read_json_state(LEDGER_PATH) or {}
     key = f"{model}::{topo_key}"
     
     if key not in data or isinstance(data[key], list):
@@ -1020,8 +1170,7 @@ def record_load_time(model: str, topo_key: str, duration_sec: int, load_type: st
 
     data[key].setdefault(load_type, []).append(duration_sec)
     data[key][load_type] = data[key][load_type][-20:]
-    try: LEDGER_PATH.write_text(json.dumps(data, indent=2))
-    except Exception: pass
+    _write_json_state(LEDGER_PATH, data)
 
 def _record_launch_success(model: str, topo_key: str, config_hash: str):
     """
@@ -1032,10 +1181,7 @@ def _record_launch_success(model: str, topo_key: str, config_hash: str):
     must never break status polling, so this fails silently like
     record_load_time()/SessionTracker._commit_session() do.
     """
-    data = {}
-    if LEDGER_PATH.exists():
-        try: data = json.loads(LEDGER_PATH.read_text())
-        except Exception: data = {}
+    data = _read_json_state(LEDGER_PATH) or {}
 
     key = f"{model}::{topo_key}"
     if key not in data or not isinstance(data[key], dict):
@@ -1048,8 +1194,7 @@ def _record_launch_success(model: str, topo_key: str, config_hash: str):
         "count": prior.get("count", 0) + 1,
     }
 
-    try: LEDGER_PATH.write_text(json.dumps(data, indent=2))
-    except Exception: pass
+    _write_json_state(LEDGER_PATH, data)
 
 def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached") -> tuple[int, bool]:
     default_ests = {"cached": 180, "compiled": 1500, "downloaded": 4500}
@@ -1059,17 +1204,14 @@ def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached"
         default_ests = {"cached": 700, "compiled": 1800, "downloaded": 5000}
         default_est = default_ests.get(load_type, 700)
         
-    if not LEDGER_PATH.exists():
+    data = _read_json_state(LEDGER_PATH)
+    if data is None:
         return default_est, False
-    try:
-        data = json.loads(LEDGER_PATH.read_text())
-        key_data = data.get(f"{model}::{topo_key}", {})
-        if isinstance(key_data, dict):
-            times = key_data.get(load_type, [])
-            if times:
-                return int(sum(times) / len(times)), True
-    except Exception:
-        pass
+    key_data = data.get(f"{model}::{topo_key}", {})
+    if isinstance(key_data, dict):
+        times = key_data.get(load_type, [])
+        if times:
+            return int(sum(times) / len(times)), True
     return default_est, False
 
 def get_vllm_metrics(head_ip: str = PRIMARY_HOST_IP, port: int = 8000) -> dict:
@@ -1103,8 +1245,17 @@ def get_vllm_metrics(head_ip: str = PRIMARY_HOST_IP, port: int = 8000) -> dict:
                     metrics["draft_tokens"] = val
                 elif any(k in line for k in ["vllm:spec_decode_num_accepted_tokens_total", "vllm:num_spec_tokens_accepted_total"]):
                     metrics["accepted_tokens"] = val
-    except Exception:
-        pass
+    except Exception as exc:
+        # Unlike check_vllm_health() above -- whose failures are routine
+        # during normal model warmup -- a parse exception here means the
+        # /metrics response came back but didn't scrape the way this
+        # function expects (format change, unexpected content, etc).
+        # That's not routine, and silently returning all-zero metrics
+        # looks identical to "genuinely idle cluster" on the dashboard --
+        # exactly the kind of silent-wrong-number failure worth a signal
+        # for, so it doesn't take a "why is TPS stuck at 0" investigation
+        # to notice.
+        print(f"[!] get_vllm_metrics: failed to parse /metrics response from {head_ip}:{port} - {exc}")
     return metrics
 
 def cache_inventory(target_hosts: list = None) -> dict:
@@ -1178,25 +1329,16 @@ def _record_hf_path(catalog_key: str, hf_path: str) -> None:
     did specify this hf_path for this key at this point in time, which is
     exactly the provenance record this exists to preserve.
     """
-    data = {}
-    if HF_PATH_LEDGER_PATH.exists():
-        try: data = json.loads(HF_PATH_LEDGER_PATH.read_text())
-        except Exception: data = {}
+    data = _read_json_state(HF_PATH_LEDGER_PATH) or {}
     data[catalog_key] = {
         "hf_path": hf_path,
         "cache_dirname": _hf_cache_dirname(hf_path),
         "last_deployed": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    try: HF_PATH_LEDGER_PATH.write_text(json.dumps(data, indent=2))
-    except Exception: pass
+    _write_json_state(HF_PATH_LEDGER_PATH, data)
 
 def _load_hf_path_ledger() -> dict:
-    if not HF_PATH_LEDGER_PATH.exists():
-        return {}
-    try:
-        return json.loads(HF_PATH_LEDGER_PATH.read_text())
-    except Exception:
-        return {}
+    return _read_json_state(HF_PATH_LEDGER_PATH) or {}
 
 def _resolve_model_to_hf_path(model: str) -> Optional[str]:
     """
@@ -1705,7 +1847,9 @@ def _detect_live_model_topo_metrics() -> dict:
     vllm_metrics = get_vllm_metrics(serving_ip)
     catalog_models = load_model_catalog().get("catalog", {}).get("models", {})
     raw_loaded_model = container_info.get(serving_host, {}).get("loaded_model", "Unknown")
-    matched_model = _resolve_catalog_key(raw_loaded_model, catalog_models)
+    matched_model, _, _ = _resolve_active_recipe(
+        serving_host, catalog_models, raw_loaded_model, require_active=False
+    )
     topo = "2_node" if len([h for h, i in container_info.items() if i.get("active_container") != "None"]) > 1 else "1_node"
 
     return {
@@ -1890,7 +2034,16 @@ def _discover_host_container(host: str, meta: dict) -> dict:
                     idx = cmd_parts.index("--model")
                     if idx + 1 < len(cmd_parts):
                         loaded_model = cmd_parts[idx + 1].split("/")[-1]
-            except Exception:
+            except Exception as exc:
+                # Falling back to a placeholder here means active_model
+                # (and downstream matched_key resolution, when
+                # ACTIVE_DEPLOYMENT_STATE doesn't already have an exact
+                # record for this host) silently degrades to the fuzzy
+                # match's least reliable input. Worth knowing when the
+                # `docker inspect` Cmd shape changes under us rather than
+                # discovering it only once someone notices "Active
+                # Container" on the dashboard.
+                print(f"[!] _discover_host_container({host}): failed to parse inspected Cmd for model name - {exc}")
                 loaded_model = "Active Container"
         else:
             ps_res = run_ssh(ip, user, ["docker", "exec", c_name, "ps", "aux"], timeout=10)
@@ -1900,7 +2053,8 @@ def _discover_host_container(host: str, meta: dict) -> dict:
                         if "/" in part and any(fam in part for fam in ["DeepSeek", "Qwen", "Llama", "model", "gemma", "Nemotron", "Muse", "Glimmer"]):
                             loaded_model = part.split("/")[-1]
                             break
-                except Exception:
+                except Exception as exc:
+                    print(f"[!] _discover_host_container({host}): failed to parse `ps aux` output for model name - {exc}")
                     loaded_model = "Active Container"
             else:
                 loaded_model = "Active Container"
@@ -1929,6 +2083,40 @@ def _resolve_catalog_key(loaded_model: str, catalog_models: dict) -> str:
                 break
     return matched_key
 
+def _resolve_active_recipe(host: str, catalog_models: dict, loaded_model: str,
+                            active_container: str = "None", require_active: bool = True) -> tuple:
+    """
+    Returns (catalog_key, config_hash, is_exact) for whatever recipe is
+    actually running on `host`. Single source of truth for the "prefer
+    ACTIVE_DEPLOYMENT_STATE's exact record, fall back to _resolve_catalog_key's
+    fuzzy served-name match" resolution -- see ACTIVE_DEPLOYMENT_STATE's
+    module comment for why the fuzzy match alone is ambiguous (two recipes
+    can serve the identical checkpoint under different configs). Was
+    previously duplicated three times (one per caller below) with subtly
+    different gating each time; consolidated here so the gating logic only
+    needs to be reasoned about once.
+
+    config_hash is only ever non-None when is_exact is True. Callers that
+    need to distinguish "this is the confirmed-active recipe" from "this is
+    just our best guess" (e.g. deciding whether to report active_recipe_key
+    to the dashboard at all) should check is_exact, not just catalog_key
+    truthiness -- catalog_key is always a usable string either way.
+
+    require_active=True (the default) only trusts ACTIVE_DEPLOYMENT_STATE
+    when active_container != "None" -- guards against a stale record
+    surviving an out-of-band `docker rm` (an operator on maestro, not
+    through the orchestrator) that discovery would otherwise catch. Pass
+    require_active=False when the caller has already independently
+    confirmed the host is actively serving (e.g. via check_vllm_health()),
+    so there's nothing further to gate on.
+    """
+    deployment = ACTIVE_DEPLOYMENT_STATE.get(host)
+    if require_active and active_container == "None":
+        deployment = None
+    if deployment and deployment.get("catalog_key") in catalog_models:
+        return deployment["catalog_key"], deployment.get("config_hash"), True
+    return _resolve_catalog_key(loaded_model, catalog_models), None, False
+
 def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool, container_info: dict, serving_host: str, catalog_models: dict) -> tuple:
     ip = meta["ip"]
     user = None
@@ -1938,7 +2126,8 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
         return host, {
             "ip": ip, "docker_status": "UNREACHABLE", "container_name": "None",
             "container_state": "NONE", "active_model": "None", "model_status": "NONE",
-            "eta_seconds": 0, "eta_display": "N/A", "telemetry": telemetry
+            "eta_seconds": 0, "eta_display": "N/A", "telemetry": telemetry,
+            "active_recipe_key": None, "active_config_hash": None
         }
 
     active_container = info["active_container"]
@@ -1952,7 +2141,12 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
             head_crashed = True
             break
 
-    matched_key = _resolve_catalog_key(loaded_model, catalog_models)
+    # Prefer the recorded ACTIVE_DEPLOYMENT_STATE (exact, hash-based) over
+    # the fuzzy served-name match -- see _resolve_active_recipe()'s
+    # docstring.
+    matched_key, active_config_hash, is_exact_match = _resolve_active_recipe(
+        host, catalog_models, loaded_model, active_container=active_container
+    )
 
     eta_seconds = 0
     eta_display = "Ready" if cluster_ready else "N/A"
@@ -2041,7 +2235,14 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
         "model_status": model_status,
         "eta_seconds": eta_seconds,
         "eta_display": eta_display,
-        "telemetry": telemetry
+        "telemetry": telemetry,
+        # Exact catalog key + config_hash for the recipe actually running on
+        # this host, per ACTIVE_DEPLOYMENT_STATE above -- this is what the
+        # dashboard should key its model-select sync off of, not active_model
+        # (which is just the served checkpoint name and is ambiguous between
+        # recipes that happen to serve the same checkpoint).
+        "active_recipe_key": matched_key if is_exact_match else None,
+        "active_config_hash": active_config_hash
     }
 
 def _collect_bounded(futures: list, host_order: list, deadline: float, label: str) -> dict:
@@ -2092,7 +2293,10 @@ def _compute_cluster_status_impl() -> dict:
     catalog_models = load_model_catalog().get("catalog", {}).get("models", {})
 
     raw_loaded_model = container_info.get(serving_host, {}).get("loaded_model", "Unknown")
-    matched_model = _resolve_catalog_key(raw_loaded_model, catalog_models)
+    serving_active_container = container_info.get(serving_host, {}).get("active_container", "None")
+    matched_model, _, _ = _resolve_active_recipe(
+        serving_host, catalog_models, raw_loaded_model, active_container=serving_active_container
+    )
     topo = "2_node" if len([h for h, i in container_info.items() if i.get("active_container") != "None"]) > 1 else "1_node"
     if cluster_ready:
         SESSION_TRACKER.update(vllm_metrics, matched_model, topo)
@@ -2115,8 +2319,13 @@ def _compute_cluster_status_impl() -> dict:
                 with PENDING_LAUNCH_LOCK:
                     if PENDING_LAUNCH_STATE.get("pending") is pending:
                         PENDING_LAUNCH_STATE["pending"] = None
-    except Exception:
-        pass
+    except Exception as exc:
+        # This block should never actually raise -- it's arithmetic and
+        # dict lookups on data this same process wrote. If it does, that's
+        # a genuine bug (e.g. a future refactor of PENDING_LAUNCH_STATE's
+        # shape) and silently eating it here would just mean launch-success
+        # telemetry quietly stops recording with zero indication why.
+        print(f"[!] _compute_cluster_status_impl: pending launch-confirmation consumption failed unexpectedly - {exc}")
 
     with BENCHMARK_STATE_LOCK:
         is_benchmarking = BENCHMARK_STATE["running"]
@@ -2168,7 +2377,8 @@ def _compute_cluster_status_impl() -> dict:
             status_data["hosts"][host] = {
                 "ip": HOSTS[host]["ip"], "docker_status": "TIMEOUT", "container_name": "None",
                 "container_state": "NONE", "active_model": "None", "model_status": "NONE",
-                "eta_seconds": 0, "eta_display": "N/A", "telemetry": {}
+                "eta_seconds": 0, "eta_display": "N/A", "telemetry": {},
+                "active_recipe_key": None, "active_config_hash": None
             }
         else:
             _, host_status = result
@@ -2191,6 +2401,15 @@ def _compute_cluster_status_impl() -> dict:
             worker_s["model_status"] = head_s["model_status"]
             worker_s["eta_seconds"] = head_s["eta_seconds"]
             worker_s["eta_display"] = head_s["eta_display"]
+            # Worker already gets its own ACTIVE_DEPLOYMENT_STATE entry
+            # written directly at deploy time (execute_deployment() sets it
+            # for every host in target_hosts, head and worker alike), so
+            # this mirror is a defensive fallback only -- covers the case
+            # where worker's own container discovery didn't resolve a
+            # recipe key for some reason but head's did.
+            if not worker_s.get("active_recipe_key"):
+                worker_s["active_recipe_key"] = head_s["active_recipe_key"]
+                worker_s["active_config_hash"] = head_s["active_config_hash"]
 
     return status_data
 
@@ -2245,10 +2464,7 @@ def enrich_catalog(catalog_dict: dict) -> dict:
     if not isinstance(models, dict):
         return catalog_dict
 
-    ledger_data = {}
-    if LEDGER_PATH.exists():
-        try: ledger_data = json.loads(LEDGER_PATH.read_text())
-        except Exception: pass
+    ledger_data = _read_json_state(LEDGER_PATH) or {}
 
     ledger_tps = {}
     if BENCHMARK_LEDGER_PATH.exists():
@@ -2576,6 +2792,12 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
         # otherwise a mid-teardown exception would leave the dashboard
         # showing "in progress" forever with no way to clear it.
         _set_teardown_state(False, "done", f"Teardown complete for {host_list}.", mark_last_run=True)
+        # Always clear ACTIVE_DEPLOYMENT_STATE for these hosts too, same
+        # unconditional-reset reasoning as TEARDOWN_STATE above -- a host
+        # with no container running must never keep reporting a stale
+        # "this recipe is active" record, whether teardown fully succeeded
+        # or a phase raised partway through.
+        _clear_active_deployment(hosts_to_clean)
 
 def execute_teardown(target_hosts: list = None) -> dict:
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
@@ -2702,8 +2924,14 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
-        try: offline_mode = "OFFLINE" in NETWORK_STATE_FILE.read_text().strip()
-        except Exception: pass
+        try:
+            offline_mode = "OFFLINE" in NETWORK_STATE_FILE.read_text().strip()
+        except Exception as exc:
+            # Once per deploy, not once per 4s status poll -- worth a
+            # signal here specifically, since a silently-wrong offline_mode
+            # changes which --hf-token/network flags actually get passed
+            # to the container this deploy launches.
+            print(f"[!] _execute_deployment_impl: failed to read {NETWORK_STATE_FILE} - {exc}")
     offline_val = "1" if offline_mode else "0"
 
     topo_config = topologies[topo_key]
@@ -2716,8 +2944,19 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     pp_size = topo_config.get("pp_size", nodes)
     
     vllm_args_raw = topo_config.get("vllm_args", "")
-    try: vllm_args_list = shlex.split(vllm_args_raw)
-    except Exception: vllm_args_list = vllm_args_raw.split()
+    try:
+        vllm_args_list = shlex.split(vllm_args_raw)
+    except Exception as exc:
+        # Falling back to a naive .split() here is exactly the failure
+        # mode behind the documented "Argument splitting bug" -- it breaks
+        # on any quoted value containing spaces (e.g. JSON passed to
+        # --speculative-config), silently handing vLLM a mis-split argv
+        # instead of raising where a human would see it. Print it so a
+        # shlex-unparseable vllm_args string in a recipe shows up in the
+        # daemon log at deploy time, not as a mysterious argparse error
+        # three layers downstream inside the container.
+        print(f"[!] _execute_deployment_impl({model}): vllm_args failed shlex.split(), falling back to naive whitespace split - {exc}")
+        vllm_args_list = vllm_args_raw.split()
 
     use_ray = (nodes > 1) and ("--distributed-executor-backend" in vllm_args_list) and ("ray" in vllm_args_list)
     tuning = load_cluster_config().tuning
@@ -2945,6 +3184,13 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     # key against, and silently skipped (not fatal) if hashing fails for
     # any other reason -- this is a QoL marker, not load-bearing for deploy
     # itself.
+    #
+    # The same recipe/config_hash resolution also feeds ACTIVE_DEPLOYMENT_STATE
+    # (unlike PENDING_LAUNCH_STATE, this one IS load-bearing -- it's what the
+    # dashboard reads to know which recipe is actually running, so it's set
+    # for every host in target_hosts here, at the point we know each of them
+    # has a container confirmed running post-launch, not gated on a later
+    # health check the way launch-success recording is).
     if os.environ.get("USE_LEGACY_CATALOG") != "1":
         try:
             recipe = load_recipes().get(model)
@@ -2957,8 +3203,21 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                         "config_hash": cfg_hash,
                         "started_ts": time.time(),
                     }
-        except Exception:
-            pass
+                for h in target_hosts:
+                    _set_active_deployment(h, model, topo_key, cfg_hash)
+        except Exception as exc:
+            # PENDING_LAUNCH_STATE staying unset here is genuinely fine
+            # (it's just a launch-success telemetry marker, as noted
+            # above) -- but ACTIVE_DEPLOYMENT_STATE staying unset is NOT
+            # fine. It's what lets the dashboard show the correct recipe
+            # instead of falling back to the ambiguous fuzzy served-name
+            # match (see ACTIVE_DEPLOYMENT_STATE's module comment -- this
+            # whole mechanism exists specifically to fix that ambiguity).
+            # A silent failure here would silently reintroduce it. Print
+            # so a broken load_recipes()/compute_config_hash() call after
+            # this deploy shows up in the daemon log immediately, not as
+            # a confusing "why did the dropdown revert again" report.
+            print(f"[!] _execute_deployment_impl({model}): failed to record ACTIVE_DEPLOYMENT_STATE - {exc}")
 
     if wait or run_benchmark:
         head_ip = HOSTS[head]["ip"]
@@ -3234,14 +3493,25 @@ def _telemetry_daemon_loop():
     while True:
         try:
             get_cluster_status()
-        except Exception:
-            pass
+        except Exception as exc:
+            # This is the top-level background watchdog -- if
+            # get_cluster_status() is raising here, SESSION_TRACKER isn't
+            # accumulating, launch-success/ACTIVE_DEPLOYMENT_STATE aren't
+            # being consumed/recorded, and nothing else in this process
+            # would ever surface that on its own. Silently swallowing it
+            # (the previous behavior) is exactly how the 08-25/27/28
+            # SessionTracker self-deadlock went unnoticed for hours --
+            # see the RLock fix's TOMBSTONES entry. A repeated print here
+            # if this loop is genuinely wedged is a feature, not noise:
+            # it's the signal that would have made that incident visible
+            # in minutes instead of hours.
+            print(f"[!] _telemetry_daemon_loop: get_cluster_status() raised - {exc}")
         iterations += 1
         if iterations % max(1, _SSH_MUX_FLUSH_INTERVAL_SEC // 10) == 0:
             try:
                 _flush_stale_ssh_multiplex_sockets()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[!] _telemetry_daemon_loop: _flush_stale_ssh_multiplex_sockets() raised - {exc}")
         time.sleep(10)
 
 def handle_shutdown(signum, frame):
