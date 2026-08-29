@@ -29,8 +29,21 @@ topologies:
     - NCCL_IB_GID_INDEX=3
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
-    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=3600
-    - VLLM_RPC_TIMEOUT=3600
+    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=7200
+    - VLLM_RPC_TIMEOUT=7200
+    - GLOO_TIMEOUT=7200
+    - TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=7200
+    - TORCH_GLOO_TIMEOUT_SECONDS=7200
+    - NCCL_COMM_TIMEOUT=7200
+    # Timeouts eased to match the proven-safe values from the stock-image
+    # DSpark recipe (deepseek-v4-flash-0731-dspark.yaml). This is a first
+    # boot of an entirely untested kernel lineage (jasl's SM12x
+    # Triton/CuTeDSL fallback path) -- first-run JIT compilation could
+    # plausibly run long, and the goal here is to let it cook and get a
+    # clean signal rather than risk a barrier timeout that looks identical
+    # to a real crash. Once this boots successfully, revisit the full raw
+    # log to see what was actually needed and tighten these back down.
+    #
     # No --attention-backend / --moe-backend b12x flags here: this is a
     # different kernel lineage from eugr/spark-vllm-b12x (jasl's fork uses
     # its own SM12x Triton/CuTeDSL fallback kernels, not B12X_ATTN/b12x).
