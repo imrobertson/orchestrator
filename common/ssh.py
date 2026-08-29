@@ -82,18 +82,27 @@ def get_hf_token() -> str:
         try:
             for line in secrets_file.read_text().splitlines():
                 if line.startswith("HF_TOKEN="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if token:
+                        return token
+                    print(f"[!] Warning: {secrets_file} has an HF_TOKEN= line but its value is empty after "
+                          f"stripping whitespace/quotes. Checking local cache...")
+                    break
         except PermissionError:
             print(f"[!] Warning: You do not have permission to read {secrets_file}. Checking local cache...")
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[!] Warning: Failed to parse {secrets_file} ({type(exc).__name__}: {exc}). "
+                  f"Checking local cache...")
 
     hf_token_file = Path.home() / ".cache" / "huggingface" / "token"
     if hf_token_file.exists():
         try:
-            return hf_token_file.read_text().strip()
-        except Exception:
-            pass
+            token = hf_token_file.read_text().strip()
+            if token:
+                return token
+            print(f"[!] Warning: {hf_token_file} exists but is empty.")
+        except Exception as exc:
+            print(f"[!] Warning: Failed to read {hf_token_file} ({type(exc).__name__}: {exc}).")
 
     print("[!] Warning: No HF_TOKEN found in env, .secrets, or ~/.cache. Gated models may fail to download.")
     return ""

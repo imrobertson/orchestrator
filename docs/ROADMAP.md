@@ -521,5 +521,8 @@ worse -- trains people to stop trusting the badge at all.
   reordering.
 
 **Depends on:** nothing structurally. Worth landing before or alongside the
-per-recipe status marker entry above, since that's the feature whose
-correctness actually depends on this hash being order-insensitive.
+per-recipe status marker entry above, since that's the feature whose correctness actually depends on this hash being order-insensitive.
+
+------
+new item::
+log the exception when .secrets parsing fails instead of swallowing it, so "malformed token line" surfaces immediately instead of masquerading as "no token found anywhere."

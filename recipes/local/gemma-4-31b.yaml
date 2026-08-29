@@ -1,5 +1,5 @@
 recipe_version: '1'
-hf_path: google/gemma-4-31B-it-FP8
+hf_path: google/gemma-4-31B-it
 image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.75
 capability:
@@ -15,8 +15,10 @@ topologies:
     env_vars:
     - OMP_NUM_THREADS=16
     - VLLM_CPU_OMP_THREADS=16
+    - VLLM_DISABLE_COMPILE_CACHE=1
     vllm_args: >-
-      --trust-remote-code --kv-cache-dtype fp8 
+      --trust-remote-code --quantization fp8 --kv-cache-dtype fp8
+      --attention-backend TRITON_ATTN
       --max-num-batched-tokens 8192 --enable-chunked-prefill
   2_node:
     max_model_len: 131072
@@ -33,7 +35,10 @@ topologies:
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
     - VLLM_ENGINE_INITIALIZATION_TIMEOUT=3600
     - VLLM_RPC_TIMEOUT=3600
+    - VLLM_USE_V1=0
+    - VLLM_DISABLE_COMPILE_CACHE=1
     vllm_args: >-
-      --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 
-      --distributed-executor-backend ray --max-num-seqs 4 
+      --disable-custom-all-reduce --trust-remote-code --quantization fp8
+      --kv-cache-dtype fp8 --attention-backend TRITON_ATTN
+      --distributed-executor-backend ray --max-num-seqs 4
       --max-num-batched-tokens 8192 --enable-chunked-prefill

@@ -1,5 +1,26 @@
 # Control Plane Release Tombstones & Fix Log
 
+### 82. Silent HF Token Failures in get_hf_token() (common/ssh.py)
+* **Symptom:** A malformed HF_TOKEN= line in .secrets caused vLLM to 401
+  against a gated/private HF repo with zero indication the token was ever
+  the problem — the container simply launched without HF_TOKEN set, no
+  warning at deploy time. Traced back from a Gemma 4 recipe debugging
+  session (2026-08-29) that initially looked like a bad hf_path, and
+  stayed looking that way even after the hf_path was fixed.
+* **Cause:** get_hf_token()'s .secrets-parsing branch used a bare
+  `except Exception: pass`, silently swallowing any parse failure and
+  falling through to the ~/.cache/huggingface/token fallback with no
+  trace. The ~/.cache fallback had the same bare-except pattern. Worse:
+  an HF_TOKEN= line that parsed fine but stripped down to an empty
+  string returned "" immediately from inside the loop — skipping even
+  the function's own generic "no token found" warning at the bottom,
+  since that return happens before that code path is ever reached.
+* **Fix:** Both except blocks now log `type(exc).__name__: exc` instead
+  of passing silently. An empty-after-strip token value in .secrets no
+  longer returns early — it warns and falls through to the next source
+  (~/.cache/huggingface/token) instead of masquerading as "found."
+* **File:** common/ssh.py, get_hf_token()
+
 ### 81. Long-Lived Daemon Slowly Exhausted the Container's Process Table (V4.8.7)
 * **The Trap:** `common/ssh.py`'s `run_ssh()` uses SSH's `ControlMaster=auto` / `ControlPersist=60s` for connection reuse — by design, a `ControlPersist` master detaches from the SSH client that spawned it so it can outlive that client. When its original parent process exits, standard Unix reparenting hands it to PID 1 of its namespace. The Dockerfile's `CMD` runs `python3 dgx-orchestrator.py daemon` directly as PID 1, with no `tini`/`dumb-init`/`--init` — and a bare Python process has no general-purpose logic to reap arbitrary reparented children (it only ever waits on processes it directly spawned itself, which is correct for those, but says nothing about orphans reparented to it from elsewhere). Every `ControlPersist` master that got reparented and later exited became a zombie nothing ever collected. Over enough days of continuous status polling (SSH calls against every host, every 4-10s, forever), this is a slow, steady climb toward the container's PID ceiling. Surfaced as `dgx-config` failing with `OCI runtime exec failed ... nsexec-0[...]: unable to spawn stage-1: Resource temporarily unavailable` — `runc` failing to fork a new process inside the container because there was no room left. Both the dashboard's teardown button and `dgx-config teardown` failed identically (same underlying container, same PID exhaustion) until a full `docker compose down`/recreate cleared the whole PID namespace and gave temporary relief — a strong tell in hindsight that should have pointed straight at container-level resource exhaustion rather than anything in `dgx-orchestrator.py`'s own logic.
 * **The Fix:** Added `init: true` to `orchestrator-api` in `docker-compose.yml`, which runs Docker's built-in `tini`-based init as PID 1 instead of the raw Python process. `tini` correctly reaps any reparented orphan regardless of what spawned it, closing the leak at its actual source with a one-line config change and zero code changes. `run_ssh()`'s own docstring had already correctly identified this exact leak mechanism in the abstract (see its "Process-tree cleanup on timeout" section) without yet being connected to this specific production symptom — worth rereading that docstring in full if this class of issue ever resurfaces elsewhere.
