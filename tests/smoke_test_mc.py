@@ -82,9 +82,28 @@ def parse_args():
     p.add_argument("--common-dir", default=str(SCRIPT_DIR / "common"),
                     help="Directory with your real recipes.py/mods.py/ssh.py "
                          "(and optionally config.py/constants.py).")
+    p.add_argument("--cluster-config", default=None,
+                    help="Path to your real cluster_config.yaml. Required if your real "
+                         "config.py (found via --common-dir) is being used, since it reads "
+                         "this file at import/call time -- the fixture's fake config.py does "
+                         "NOT need this. If omitted, the script tries a couple of sensible "
+                         "default locations next to --common-dir before giving up and falling "
+                         "back to the bundled fake config.py/constants.py for this run.")
     p.add_argument("--keep-fixture", action="store_true",
                     help="Don't delete the temp BASE_DIR fixture on exit (for debugging).")
     return p.parse_args()
+
+
+def find_cluster_config(explicit: str | None, common_dir: Path) -> Path | None:
+    if explicit:
+        p = Path(explicit).resolve()
+        if not p.exists():
+            sys.exit(f"[!] --cluster-config not found: {p}")
+        return p
+    for candidate in (common_dir.parent / "cluster_config.yaml", common_dir / "cluster_config.yaml"):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -203,7 +222,16 @@ class ContainerRole:
 _REQUIRED_REAL_MODULES = ["recipes.py", "mods.py", "ssh.py"]
 
 
-def build_common_package(work_dir: Path, common_dir: Path) -> None:
+def build_common_package(work_dir: Path, common_dir: Path, force_fake_config: bool = False) -> bool:
+    """Returns True if the REAL config.py was used (as opposed to this
+    script's fake) -- callers need this to know whether a real
+    cluster_config.yaml must also be supplied.
+
+    force_fake_config=True overrides even a real config.py/constants.py
+    found in common_dir -- used when a real config.py exists but no
+    cluster_config.yaml could be found for it, so the run degrades
+    cleanly to full-fake rather than a mixed real-config/no-cluster-yaml
+    state that would just crash on import."""
     pkg = work_dir / "common"
     pkg.mkdir(parents=True, exist_ok=True)
     (pkg / "__init__.py").touch()
@@ -218,13 +246,20 @@ def build_common_package(work_dir: Path, common_dir: Path) -> None:
     for m in _REQUIRED_REAL_MODULES:
         shutil.copy2(common_dir / m, pkg / m)
 
+    used_real_config = False
     for fname, fake_src in [("config.py", _FAKE_CONFIG_PY), ("constants.py", _FAKE_CONSTANTS_PY)]:
         real = common_dir / fname
-        if real.exists():
+        if real.exists() and not force_fake_config:
             shutil.copy2(real, pkg / fname)
             print(f"[i] Using REAL {fname} from {common_dir} (not this script's fake).")
+            if fname == "config.py":
+                used_real_config = True
         else:
+            if real.exists() and force_fake_config:
+                print(f"[i] REAL {fname} found but overridden with this script's fake for this run "
+                      f"(see cluster_config.yaml note above).")
             (pkg / fname).write_text(fake_src)
+    return used_real_config
 
 
 # ---------------------------------------------------------------------
@@ -364,8 +399,27 @@ def main():
     orchestrator_path = Path(args.orchestrator).resolve()
     common_dir = Path(args.common_dir).resolve()
 
+    # Convenience: if a directory was passed (e.g. `--orchestrator .`),
+    # look for dgx-orchestrator.py inside it rather than failing with an
+    # opaque spec_from_file_location() -> None -> AttributeError three
+    # calls downstream. Still a hard error if it's not there -- this is
+    # a narrow convenience, not a general search.
+    if orchestrator_path.is_dir():
+        candidate = orchestrator_path / "dgx-orchestrator.py"
+        if candidate.exists():
+            print(f"[i] --orchestrator {orchestrator_path} is a directory; using {candidate}")
+            orchestrator_path = candidate
+        else:
+            sys.exit(
+                f"[!] --orchestrator {orchestrator_path} is a directory and does not contain "
+                f"dgx-orchestrator.py. Pass the path to the actual .py file, "
+                f"e.g. --orchestrator {orchestrator_path}/dgx-orchestrator.py"
+            )
+
     if not orchestrator_path.exists():
         sys.exit(f"[!] --orchestrator not found: {orchestrator_path}")
+    if orchestrator_path.suffix != ".py":
+        sys.exit(f"[!] --orchestrator does not look like a .py file: {orchestrator_path}")
 
     work_dir = Path(tempfile.mkdtemp(prefix="dgx-mc-smoke-"))
     base_dir = work_dir / "base"
@@ -375,7 +429,28 @@ def main():
 
     try:
         build_fixture(base_dir)
-        build_common_package(work_dir, common_dir)
+
+        # A real config.py (if present in --common-dir) reads
+        # cluster_config.yaml at call/import time -- the fixture's fake
+        # config.py doesn't need this file at all, so it's only fetched
+        # when it's actually going to be used.
+        real_config_present = (common_dir / "config.py").exists()
+        force_fake_config = False
+        if real_config_present:
+            cc_path = find_cluster_config(args.cluster_config, common_dir)
+            if cc_path is not None:
+                shutil.copy2(cc_path, base_dir / "cluster_config.yaml")
+                print(f"[i] Using real cluster_config.yaml: {cc_path}")
+            else:
+                print(
+                    "[!] A real config.py was found in --common-dir, but no cluster_config.yaml "
+                    "was given (--cluster-config) or found next to --common-dir. Falling back to "
+                    "this script's fake config.py/constants.py for this run -- pass "
+                    "--cluster-config /path/to/cluster_config.yaml for a fully-real run."
+                )
+                force_fake_config = True
+
+        used_real_config = build_common_package(work_dir, common_dir, force_fake_config=force_fake_config)
 
         os.environ["BASE_DIR"] = str(base_dir)
         os.environ["HOME"] = str(home_dir)  # keep resolve_user_identity_key()'s ~/.ssh writes sandboxed
@@ -390,11 +465,42 @@ def main():
         real_mods.subprocess.run = fake_scp_run
 
         spec = importlib.util.spec_from_file_location("dgx_orchestrator", str(orchestrator_path))
+        if spec is None or spec.loader is None:
+            sys.exit(
+                f"[!] Could not build an import spec for {orchestrator_path} -- "
+                f"is this actually a Python file (not a directory or package)?"
+            )
         dgx = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(dgx)
 
         print(f"[i] Loaded {orchestrator_path}")
         print(f"[i] ORCHESTRATOR_VERSION = {getattr(dgx, 'ORCHESTRATOR_VERSION', '?')}")
+
+        # Host IPs come from whatever HOSTS ended up being (real
+        # cluster_config.yaml if used_real_config, this script's fake
+        # 100.64.0.x otherwise) -- assertions below must never hardcode
+        # an expected IP, since it depends entirely on which config was
+        # actually loaded.
+        try:
+            head_ip = dgx.HOSTS["spark-3"]["ip"]
+            worker_ip = dgx.HOSTS["spark-4"]["ip"]
+        except KeyError as exc:
+            sys.exit(
+                f"[!] dgx.HOSTS does not contain expected host key {exc} -- this smoke test's "
+                f"fixture/assertions assume hosts named 'spark-3' and 'spark-4' exist "
+                f"(spark-3 as head). If your real cluster_config.yaml uses different host "
+                f"names, this script needs updating, not your recipe/deploy code."
+            )
+        print(f"[i] Using host IPs from {'REAL' if used_real_config else 'fake'} config: "
+              f"spark-3={head_ip}, spark-4={worker_ip}")
+
+        # Same reasoning as head_ip/worker_ip above: default_image must
+        # never be hardcoded to this script's fake fixture value, since a
+        # real cluster_config.yaml can (and, per Ian's real one, does)
+        # carry a completely different default_image. Read it from
+        # whichever config actually ended up loaded.
+        default_image = dgx.load_cluster_config().default_image
+        print(f"[i] Using default_image from {'REAL' if used_real_config else 'fake'} config: {default_image}")
         print()
 
         # -----------------------------------------------------------
@@ -411,7 +517,7 @@ def main():
         check("1-node dry-run (mods:[]): key set unchanged (no 'mods' key)", set(r1.keys()) == expected_keys, r1.keys())
         check(
             "1-node dry-run (mods:[]): image arg is unmodified base image",
-            "eugr/spark-vllm-b12x:latest" in r1["docker_run_commands"]["spark-3"],
+            default_image in r1["docker_run_commands"]["spark-3"],
             r1["docker_run_commands"]["spark-3"],
         )
 
@@ -478,7 +584,7 @@ def main():
         check("live 1-node (mods:[]): zero docker image inspect", len(docker_image_inspects(TRANSPORT.calls)) == 0, TRANSPORT.calls)
         check(
             "live 1-node (mods:[]): docker run uses base image",
-            "eugr/spark-vllm-b12x:latest" in docker_runs(TRANSPORT.calls)[0]["cmd"],
+            default_image in docker_runs(TRANSPORT.calls)[0]["cmd"],
             docker_runs(TRANSPORT.calls),
         )
 
@@ -501,7 +607,7 @@ def main():
         check("live 1-node (mods present): exactly one docker run", len(runs_6) == 1, runs_6)
         check(
             "live 1-node (mods present): docker run uses derived tag, not base",
-            bool(runs_6) and any("-mods-" in a for a in runs_6[0]["cmd"]) and "eugr/spark-vllm-b12x:latest" not in runs_6[0]["cmd"],
+            bool(runs_6) and any("-mods-" in a for a in runs_6[0]["cmd"]) and default_image not in runs_6[0]["cmd"],
             runs_6,
         )
 
@@ -510,9 +616,9 @@ def main():
         # 'docker image inspect', zero 'docker commit' (no re-bake).
         # -----------------------------------------------------------
         from common.mods import resolve_mod_tag
-        derived_tag = resolve_mod_tag("eugr/spark-vllm-b12x:latest", ["fake-mod"])
+        derived_tag = resolve_mod_tag(default_image, ["fake-mod"])
         TRANSPORT.reset()
-        TRANSPORT.preseeded_tags = {"100.64.0.3": {derived_tag}}
+        TRANSPORT.preseeded_tags = {head_ip: {derived_tag}}
         r7 = dgx._execute_deployment_impl("test-model-mods", 1, "spark-3", "smoke", dry_run=False)
         check("live 1-node, tag pre-baked: status == success", r7.get("status") == "success", r7)
         check("live 1-node, tag pre-baked: exactly one docker image inspect", len(docker_image_inspects(TRANSPORT.calls)) == 1, TRANSPORT.calls)
@@ -529,7 +635,7 @@ def main():
         check("live 2-node (mods present): status == success", r8.get("status") == "success", r8)
         commits_8 = docker_commits(TRANSPORT.calls)
         check("live 2-node (mods present): two docker commits (one per host)", len(commits_8) == 2, commits_8)
-        check("live 2-node (mods present): commits happened on two different hosts", {c["ip"] for c in commits_8} == {"100.64.0.3", "100.64.0.4"}, commits_8)
+        check("live 2-node (mods present): commits happened on two different hosts", {c["ip"] for c in commits_8} == {head_ip, worker_ip}, commits_8)
         check("live 2-node (mods present): both hosts baked to the same tag", len({c["cmd"][-1] for c in commits_8}) == 1, commits_8)
         runs_8 = docker_runs(TRANSPORT.calls)
         check("live 2-node (mods present): two docker runs, both using the derived tag",
