@@ -81,11 +81,12 @@ def get_hf_token() -> str:
     if secrets_file.exists():
         try:
             for line in secrets_file.read_text().splitlines():
-                if line.startswith("HF_TOKEN="):
-                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                key, sep, value = line.partition("=")
+                if sep and key.strip().upper() == "HF_TOKEN":
+                    token = value.strip().strip('"').strip("'")
                     if token:
                         return token
-                    print(f"[!] Warning: {secrets_file} has an HF_TOKEN= line but its value is empty after "
+                    print(f"[!] Warning: {secrets_file} has an HF_TOKEN line but its value is empty after "
                           f"stripping whitespace/quotes. Checking local cache...")
                     break
         except PermissionError:

@@ -146,6 +146,37 @@ Shared-expert loader bug (tonyd2wild's DSPARK-SHARED-EXPERT-FIX.md) — checked,
 
 Terminology trap: "NVFP4" means two unrelated things in this ecosystem. (1) NVFP4-quantized weights (e.g. auroter/DeepSeek-V4-Flash-0731-NVFP4) — a different checkpoint, orthogonal to DSpark. (2) nvfp4_ds_mla, an NVFP4 KV cache dtype — the thing already documented above as known-bad on stock vLLM for MLA models. Getting KV cache dtype working for real (as opposed to weight quantization) requires a heavily-patched third-party runtime (e.g. tonyd2wild's staged A/B/C build), not a flag on either of our current images. Its only benefit is KV pool size/context ceiling — confirmed zero effect on draft acceptance/speed.
 
+### Gemma 4 31B dense (google/gemma-4-31B-it) on eugr/spark-vllm-b12x
+
+Validated, 2026-08-29, real hardware, TP=2 across spark-3/spark-4:
+`google/gemma-4-31B-it` (BF16 base) + `--quantization fp8` +
+`--kv-cache-dtype fp8` + `--attention-backend TRITON_ATTN` +
+`--distributed-executor-backend ray` + `VLLM_USE_V1=0`. 12.0 tok/s decode
+(3-pass benchmark.py, temp=0.0), cold TTFT 0.99s, warm TTFT 0.11s — matches
+independent community TP=2 figures (~11.2 tok/s) closely enough to treat
+both flag choices as confirmed correct, not just non-crashing.
+
+`--attention-backend TRITON_ATTN` is required, not optional: Gemma 4 has
+heterogeneous head dimensions (256 local / 512 global) that the default
+FlashInfer path doesn't handle correctly. Confirmed via
+`Using AttentionBackendEnum.TRITON_ATTN backend.` appearing 3x across the
+cluster in `docker logs vllm-head` — both TP ranks, both nodes.
+
+`eugr/spark-vllm-b12x:latest` (no special tag needed) ships transformers
+5.15.0 — well past the 5.5.0 floor `gemma4` architecture support needs.
+Don't assume otherwise from eugr's `--tf5` build-flag naming; verify
+directly with `docker run --rm <image> pip show transformers` rather than
+inferring from tag conventions.
+
+Benign startup noise, not a failure: `shm_broadcast.py:801 No available
+shared memory broadcast block found in 60 seconds` logged twice during
+boot (22:38–22:39), consistent with runtime FP8 quantization of the ~59GB
+BF16 checkpoint still running when the queue polled. Did not recur once
+serving started; benchmark came back clean. Would be worth investigating
+if it ever recurs *during* active serving rather than only at boot.
+
+
+UPDATE:: Using AttentionBackendEnum.TRITON_ATTN backend. repeated 3x across cluster, quantization=fp8 and kv_cache_dtype=fp8 in the engine config line, 12.0 tok/s decode at TP=2. That's the difference between "we set these flags" and "we confirmed vLLM resolved them" — which is exactly the standard your status: validated marker is meant to encode.
 ---
 
 ## Incident Log
@@ -192,3 +223,21 @@ Terminology trap: "NVFP4" means two unrelated things in this ecosystem. (1) NVFP
 Symptom: ethtool <second-port-iface> reports Link detected: yes and returns full module EEPROM data on both spark-3 and spark-4's second RDMA port, despite only one physical QSFP cable existing between the pair.
 Cause: Driver/firmware returns stale/cached module data from whichever port initialized first — confirmed by identical vendor serial number reported on both ports. Not a real link.
 Rule: Trust enp1s0f0np0 (the actually-cabled port, confirmed via matching real cable's serial). Don't chase this again if it resurfaces.
+
+### 10. Fabricated / Nonexistent HF Repo Path (Gemma 4 31B FP8)
+* **Failure:** `RepositoryNotFoundError: 401 Client Error... Repository Not
+  Found` at config-creation time, before any model loading starts.
+* **Cause:** `hf_path` pointed at `google/gemma-4-31B-it-FP8` — a repo that
+  simply doesn't exist. Google only publishes `google/gemma-4-31B-it`
+  (BF16); FP8 variants exist only under third-party namespaces
+  (RedHatAI, prithivMLmods, vrfai, etc.), never under `google/`.
+* **Compounding trap:** even a real third-party pre-quantized FP8 repo
+  would have failed differently — `KeyError:
+  'layers.0.mlp.down_proj.weight_scale'` in `gemma4.py` load_weights,
+  a documented vLLM bug (#38912). The validated pattern for Gemma 4 is
+  BF16 base + `--quantization fp8` (runtime dynamic quantization), not a
+  pre-quantized checkpoint — opposite of the DeepSeek pattern above.
+* **Rule:** Before writing an `hf_path`, confirm the repo actually exists
+  under the stated org. For Gemma 4 specifically, always use the BF16
+  base checkpoint with `--quantization fp8`, never a pre-quantized
+  `-FP8` repo.

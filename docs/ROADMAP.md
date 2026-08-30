@@ -10,9 +10,654 @@ Each entry: what's wrong today, why it matters, and a rough shape for the
 fix -- not a full spec. Flesh out into a real prompt (see
 `PHASE-2-PROMPTS.md` for the style) when it's actually picked up.
 
+## How this document is organised
+
+Entries are grouped by theme rather than by the order they were noticed.
+Two groups are worth calling out:
+
+- **Residual gaps from shipped work** -- entries whose headline problem was
+  largely fixed in 4.8.x, kept because the *remaining* gap is documented
+  there and because the reasoning explains why the current code looks the
+  way it does. Lower priority than anything in the earlier sections, but do
+  not delete them: several exist specifically to stop a future reader from
+  "fixing" something that is deliberate.
+- **Phase 3 inputs** -- not work to do now, but decisions that get more
+  expensive the longer they're deferred, and that belong in front of whoever
+  picks up N-node generalisation.
+
+Within each group, entries are roughly ordered by priority.
+
+
 ---
 
-## Open
+## Deployment mechanics
+
+### Model-specific mods: bake a derived image layer
+
+**New, 2026-08-29. Priority: HIGH.** Supersedes the `mods:` execution
+decision recorded in `ARCHITECTURE-MIGRATION-PLAN.md` on 2026-08-20 (see
+"What changed since 2026-08-20" at the end of this entry). This is the
+largest open item in this document and the only one that unblocks a whole
+class of models rather than fixing a specific defect.
+
+**Context: why this is now load-bearing.** Cutting-edge checkpoints
+increasingly require patched vLLM source to load at all, months before the
+fix reaches upstream. The triggering case:
+`bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4` ships its own
+`gemma4_patched.py`, which must replace
+`<vllm>/model_executor/models/gemma4.py`, because stock vLLM's loader can't
+map that checkpoint's per-expert NVFP4 scale tensors and dies at load with a
+`KeyError`. This is not a one-off -- waiting ~6 months per fix means not
+running these models at all.
+
+**What exists today:** nothing. `RecipeConfig.mods` is declared in
+`common/recipes.py` and validates, but is documented INERT -- excluded from
+`_TOPOLOGY_OUTPUT_FIELDS`, never read by `build_catalog_response()` or the
+deploy path, and excluded from `compute_config_hash()`. All `docker run`
+volume mounts are constructed programmatically from `cluster_config.yaml`
+plus hardcoded cache roots; nothing recipe-authored has ever reached a
+container's filesystem.
+
+#### The decision
+
+**A mod is a directory containing `run.sh` plus vendored payload files
+(eugr's format). It is applied by baking a derived image layer before the
+container is ever launched -- not by `docker exec` into a running one.**
+
+Per deploy, the orchestrator resolves the recipe's mod set to a
+deterministic tag (`<base-image>-mods-<hash-of-mod-set>`). If that tag
+doesn't exist on the host: start a throwaway container from the base image,
+run each mod's `run.sh` inside it, `docker commit` to the tag. The real
+deploy then runs from that tag with existing entrypoint semantics completely
+untouched.
+
+**Confidence.** The format choice and the rejection of exec-based delivery
+are grounded in a direct reading of eugr's actual mod library and this
+codebase's deploy path -- high confidence, with the falsifiable claims cited
+inline below. The bake mechanism itself rests on one unverified assumption
+(that `docker commit` preserves image config faithfully on these images),
+which is standard documented behaviour but untested here. Step 0 of the
+sequence exists to falsify that before any code is written.
+
+#### Evidence: what eugr's mods actually are
+
+This was decided by reading the mod library, not by reasoning from the
+format's name. Every mod in `eugr/spark-vllm-docker/mods/` except one is a
+build-time modification of the vLLM installation:
+
+| Mod | What it does | Phase |
+|---|---|---|
+| `gpu-mem-util-gb` | rewrites 8 vLLM source files to add a `--gpu-memory-utilization-gb` CLI arg | bake |
+| `diffusiongemma` | several `git apply` patches + chat-template drop | bake |
+| `fix-gemma4-tool-parser` | `git apply` of vLLM PR #38909 | bake |
+| `fix-glm-4.7-flash-AWQ`, `fix-Salyut1-GLM-4.7-NVFP4` | `.patch` files against vLLM source | bake |
+| `fix-qwen3-coder-next` | ships `_triton_alloc_setup.pth` (site-packages hook, runs at Python startup) | bake |
+| `fix-qwen3.5/3.6-chat-template` | drops a `.jinja` into the container workdir | bake |
+| `use-official-vllm`, `use-ngc-vllm` | base-image swap | N/A -- our `image:` field already does this |
+| `drop-caches` | persistent 60s `sync; echo 3 > /proc/sys/vm/drop_caches` loop | **runtime** -- see separate entry below |
+
+**`gpu-mem-util-gb` is the decisive case.** It patches
+`vllm/engine/arg_utils.py` to register a new CLI argument. That argument is
+parsed at process startup, so a mod applied after the container is
+`RUNNING` is unconditionally too late. Any exec-based mechanism fails on
+this mod -- and it was one of the two named first candidates for porting.
+
+**`drop-caches` is the only genuine runtime mod, and it isn't a mod for
+us.** `/proc/sys/vm/drop_caches` is not namespaced -- writing it inside a
+container affects the host. In eugr's on-node architecture a container was
+the only execution surface; we have an off-node control plane that already
+runs commands against hosts at deploy time. It belongs as a host-side
+daemon with deploy/teardown lifecycle, tracked separately below.
+
+**So: one mechanism, not two.** No `phase: image|runtime` field. A two-phase
+design was drafted and discarded once the library was actually read -- it
+existed only to let two earlier decisions both be right.
+
+#### Why not the alternatives
+
+**Rejected: `extra_mounts: list[str]` on the recipe schema.** (1) Makes
+recipe-authored strings into raw host paths bind-mounted into a container
+that is `--privileged` on the 2-node path. (2) The file must independently
+exist at an identical path on every target host before any deploy, which
+nothing guarantees -- `cache_cluster_assets.py` handles weights and images,
+not arbitrary files. That converts "unsupported" into "deploys silently
+against a host missing the file," the same shape as the host-hardcoding bug
+class. (3) A mount can only express file replacement -- it cannot express
+`git apply`, a source rewrite, or a `.pth` hook, i.e. most of the table
+above.
+
+**Rejected: hand-maintained custom image per patched model.** Needs zero
+code change (`image:` is already a string field), but creates a private
+image per model rebuilt on every base bump, turns patch-to-vLLM-version
+coupling into a human-maintained tag matrix, and erases the fact that vLLM
+was modified -- when upstream changes and a patch goes stale, a hand-baked
+image gives no signal. The chosen design keeps the baking and removes the
+human: the tag encodes the mod-set hash and the recipe declares the mods, so
+provenance is *better*, not worse.
+
+**Rejected: eugr's own delivery -- `docker exec` into a running container.**
+Their `launch-cluster.sh::apply_mod_to_container()` scps the mod to the
+node, `docker cp`s it in, then
+`docker exec bash -c "cd <dest> && chmod +x run.sh && ./run.sh"`. This works
+for them because their containers start *idle* (a keepalive command), mods
+apply, then the launch script is copied in and exec'd. Ours don't: the
+1-node path starts the container with the vLLM entrypoint as PID 1, so an
+exec'd mod races against vLLM's own startup and loses for anything that
+patches code vLLM imports or arguments it parses (see `gpu-mem-util-gb`
+above). Restructuring the 1-node path to idle-then-exec would also destroy a
+working failure signal -- today, vLLM dying on 1-node kills the container and
+`docker ps` catches it; an exec'd engine leaves a healthy-looking container
+wrapped around a dead process, which is precisely the failure mode the
+"Engine health monitoring" entry exists to fix on the 2-node path.
+
+#### Properties this buys
+
+- **`compute_config_hash()` coverage is free.** `image` is already a hashed
+  field. If the mod set resolves *into* the image tag, mod changes
+  invalidate the hash with zero changes to hashing logic -- no `sha256`
+  schema field, no file I/O added to `build_catalog_response()` (which runs
+  on every dashboard status poll), no hash-versioning decision. This was the
+  messiest open question in every rejected design and it evaporates.
+- **No file-transport problem.** Each node bakes locally from the same base
+  plus the same mod directory, so only the small mod directory ships. No
+  need to extend `run_ssh()` for stdin (it's `subprocess.Popen` with no
+  stdin plumbing today) and no base64-in-argv workaround.
+- **The container-path hazard is dodged rather than mitigated.** Hardcoding
+  a target like `python3.12/dist-packages/vllm/...` in a recipe would break
+  silently on a base-image Python bump -- patch lands where nothing imports
+  it, stock loader runs, original error returns, same class as the
+  host-hardcoding bug. A `run.sh` running *inside* the container resolves
+  the path itself at the moment it matters.
+
+#### Hard constraints
+
+1. **Mod payloads must be vendored in-repo. No network fetches at bake
+   time.** `fix-gemma4-tool-parser` is a live example of the hazard: it
+   `curl`s a GitHub PR diff and pipes it to `git apply`. If each host bakes
+   locally, a non-deterministic mod can produce *different images on head and
+   worker*. It also fails outright under the `global_hf_hub_offline` /
+   `global_transformers_offline` switches. Porting that mod means pinning the
+   diff into the repo, not copying the `curl`.
+2. **Bake per-host, not bake-once-and-distribute.** Far simpler (no
+   registry, no multi-GB `docker save | ssh docker load`) and safe *only
+   because* constraint 1 guarantees determinism. Record that dependency --
+   if constraint 1 is ever relaxed, this must be revisited.
+3. **`run.sh` must execute with `WORKSPACE_DIR` set to the image's actual
+   `WorkingDir`.** Chat-template mods do
+   `cp chat_template.jinja $WORKSPACE_DIR/fixed_chat_template.jinja`; get
+   this wrong and the file bakes into a directory vLLM never looks in. Folds
+   into Step 0's config check, which already inspects `WorkingDir`.
+
+#### Known coupling worth catching later
+
+Chat-template mods only work if the recipe *also* passes a matching flag
+(`--chat-template fixed_chat_template.jinja`) in `vllm_args`. The mod and the
+flag are correct only together, and nothing enforces the pairing. Same class
+as the "Recipe-level guardrails against known-bad flag combinations" entry
+above -- worth folding into that linter once both exist, rather than building
+a separate check.
+
+#### Open questions
+
+1. **Baked layers accumulate.** Needs the same retention treatment
+   `crash_log_retention_days` gives Ray logs. Not urgent; layers are small
+   relative to weights.
+2. **Where the mod source of truth lives.** `mods/` at repo root is the
+   obvious answer -- reviewable, versioned alongside the recipes that
+   reference it, and already visible inside the orchestrator container at
+   `/app/mods/` via `docker-compose.yml`'s `.:/app` bind mount. Confirm
+   `.gitignore` doesn't exclude the payload files (`.patch`, `.pth`,
+   `.jinja`, `.diff`) before the first commit, given the credentials-scrub
+   history.
+
+#### Implementation sequence
+
+Steps 1-5 are each independently testable. Step 0 gates the design; step 4
+gates the implementation. Neither is a formality.
+
+0. **Verify the load-bearing assumption: that `docker commit` faithfully
+   preserves image config on these specific vLLM images.** The whole design
+   rests on a derived layer behaving identically to its base except for the
+   patched files. That is documented `docker commit` behaviour and is
+   expected to hold, but has **not been checked against
+   `eugr/spark-vllm-b12x` or any GB10 vLLM image**. If it doesn't hold, the
+   delivery mechanism is wrong -- not an implementation detail -- and the
+   rejected alternatives come back into play. Cheap to falsify, expensive to
+   discover late.
+   - Diff `docker inspect --format '{{json .Config}}'` between the base
+     image and a throwaway commit of it. `Entrypoint`, `Cmd`, `Env`,
+     `WorkingDir`, `Labels`, `ExposedPorts` must survive unchanged.
+   - Confirm a committed layer with an *empty* mod set launches correctly
+     through the existing deploy path -- i.e. `<base>-mods-<hash>` is
+     behaviourally identical to `<base>`. If that isn't true, nothing
+     downstream can be trusted.
+   - Check the NGC-derived base's `ENTRYPOINT` script and NVIDIA container
+     runtime hooks still fire from the committed image. These images print a
+     CUDA banner and do driver checks at startup; that machinery is the most
+     plausible thing to behave differently.
+   - Note the image is arm64 on GB10. Nothing about `docker commit` should be
+     architecture-sensitive, but this stack already produced one x86-only
+     surprise (`orthozany/vllm-jasl-dsv4`, see
+     `BACKLOG-dspark-sm120-image.md`) -- don't assume by analogy to x86
+     experience.
+
+   If step 0 fails, stop and re-open the delivery decision rather than
+   working around it. The rejected alternatives are documented above
+   precisely so that's a cheap pivot.
+
+1. **Mod format + loader schema.** Retype `RecipeConfig.mods` from bare
+   `list` to a typed model (mod directory name; the orchestrator resolves it
+   against `mods/`, so no host paths in recipes). Every existing recipe has
+   it empty, so this is a zero-data migration -- verify that against
+   `recipes/local/*.yaml` and `recipes/eugr/*.yaml` rather than assuming.
+   Shape validation at load (pydantic); existence verification deferred to
+   deploy, because `build_catalog_response()` fails closed and one bad mod
+   entry would otherwise empty the entire catalog.
+2. **Bake + cache + tag resolution.** Deterministic tag from the mod-set
+   hash; skip the bake when the tag already exists on the host. Fail loudly
+   and abort the deploy if any `run.sh` returns non-zero -- eugr's own
+   `apply_mod_to_container()` does exactly this, and a half-applied patch set
+   is worse than no deploy.
+3. **Deploy-path integration.** One shared helper called from both the 1-node
+   and 2-node branches. Given the host-hardcoding history, do not write the
+   resolution logic twice.
+4. **Prove end-to-end with a no-op mod** -- a `run.sh` that touches one
+   harmless file. Validates schema parse -> hash -> bake -> tag resolution ->
+   deploy, with the failure mode *not* entangled with "did the real patch
+   work." If the mechanism is broken, find that on a harmless file, not on
+   the first production use.
+5. **Wrap the Gemma patch** as `mods/gemma4-nvfp4/`. Port `gpu-mem-util-gb`
+   if the OOM-watchdog gap still wants it (note it is a large multi-file
+   patcher, not a trivial port).
+
+#### What changed since 2026-08-20
+
+`ARCHITECTURE-MIGRATION-PLAN.md` resolved this on 2026-08-20 in favour of
+eugr's `docker exec` pattern, applied after the container reaches `RUNNING`
+and before the health-check poll. That decision was reasonable for what was
+known: it was made against the mod *concept*, without reading any `run.sh`.
+Reading them showed the two named first candidates both fall outside what
+that mechanism can do -- `gpu-mem-util-gb` patches an argument parsed at
+startup (too late to exec), and `drop-caches` isn't a container-scoped
+operation at all. The 08-20 ordering insight (mods before the health poll)
+becomes unnecessary rather than wrong: baking means the image is already
+correct before the container starts, so there is no race to sequence around.
+
+**Depends on:** nothing blocking. `EUGR-REFERENCE-NOTES.md` has the mechanism
+detail on eugr's side and should be updated to note that we adopt their
+format but not their delivery.
+
+---
+
+### Host-side FS cache pressure relief during model load (`drop-caches`)
+
+**New, 2026-08-29.** Split out of the mods design above, where it was
+originally miscategorised as a mod to be ported.
+
+**Context:** eugr's `mods/drop-caches/run.sh` starts a `nohup` background
+loop running `sync; echo 3 > /proc/sys/vm/drop_caches` every 60 seconds for
+the container's lifetime, writing a PIDFILE so it can be stopped. Per their
+changelog it exists to stop `fastsafetensors` getting stuck mid-load on
+large models when running close to the memory ceiling -- it must run
+*during* loading, continuously, not once beforehand.
+
+**Why it is not a mod in our architecture:** `/proc/sys/vm/drop_caches` is
+not namespaced, so writing it inside a container acts on the host anyway. In
+eugr's on-node design a container was the only execution surface available;
+we have an off-node control plane that already runs commands against hosts
+over SSH at deploy time (teardown, `nvidia-smi -lgc` clock lock, `mkdir -p`).
+Wrapping this as a container mod would import their architectural constraint
+into a system that doesn't have it.
+
+**Why it is also not a `tuning:` knob:** unlike `gpu_clock_lock`, this isn't
+a one-shot setting applied before launch. It's a daemon with a lifecycle --
+start at deploy, stop at teardown -- which is real behaviour to build, not a
+value to centralise.
+
+**What's missing today:** nothing addresses FS cache pressure during model
+load. Whether we actually need it is unconfirmed: it was introduced for
+Qwen3.5-397B on eugr's hardware, and we have no recorded instance of a
+`fastsafetensors` load stall on our own cluster. This entry exists so the
+mechanism is understood and findable if that symptom ever appears, not
+because it's a known gap.
+
+**Shape of a real fix, if it's ever needed:**
+- Start a host-side loop over SSH as part of the deploy sequence, gated by a
+  per-recipe or per-deploy opt-in rather than always-on (dropping caches
+  every 60s unconditionally has its own cost on a shared host).
+- Tie teardown to it explicitly. A PIDFILE-per-deploy under the same
+  `~/.cache/ray-logs/<deploy_run_id>` convention would make cleanup fit the
+  existing teardown phases rather than adding a new tracking mechanism.
+- Note the interaction with the teardown entries above: an orphaned
+  `drop_caches` loop surviving teardown would be exactly the kind of stray
+  host process the `ps aux` safety-net step was originally aimed at, and one
+  of the few that step could actually see (it runs on the bare host, not in
+  a container).
+
+**Depends on:** nothing. Deliberately deferred -- do not build speculatively
+before a real load stall is observed on our hardware.
+
+---
+
+## Recipe catalog integrity
+
+### Recipe-level guardrails against known-bad flag combinations
+
+**Priority: bumped, 2026-08-28.** Directly requested — several recipes in
+the current catalog can be selected and launched in the dashboard/CLI but
+are known or suspected to fail, which wastes a real cold-start cycle
+(sometimes 30+ minutes) finding that out. This entry (the flag-combination
+linter) and the new "recipe status marker" entry below are the two
+concrete pieces of that ask.
+
+**Context:** two separate incidents on 2026-08-23 were both, at root, a
+recipe carrying a `vllm_args` combination that was invalid and had never
+been validated against a real deploy before being committed:
+
+1. `--kv-cache-dtype nvfp4_ds_mla` on an MLA-architecture model (DeepSeek
+   V4) -- vLLM's own engine-config validation rejects any `nvfp4`-family
+   KV cache dtype for MLA models outright. Already documented in
+   `docs/TROUBLESHOOTING.md` #3 for the related trigger case.
+2. `--quantization modelopt_fp4` combined with an explicit
+   `--kv-cache-dtype`, which per that same troubleshooting entry triggers
+   an internal container entrypoint hook that silently overrides the
+   explicit KV cache dtype back to `nvfp4_ds_mla` -- recreating problem #1
+   even when the recipe author correctly set `fp8` explicitly.
+
+Both are documented in `docs/TROUBLESHOOTING.md` now, but only as
+after-the-fact incident write-ups -- nothing stops a third recipe from
+reintroducing either pattern, and a recipe carrying one can sit in git
+looking fine (valid YAML, passes schema validation) until the moment
+someone actually deploys it.
+
+**Shape of a real fix:**
+- A lightweight recipe linter -- either folded into `load_recipes()`
+  itself (warn at load time, don't hard-fail the whole catalog per the
+  existing fail-closed behavior) or a standalone `tools/lint_recipes.py`
+  run in CI -- checking `vllm_args` for a small, explicit list of known-bad
+  flag combinations as they're discovered. Start with the two above; this
+  list only grows by adding real incidents, not by trying to anticipate
+  hypothetical ones.
+- Cheap enough to start: a dict of `{flag_or_value: incompatible_with}`
+  pairs and a regex/shlex-split check against `vllm_args` at recipe load
+  time, surfaced the same way an unrecognized `recipe_version` already
+  warns today (soft warning, not a hard failure, unless confidence is
+  high).
+
+**Depends on:** nothing. Small, and the two known cases above are already
+fully specified.
+
+---
+
+### Per-recipe/topology validation status marker
+
+**New, 2026-08-28.** A narrower linter only catches flag combinations
+someone already knows are bad. It doesn't help with the broader,
+currently-felt problem: a recipe can be schema-valid, carry no known-bad
+flag pattern, and *still* fail on deploy simply because that specific
+model/topology combination has never actually been exercised end-to-end
+-- exactly the distinction `docs/TROUBLESHOOTING.md`'s
+Validated/Known-bad/Unconfirmed framework already draws for individual
+`vllm_args`, but nothing currently draws at the level of "should a person
+even try deploying this recipe right now."
+
+**Context:** the catalog is a living, growing set (see `README.md`'s
+Model Catalog section) where new variants get added as needed. Nothing
+distinguishes, in the dashboard dropdown or `dgx-config status`, a recipe
+that's been deployed and confirmed serving traffic from one that's a
+work-in-progress smoke test (e.g.
+`deepseek-v4-flash-0731-dspark-sm120.yaml`, deliberately built small for a
+fast yes/no and explicitly not expected to be production-ready) or one
+that's simply never been tried. All three currently look identical in the
+UI: selectable, same as any other model.
+
+**Shape of a real fix:**
+- Add an optional `status:` field to the recipe schema (`common/recipes.py`),
+  e.g. `validated` / `unconfirmed` / `known-bad`, defaulting to
+  `unconfirmed` when absent so existing recipes don't need an immediate
+  mass edit.
+- `build_catalog_response()` already has `PENDING_LAUNCH_STATE`'s "last
+  launched successfully" tracking (landed 2026-08-24) keyed by
+  `config_hash` -- a recipe/topology combination that has a recorded
+  successful launch could auto-promote from `unconfirmed` to `validated`
+  without a human touching the YAML at all, keeping the marker honest and
+  low-maintenance rather than another thing to remember to update by hand.
+- Surface the status as a visible badge/color next to each model in the
+  dashboard dropdown and in `dgx-config status`'s catalog listing --
+  something a person glances at before clicking Deploy, not something
+  they have to already know to go check `docs/TROUBLESHOOTING.md` for.
+- Does not replace the flag-combination linter above -- that catches a
+  known-bad pattern before it's ever deployed once; this tracks whether a
+  given recipe has actually been proven to work at all. Both are worth
+  having.
+
+**Depends on:** nothing structurally. Requires an actual pass over the
+current `recipes/local/*.yaml` and `recipes/eugr/*.yaml` files to assign
+initial status values -- not done as part of this roadmap entry, needs the
+real files.
+
+---
+
+### `compute_config_hash()` hashes `vllm_args` as a raw string, not parsed
+
+**Context, 2026-08-29.** `common/recipes.py`'s `compute_config_hash()`
+deliberately hashes `vllm_args` as-is rather than `shlex`-splitting it --
+its own docstring calls this out explicitly: *"simpler, and fine unless
+flags get reordered without changing them in practice."* That caveat is
+the bug: two functionally identical `vllm_args` strings that differ only in
+flag order, or in incidental whitespace from a YAML folded-scalar (`>-`)
+reflow, hash differently and spuriously reset a recipe's "validated"/launch-
+history status even though nothing that reaches `docker run` actually
+changed.
+
+**Why this matters more once the per-recipe status marker (above) lands:**
+right now a stale hash only means a slightly-too-conservative "last
+launched successfully" display. Once recipes carry a `validated` /
+`unconfirmed` / `known-bad` badge that auto-promotes off this same hash,
+an incidental reflow -- someone re-wrapping a long `vllm_args` line, or a
+future recipe-editing tool that reorders flags for readability -- would
+silently demote a known-good recipe back to looking unvalidated in the
+dashboard, for a change that altered nothing about actual behavior. A
+false "this hasn't been tested" is a worse failure mode than a false
+"this has" would be, since it either causes needless re-validation or --
+worse -- trains people to stop trusting the badge at all.
+
+**Shape of a real fix:**
+- `shlex.split(topo.vllm_args)`, then sort the resulting token list (or
+  parse into flag/value pairs and sort by flag name) before hashing, so
+  flag order stops mattering the same way `env_vars` already gets sorted
+  before hashing.
+- Watch the interaction with `docs/TROUBLESHOOTING.md` Incident #4 (YAML
+  folded-scalar comment pollution / `shlex.split()` choking on stray `#`)
+  while touching this -- `compute_config_hash()` and the actual launch
+  path's own arg-splitting should probably share one parsing helper rather
+  than two independent implementations of "parse `vllm_args`" that could
+  drift out of sync with each other.
+- Decide whether to also normalize `--speculative-config`'s embedded JSON
+  (currently just a substring of the larger `vllm_args` string) --
+  key-order-insensitive JSON comparison would close the same class of gap
+  one level deeper, though it's a smaller/rarer case than top-level flag
+  reordering.
+
+**Depends on:** nothing structurally. Worth landing before or alongside the
+per-recipe status marker entry above, since that's the feature whose
+correctness actually depends on this hash being order-insensitive.
+
+---
+
+### Near-duplicate catalog key detection
+
+**Context:** `deepseek-v4-flash-nvfp4.yaml` and
+`deepseek-v4-flash-0731-nvfp4.yaml` coexisted with catalog keys one
+keystroke apart, serving genuinely different models. A prior session
+silently repointed the former's `hf_path` to the *same* model as the
+latter while also introducing the invalid kv-cache-dtype combination above
+-- with no filename change to signal any of it happened. The wrong key got
+deployed by simple typo-adjacent selection, not a deliberate choice.
+(Resolution used at the time: the older recipe was deleted outright rather
+than repaired, since it wasn't in active use -- see `docs/TOMBSTONES.md`
+#57. That closed this specific instance but not the underlying class of
+risk.)
+
+**What's missing today:** `load_recipes()` already raises on an exact
+stem collision between `local/` and `eugr/` directories, but nothing
+flags two *different*, both-valid catalog keys that are suspiciously
+similar -- by edit distance, by shared `hf_path`, or both.
+
+**Shape of a real fix:**
+- At `load_recipes()` time, after loading the full set: flag any pair of
+  keys within a small edit-distance threshold of each other, or any pair
+  that share an identical `hf_path`, as a soft warning (printed at load,
+  maybe also surfaced in `dgx-config status` or the dashboard) -- not a
+  hard failure, since legitimate near-duplicates (a `-nvfp4` suffix
+  variant of the same base name) are common and expected.
+- The `hf_path` collision check is the more actionable one: two catalog
+  keys serving the identical HF model is either intentional (fine, but
+  worth knowing) or exactly this incident (a stale entry silently
+  repointed to overlap with a newer one).
+- `find_cached_models()` (4.8.4) already computes a live
+  `hf_path -> catalog_key` map for cache attribution purposes -- the same
+  data structure this check would need, just applied at recipe-load time
+  instead of cache-inspection time. Worth building this as a shared helper
+  both call, rather than two separate implementations of the same lookup.
+
+**Depends on:** nothing. Could land alongside the flag-combination linter
+above, since both hook into the same `load_recipes()` pass.
+
+---
+
+### `benchmark_ledger.csv` key can silently mismatch the recipe actually benchmarked
+
+**Context, 2026-08-29.** `benchmark.py --model-key` exists specifically so
+the ledger's ability to join back to the catalog (`enrich_catalog()`'s
+`historical_tps` lookup) doesn't depend on the served model ID matching the
+catalog key -- per the script's own docstring, those are different strings
+by default. During the DSpark validation run, the benchmark logged under
+key `deepseek-v4-flash-0731-1M` despite validating a completely different
+recipe (`deepseek-v4-flash-0731-dspark`) -- either `--model-key` wasn't
+passed, or was passed with a stale value left over from a previous run.
+
+**What's missing today:** nothing catches this at benchmark time. A wrong
+or missing `--model-key` silently produces a ledger row that looks
+legitimate but attributes historical throughput data to the wrong recipe --
+which then quietly corrupts anything downstream that trusts
+`historical_tps` for that catalog key (the per-recipe status-marker idea
+above, dashboard display, capacity planning) without any error surfacing
+anywhere.
+
+**Shape of a real fix:**
+- Have `execute_standalone_benchmark()`/`_run_benchmark_worker()` (the
+  orchestrator's own caller of `benchmark.py`, per its comment about owning
+  `benchmark_results.txt`) always pass `--model-key` explicitly, derived
+  from whatever recipe/config is actually being benchmarked, rather than
+  relying on it being supplied correctly by whoever invokes the script
+  directly.
+- Consider a sanity check at ledger-write time: if `--model-key` isn't
+  provided and falls back to `model_id.split("/")[-1]`, and that fallback
+  key doesn't match anything in the currently-loaded catalog, warn loudly
+  rather than writing a silently-orphaned row.
+- Worth an audit of existing `benchmark_ledger.csv` rows for other
+  mismatches now that one's confirmed, since this could have been
+  happening quietly before it was noticed.
+
+**Depends on:** nothing structurally. Small, self-contained fix in the
+benchmark invocation path.
+
+---
+
+## Runtime robustness
+
+### Engine health monitoring: container RUNNING doesn't mean the engine is alive
+
+**Context:** in a 2-node Ray deploy, the container's PID 1 is
+`ray start --block`, not the vLLM engine. The engine itself runs as a
+separate, detached `docker exec -d` process launched after Ray registers
+its workers -- structurally decoupled from the container's own process
+tree. Docker correctly reports the container `RUNNING` for as long as Ray
+is alive, independent of whether the actual engine process crashed
+seconds after starting.
+
+**What 4.8.4 does:** `_detect_crash_signature()` catches this by scanning
+container logs for an unhandled Python traceback OR an argparse-style CLI
+usage error, and short-circuits to a `CRASHED` status before the
+progress-keyword scanner gets a chance to misfire on words inside the
+error text itself (two real incidents: a crash message containing the
+literal phrase "kv cache," and a malformed `--speculative-config` that
+exits via `parser.error()` with no traceback at all). This is a real fix
+for both failure classes observed, but it's a log-scraping workaround, not
+a structural one.
+
+**What's still missing:** nothing directly checks whether the engine
+process is actually alive. A crash that produces neither a traceback nor
+an argparse error line (a segfault, an OOM-killed process, a hang with no
+output at all) would not be caught by `_detect_crash_signature()` and
+would fall through to the same misreporting risk this entry exists to
+close.
+
+**Shape of a real fix:**
+- For the Ray-exec launch path specifically: track the PID (or a
+  recognizable process signature) of the `docker exec -d`'d engine process
+  at launch time, and have status checks verify it's still present via
+  `docker exec <container> ps aux` (or `/proc` inspection) rather than
+  relying on container-level state or log content at all.
+- Treat "container RUNNING, engine process absent, health check never
+  passed" as a distinct, unambiguous CRASHED state -- independent of
+  whatever the logs do or don't contain.
+- Keep `_detect_crash_signature()` as a fast-path/first-line check (it's
+  cheap, one `docker logs` call) even after a process-liveness check
+  lands, since it can report the *reason* for the crash where a bare
+  liveness check can't.
+
+**Depends on:** nothing structurally. Natural next step after the log-scan
+fix, once there's appetite to touch the Ray-exec launch path.
+
+---
+
+### Cache integrity retrospection
+
+**Context:** `cache-inventory` (4.8.4) and `prune-cache` (4.8.4) both
+already walk every JIT cache entry directory on every host -- that's the
+natural place to add integrity checks, since the traversal cost is already
+paid.
+
+**What's missing today:** neither command has any concept of "this entry
+looks incomplete/corrupt," only age and size. The `cache-inventory` run on
+2026-08-23 surfaced one concrete artifact worth generalizing from: a
+`tilelang` entry literally named `tmp` with an implausible ~56-year age
+(epoch-adjacent timestamp), consistent with a partial-extraction directory
+from a process that died before its rename-into-place step.
+
+**Shape of a real fix:**
+- Heuristic pass in the inventory walk: flag entries whose name looks like
+  a working/temp artifact (`tmp`, trailing partial-write suffixes the
+  specific JIT libraries use -- needs checking their actual conventions,
+  not guessed), or whose internal file set looks incomplete relative to
+  what a healthy entry of that type normally contains (e.g. metadata json
+  present without a paired `.so`/`.cubin`, if that pairing convention holds
+  -- needs verifying against actual Triton/TileLang/DeepGEMM cache layouts,
+  we don't currently have documented ground truth on this).
+- Correlate against teardown history: if a `--log-teardowns` or similar
+  timestamp record existed, flag any cache entry whose mtime falls within
+  a narrow window of a past hard-kill teardown as "possibly interrupted,"
+  independent of the structural heuristic above.
+- Surface flagged entries in `cache-inventory` output as a distinct
+  category (not folded into the LRU list), and let `prune-cache` optionally
+  target flagged entries specifically regardless of the free-space floor --
+  a suspected-corrupt entry is worth clearing even when disk space isn't
+  tight, which is a different trigger than the LRU eviction path.
+- This needs real ground-truth on Triton/TileLang/DeepGEMM's actual cache
+  directory contracts before the heuristic can be trusted -- worth reading
+  their source (or the `eugr/spark-vllm-b12x` image's bundled versions of
+  them) rather than guessing the file-pairing convention.
+
+**Depends on:** nothing structurally -- could land independently of the
+teardown work above. Worth doing after a few more `cache-inventory` runs
+across normal operation, so the heuristic is tuned against what a *healthy*
+cache actually looks like, not just the one incident.
+
+---
+
+## Residual gaps from the 4.8.4 teardown work
 
 ### Teardown robustness: close the orphaned-compile-child gap
 
@@ -176,231 +821,77 @@ sweep is independent follow-up work, not blocked by anything else here.
 
 ---
 
-### Cache integrity retrospection
+## Phase 3 inputs: topology and schema stability
 
-**Context:** `cache-inventory` (4.8.4) and `prune-cache` (4.8.4) both
-already walk every JIT cache entry directory on every host -- that's the
-natural place to add integrity checks, since the traversal cost is already
-paid.
+### Recipes hardcode host-specific NCCL/Gloo interface names
 
-**What's missing today:** neither command has any concept of "this entry
-looks incomplete/corrupt," only age and size. The `cache-inventory` run on
-2026-08-23 surfaced one concrete artifact worth generalizing from: a
-`tilelang` entry literally named `tmp` with an implausible ~56-year age
-(epoch-adjacent timestamp), consistent with a partial-extraction directory
-from a process that died before its rename-into-place step.
+**New, 2026-08-29.** Every 2-node recipe carries
+`NCCL_SOCKET_IFNAME=enp1s0f0np0` and `GLOO_SOCKET_IFNAME=enp1s0f0np0` in its
+`env_vars`. `cluster_config.yaml` *also* declares `network.interface:
+enp1s0f0np0` and `network.nccl_ib_hca: rocep1s0f0`. Same value, two places,
+and the recipe copy is what actually reaches `docker run`.
+
+**Why this matters:** this is the same class as the `PRIMARY_HOST` /
+`SECONDARY_HOST` hardcoding eliminated in V4.8.5 -- host identity living in
+a file that shouldn't own it. It's invisible today because there is exactly
+one pool with one NIC name. The moment `spark-5`/`spark-6` come online as a
+second fabric pool with different interface names, every 2-node recipe in
+the catalog is silently wrong for that pool, with no mechanism to vary it
+per-pool because it's baked into per-model YAML. That's a
+break-every-recipe migration, and it is already written.
+
+**Confirmed prior art:** eugr does not do this. `launch-cluster.sh`'s
+`get_env_flags()` injects `NCCL_SOCKET_IFNAME`, `MN_IF_NAME`,
+`UCX_NET_DEVICES` and per-node `VLLM_HOST_IP`/`RAY_NODE_IP_ADDRESS` from
+values `autodiscover.sh` derived at launch time. Their recipes carry no
+interface names at all. Their discovery also handles a case we will
+eventually hit: four active CX7 interfaces means *mesh* topology, which
+needs a different NCCL variable set entirely
+(`NCCL_NET_PLUGIN=none`, `NCCL_IB_SUBNET_AWARE_ROUTING=1`,
+`NCCL_IB_MERGE_NICS=0`). `cluster_config.yaml` already reserves that
+distinction with `network.topology: switched`.
 
 **Shape of a real fix:**
-- Heuristic pass in the inventory walk: flag entries whose name looks like
-  a working/temp artifact (`tmp`, trailing partial-write suffixes the
-  specific JIT libraries use -- needs checking their actual conventions,
-  not guessed), or whose internal file set looks incomplete relative to
-  what a healthy entry of that type normally contains (e.g. metadata json
-  present without a paired `.so`/`.cubin`, if that pairing convention holds
-  -- needs verifying against actual Triton/TileLang/DeepGEMM cache layouts,
-  we don't currently have documented ground truth on this).
-- Correlate against teardown history: if a `--log-teardowns` or similar
-  timestamp record existed, flag any cache entry whose mtime falls within
-  a narrow window of a past hard-kill teardown as "possibly interrupted,"
-  independent of the structural heuristic above.
-- Surface flagged entries in `cache-inventory` output as a distinct
-  category (not folded into the LRU list), and let `prune-cache` optionally
-  target flagged entries specifically regardless of the free-space floor --
-  a suspected-corrupt entry is worth clearing even when disk space isn't
-  tight, which is a different trigger than the LRU eviction path.
-- This needs real ground-truth on Triton/TileLang/DeepGEMM's actual cache
-  directory contracts before the heuristic can be trusted -- worth reading
-  their source (or the `eugr/spark-vllm-b12x` image's bundled versions of
-  them) rather than guessing the file-pairing convention.
+- Derive the interface env vars in the deploy path from
+  `cluster_config.yaml`'s `network:` block (eventually per-pool), and strip
+  them from recipe `env_vars`.
+- While in there, confirm whether our 2-node loop sets `VLLM_HOST_IP` and
+  the Ray node-IP vars *per host* or once for all hosts. eugr sets them
+  per-node explicitly. Getting this wrong across pools would be subtle and
+  hard to attribute.
+- Decide whether the mesh-vs-switched variable set belongs in
+  `cluster_config.yaml` as data or in code keyed off `network.topology`.
 
-**Depends on:** nothing structurally -- could land independently of the
-teardown work above. Worth doing after a few more `cache-inventory` runs
-across normal operation, so the heuristic is tuned against what a *healthy*
-cache actually looks like, not just the one incident.
+**Depends on:** nothing to start. Deadline is external -- this wants to land
+*before* `spark-5`/`spark-6` become a real second pool, not after.
 
 ---
 
-### Engine health monitoring: container RUNNING doesn't mean the engine is alive
+### `compute_config_hash()` stability ahead of Phase 3's topology-key change
 
-**Context:** in a 2-node Ray deploy, the container's PID 1 is
-`ray start --block`, not the vLLM engine. The engine itself runs as a
-separate, detached `docker exec -d` process launched after Ray registers
-its workers -- structurally decoupled from the container's own process
-tree. Docker correctly reports the container `RUNNING` for as long as Ray
-is alive, independent of whether the actual engine process crashed
-seconds after starting.
+**New, 2026-08-29.** `compute_config_hash(recipe, topo_key)` takes the
+topology key as an input, and every historical hash is therefore bound to
+today's `1_node`/`2_node` naming. Phase 3's N-node generalization is
+expected to restructure exactly that -- to pool-aware keys, or `N_node`, or
+something else not yet decided.
 
-**What 4.8.4 does:** `_detect_crash_signature()` catches this by scanning
-container logs for an unhandled Python traceback OR an argparse-style CLI
-usage error, and short-circuits to a `CRASHED` status before the
-progress-keyword scanner gets a chance to misfire on words inside the
-error text itself (two real incidents: a crash message containing the
-literal phrase "kv cache," and a malformed `--speculative-config` that
-exits via `parser.error()` with no traceback at all). This is a real fix
-for both failure classes observed, but it's a log-scraping workaround, not
-a structural one.
+**Why this matters:** the hash is the join key for launch-success tracking
+and `historical_tps` lookups. If the key scheme changes, every accumulated
+hash silently stops joining, and the "has this exact configuration ever
+launched successfully" history is lost -- which is precisely the data the
+per-recipe status marker entry above intends to auto-promote from. There is
+already evidence this join is fragile (see the `benchmark_ledger.csv` key
+mismatch entry). Losing months of accumulated validation data at the moment
+Phase 3 lands would be a bad and entirely foreseeable surprise.
 
-**What's still missing:** nothing directly checks whether the engine
-process is actually alive. A crash that produces neither a traceback nor
-an argparse error line (a segfault, an OOM-killed process, a hang with no
-output at all) would not be caught by `_detect_crash_signature()` and
-would fall through to the same misreporting risk this entry exists to
-close.
+**Shape of a real fix:** decide *now*, before more data accumulates, either
+to version the hash (so old and new schemes coexist and old rows remain
+attributable) or to make it topology-key-independent. This is a decision to
+record, not code to write today -- but it gets more expensive with every
+month of data written under the current scheme.
 
-**Shape of a real fix:**
-- For the Ray-exec launch path specifically: track the PID (or a
-  recognizable process signature) of the `docker exec -d`'d engine process
-  at launch time, and have status checks verify it's still present via
-  `docker exec <container> ps aux` (or `/proc` inspection) rather than
-  relying on container-level state or log content at all.
-- Treat "container RUNNING, engine process absent, health check never
-  passed" as a distinct, unambiguous CRASHED state -- independent of
-  whatever the logs do or don't contain.
-- Keep `_detect_crash_signature()` as a fast-path/first-line check (it's
-  cheap, one `docker logs` call) even after a process-liveness check
-  lands, since it can report the *reason* for the crash where a bare
-  liveness check can't.
-
-**Depends on:** nothing structurally. Natural next step after the log-scan
-fix, once there's appetite to touch the Ray-exec launch path.
-
----
-
-### Recipe-level guardrails against known-bad flag combinations
-
-**Priority: bumped, 2026-08-28.** Directly requested — several recipes in
-the current catalog can be selected and launched in the dashboard/CLI but
-are known or suspected to fail, which wastes a real cold-start cycle
-(sometimes 30+ minutes) finding that out. This entry (the flag-combination
-linter) and the new "recipe status marker" entry below are the two
-concrete pieces of that ask.
-
-**Context:** two separate incidents on 2026-08-23 were both, at root, a
-recipe carrying a `vllm_args` combination that was invalid and had never
-been validated against a real deploy before being committed:
-
-1. `--kv-cache-dtype nvfp4_ds_mla` on an MLA-architecture model (DeepSeek
-   V4) -- vLLM's own engine-config validation rejects any `nvfp4`-family
-   KV cache dtype for MLA models outright. Already documented in
-   `docs/TROUBLESHOOTING.md` #3 for the related trigger case.
-2. `--quantization modelopt_fp4` combined with an explicit
-   `--kv-cache-dtype`, which per that same troubleshooting entry triggers
-   an internal container entrypoint hook that silently overrides the
-   explicit KV cache dtype back to `nvfp4_ds_mla` -- recreating problem #1
-   even when the recipe author correctly set `fp8` explicitly.
-
-Both are documented in `docs/TROUBLESHOOTING.md` now, but only as
-after-the-fact incident write-ups -- nothing stops a third recipe from
-reintroducing either pattern, and a recipe carrying one can sit in git
-looking fine (valid YAML, passes schema validation) until the moment
-someone actually deploys it.
-
-**Shape of a real fix:**
-- A lightweight recipe linter -- either folded into `load_recipes()`
-  itself (warn at load time, don't hard-fail the whole catalog per the
-  existing fail-closed behavior) or a standalone `tools/lint_recipes.py`
-  run in CI -- checking `vllm_args` for a small, explicit list of known-bad
-  flag combinations as they're discovered. Start with the two above; this
-  list only grows by adding real incidents, not by trying to anticipate
-  hypothetical ones.
-- Cheap enough to start: a dict of `{flag_or_value: incompatible_with}`
-  pairs and a regex/shlex-split check against `vllm_args` at recipe load
-  time, surfaced the same way an unrecognized `recipe_version` already
-  warns today (soft warning, not a hard failure, unless confidence is
-  high).
-
-**Depends on:** nothing. Small, and the two known cases above are already
-fully specified.
-
----
-
-### Per-recipe/topology validation status marker
-
-**New, 2026-08-28.** A narrower linter only catches flag combinations
-someone already knows are bad. It doesn't help with the broader,
-currently-felt problem: a recipe can be schema-valid, carry no known-bad
-flag pattern, and *still* fail on deploy simply because that specific
-model/topology combination has never actually been exercised end-to-end
--- exactly the distinction `docs/TROUBLESHOOTING.md`'s
-Validated/Known-bad/Unconfirmed framework already draws for individual
-`vllm_args`, but nothing currently draws at the level of "should a person
-even try deploying this recipe right now."
-
-**Context:** the catalog is a living, growing set (see `README.md`'s
-Model Catalog section) where new variants get added as needed. Nothing
-distinguishes, in the dashboard dropdown or `dgx-config status`, a recipe
-that's been deployed and confirmed serving traffic from one that's a
-work-in-progress smoke test (e.g.
-`deepseek-v4-flash-0731-dspark-sm120.yaml`, deliberately built small for a
-fast yes/no and explicitly not expected to be production-ready) or one
-that's simply never been tried. All three currently look identical in the
-UI: selectable, same as any other model.
-
-**Shape of a real fix:**
-- Add an optional `status:` field to the recipe schema (`common/recipes.py`),
-  e.g. `validated` / `unconfirmed` / `known-bad`, defaulting to
-  `unconfirmed` when absent so existing recipes don't need an immediate
-  mass edit.
-- `build_catalog_response()` already has `PENDING_LAUNCH_STATE`'s "last
-  launched successfully" tracking (landed 2026-08-24) keyed by
-  `config_hash` -- a recipe/topology combination that has a recorded
-  successful launch could auto-promote from `unconfirmed` to `validated`
-  without a human touching the YAML at all, keeping the marker honest and
-  low-maintenance rather than another thing to remember to update by hand.
-- Surface the status as a visible badge/color next to each model in the
-  dashboard dropdown and in `dgx-config status`'s catalog listing --
-  something a person glances at before clicking Deploy, not something
-  they have to already know to go check `docs/TROUBLESHOOTING.md` for.
-- Does not replace the flag-combination linter above -- that catches a
-  known-bad pattern before it's ever deployed once; this tracks whether a
-  given recipe has actually been proven to work at all. Both are worth
-  having.
-
-**Depends on:** nothing structurally. Requires an actual pass over the
-current `recipes/local/*.yaml` and `recipes/eugr/*.yaml` files to assign
-initial status values -- not done as part of this roadmap entry, needs the
-real files.
-
----
-
-### Near-duplicate catalog key detection
-
-**Context:** `deepseek-v4-flash-nvfp4.yaml` and
-`deepseek-v4-flash-0731-nvfp4.yaml` coexisted with catalog keys one
-keystroke apart, serving genuinely different models. A prior session
-silently repointed the former's `hf_path` to the *same* model as the
-latter while also introducing the invalid kv-cache-dtype combination above
--- with no filename change to signal any of it happened. The wrong key got
-deployed by simple typo-adjacent selection, not a deliberate choice.
-(Resolution used at the time: the older recipe was deleted outright rather
-than repaired, since it wasn't in active use -- see `docs/TOMBSTONES.md`
-#57. That closed this specific instance but not the underlying class of
-risk.)
-
-**What's missing today:** `load_recipes()` already raises on an exact
-stem collision between `local/` and `eugr/` directories, but nothing
-flags two *different*, both-valid catalog keys that are suspiciously
-similar -- by edit distance, by shared `hf_path`, or both.
-
-**Shape of a real fix:**
-- At `load_recipes()` time, after loading the full set: flag any pair of
-  keys within a small edit-distance threshold of each other, or any pair
-  that share an identical `hf_path`, as a soft warning (printed at load,
-  maybe also surfaced in `dgx-config status` or the dashboard) -- not a
-  hard failure, since legitimate near-duplicates (a `-nvfp4` suffix
-  variant of the same base name) are common and expected.
-- The `hf_path` collision check is the more actionable one: two catalog
-  keys serving the identical HF model is either intentional (fine, but
-  worth knowing) or exactly this incident (a stale entry silently
-  repointed to overlap with a newer one).
-- `find_cached_models()` (4.8.4) already computes a live
-  `hf_path -> catalog_key` map for cache attribution purposes -- the same
-  data structure this check would need, just applied at recipe-load time
-  instead of cache-inspection time. Worth building this as a shared helper
-  both call, rather than two separate implementations of the same lookup.
-
-**Depends on:** nothing. Could land alongside the flag-combination linter
-above, since both hook into the same `load_recipes()` pass.
+**Depends on:** informs Phase 3 rather than blocking it. Cheapest to settle
+before Phase 3 design work starts, not during.
 
 ---
 
@@ -437,92 +928,3 @@ its own.
 
 **Depends on:** nothing directly. Informs Phase 3 planning rather than
 blocking anything today.
-
----
-
-### `benchmark_ledger.csv` key can silently mismatch the recipe actually benchmarked
-
-**Context, 2026-08-29.** `benchmark.py --model-key` exists specifically so
-the ledger's ability to join back to the catalog (`enrich_catalog()`'s
-`historical_tps` lookup) doesn't depend on the served model ID matching the
-catalog key -- per the script's own docstring, those are different strings
-by default. During the DSpark validation run, the benchmark logged under
-key `deepseek-v4-flash-0731-1M` despite validating a completely different
-recipe (`deepseek-v4-flash-0731-dspark`) -- either `--model-key` wasn't
-passed, or was passed with a stale value left over from a previous run.
-
-**What's missing today:** nothing catches this at benchmark time. A wrong
-or missing `--model-key` silently produces a ledger row that looks
-legitimate but attributes historical throughput data to the wrong recipe --
-which then quietly corrupts anything downstream that trusts
-`historical_tps` for that catalog key (the per-recipe status-marker idea
-above, dashboard display, capacity planning) without any error surfacing
-anywhere.
-
-**Shape of a real fix:**
-- Have `execute_standalone_benchmark()`/`_run_benchmark_worker()` (the
-  orchestrator's own caller of `benchmark.py`, per its comment about owning
-  `benchmark_results.txt`) always pass `--model-key` explicitly, derived
-  from whatever recipe/config is actually being benchmarked, rather than
-  relying on it being supplied correctly by whoever invokes the script
-  directly.
-- Consider a sanity check at ledger-write time: if `--model-key` isn't
-  provided and falls back to `model_id.split("/")[-1]`, and that fallback
-  key doesn't match anything in the currently-loaded catalog, warn loudly
-  rather than writing a silently-orphaned row.
-- Worth an audit of existing `benchmark_ledger.csv` rows for other
-  mismatches now that one's confirmed, since this could have been
-  happening quietly before it was noticed.
-
-**Depends on:** nothing structurally. Small, self-contained fix in the
-benchmark invocation path.
-
----
-
-### `compute_config_hash()` hashes `vllm_args` as a raw string, not parsed
-
-**Context, 2026-08-29.** `common/recipes.py`'s `compute_config_hash()`
-deliberately hashes `vllm_args` as-is rather than `shlex`-splitting it --
-its own docstring calls this out explicitly: *"simpler, and fine unless
-flags get reordered without changing them in practice."* That caveat is
-the bug: two functionally identical `vllm_args` strings that differ only in
-flag order, or in incidental whitespace from a YAML folded-scalar (`>-`)
-reflow, hash differently and spuriously reset a recipe's "validated"/launch-
-history status even though nothing that reaches `docker run` actually
-changed.
-
-**Why this matters more once the per-recipe status marker (above) lands:**
-right now a stale hash only means a slightly-too-conservative "last
-launched successfully" display. Once recipes carry a `validated` /
-`unconfirmed` / `known-bad` badge that auto-promotes off this same hash,
-an incidental reflow -- someone re-wrapping a long `vllm_args` line, or a
-future recipe-editing tool that reorders flags for readability -- would
-silently demote a known-good recipe back to looking unvalidated in the
-dashboard, for a change that altered nothing about actual behavior. A
-false "this hasn't been tested" is a worse failure mode than a false
-"this has" would be, since it either causes needless re-validation or --
-worse -- trains people to stop trusting the badge at all.
-
-**Shape of a real fix:**
-- `shlex.split(topo.vllm_args)`, then sort the resulting token list (or
-  parse into flag/value pairs and sort by flag name) before hashing, so
-  flag order stops mattering the same way `env_vars` already gets sorted
-  before hashing.
-- Watch the interaction with `docs/TROUBLESHOOTING.md` Incident #4 (YAML
-  folded-scalar comment pollution / `shlex.split()` choking on stray `#`)
-  while touching this -- `compute_config_hash()` and the actual launch
-  path's own arg-splitting should probably share one parsing helper rather
-  than two independent implementations of "parse `vllm_args`" that could
-  drift out of sync with each other.
-- Decide whether to also normalize `--speculative-config`'s embedded JSON
-  (currently just a substring of the larger `vllm_args` string) --
-  key-order-insensitive JSON comparison would close the same class of gap
-  one level deeper, though it's a smaller/rarer case than top-level flag
-  reordering.
-
-**Depends on:** nothing structurally. Worth landing before or alongside the
-per-recipe status marker entry above, since that's the feature whose correctness actually depends on this hash being order-insensitive.
-
-------
-new item::
-log the exception when .secrets parsing fails instead of swallowing it, so "malformed token line" surfaces immediately instead of masquerading as "no token found anywhere."

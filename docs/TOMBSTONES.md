@@ -1,24 +1,41 @@
 # Control Plane Release Tombstones & Fix Log
 
 ### 82. Silent HF Token Failures in get_hf_token() (common/ssh.py)
-* **Symptom:** A malformed HF_TOKEN= line in .secrets caused vLLM to 401
-  against a gated/private HF repo with zero indication the token was ever
-  the problem — the container simply launched without HF_TOKEN set, no
-  warning at deploy time. Traced back from a Gemma 4 recipe debugging
-  session (2026-08-29) that initially looked like a bad hf_path, and
-  stayed looking that way even after the hf_path was fixed.
-* **Cause:** get_hf_token()'s .secrets-parsing branch used a bare
-  `except Exception: pass`, silently swallowing any parse failure and
-  falling through to the ~/.cache/huggingface/token fallback with no
-  trace. The ~/.cache fallback had the same bare-except pattern. Worse:
-  an HF_TOKEN= line that parsed fine but stripped down to an empty
-  string returned "" immediately from inside the loop — skipping even
-  the function's own generic "no token found" warning at the bottom,
-  since that return happens before that code path is ever reached.
+* **Symptom:** vLLM 401'd against a gated/private HF repo with zero
+  indication a token was ever the issue — the container launched with no
+  HF_TOKEN set, no warning at deploy time. Surfaced during a Gemma 4
+  recipe debugging session (2026-08-29) and stayed misleading through
+  two separate root causes before it was actually fixed: first looked
+  like the bad hf_path alone, then after that was fixed, looked like a
+  missing token entirely.
+* **Cause (two distinct bugs in the same function, found sequentially):**
+  1. The .secrets-parsing branch used a bare `except Exception: pass`,
+     silently swallowing any parse failure (the original malformed-token
+     case) and falling through to the ~/.cache/huggingface/token fallback
+     with no trace. The ~/.cache fallback had the same bare-except
+     pattern. An HF_TOKEN= line that parsed fine but stripped to an empty
+     string also returned "" immediately from inside the loop, skipping
+     even the function's own generic "no token found" warning at the
+     bottom.
+  2. After (1) was fixed and re-deployed, the SAME symptom recurred from
+     a second, previously-undiscovered gap: `line.startswith("HF_TOKEN=")`
+     is exact-case, so a `.secrets` line written as `HF_Token=` (or any
+     non-canonical casing) never matched at all. No exception, no partial
+     match, no warning — the for-loop just completed normally having
+     matched nothing, and fell through silently exactly like bug (1) did,
+     just via an entirely different, still-uncovered code path.
 * **Fix:** Both except blocks now log `type(exc).__name__: exc` instead
   of passing silently. An empty-after-strip token value in .secrets no
   longer returns early — it warns and falls through to the next source
-  (~/.cache/huggingface/token) instead of masquerading as "found."
+  instead of masquerading as "found." Key matching now uses
+  `line.partition("=")` + `key.strip().upper() == "HF_TOKEN"` instead of
+  `startswith("HF_TOKEN=")`, so any casing/whitespace variant of the key
+  matches correctly instead of silently missing.
+* **Lesson:** A silent-failure fix that closes one code path can still
+  leave a structurally identical silent-failure path right next to it
+  uncovered — worth explicitly asking "are there other ways to reach the
+  same silent-empty-return, not just the one that just bit me" before
+  calling a fix like this complete.
 * **File:** common/ssh.py, get_hf_token()
 
 ### 81. Long-Lived Daemon Slowly Exhausted the Container's Process Table (V4.8.7)

@@ -14,7 +14,6 @@ topologies:
     pp_size: 1
     env_vars:
     - OMP_NUM_THREADS=16
-    - VLLM_CPU_OMP_THREADS=16
     - VLLM_DISABLE_COMPILE_CACHE=1
     vllm_args: >-
       --trust-remote-code --quantization fp8 --kv-cache-dtype fp8
@@ -33,9 +32,6 @@ topologies:
     - NCCL_IB_GID_INDEX=3
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
-    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=3600
-    - VLLM_RPC_TIMEOUT=3600
-    - VLLM_USE_V1=0
     - VLLM_DISABLE_COMPILE_CACHE=1
     vllm_args: >-
       --disable-custom-all-reduce --trust-remote-code --quantization fp8

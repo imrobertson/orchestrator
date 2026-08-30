@@ -239,40 +239,37 @@ diverging from) eugr's tested recipes.
 - Before hand-writing 14 recipe files: confirm which of the current 14
   catalog models are actually still in active use. No reason to migrate
   cruft.
-- **[New, 2026-08-20] `mods:` execution — a real deliverable now, not a
-  placeholder.** This was previously "doesn't need real content on day
-  one" plus an open decision on the mechanism (see the old Open Decisions
-  entry, now removed below). Decided: adapt eugr's `mods/<name>/run.sh`
-  pattern directly — a mod is a directory containing a `run.sh`, applied
-  via `docker exec <container> bash -c "$(cat run.sh)"` (or an equivalent
-  copy-in-and-run, whichever proves simpler against real hardware) right
-  after the container reaches `RUNNING`, before the health-check poll
-  starts. This is the same "adapt, driven by our off-node SSH call instead
-  of their local/SSH dual path" idea `EUGR-REFERENCE-NOTES.md`'s
-  "Borrow / adapt / skip" section already named — this entry is what turns
-  that stated intent into an actual scoped task with a landing spot
-  (Phase 2, since it needs no N-node hardware and no allocator, just the
-  recipe schema this phase already builds). Concretely:
-  - `recipe.mods: list[str]` already exists in the schema and already
-    round-trips through `load_recipes()` — no schema change needed, just
-    execution.
-  - Mod content itself (the actual `run.sh` files) is expected to come
-    from the same `eugr-samples/` → translate → review pipeline as
-    recipes, not hand-written from scratch — `EUGR-REFERENCE-NOTES.md`'s
-    "If we pull more" list already prioritizes `mods/drop-caches/run.sh`
-    and `mods/gpu-mem-util-gb/run.sh` as directly relevant to the Phase 5
-    OOM-watchdog gap; those are the first two real candidates to port,
-    not hypothetical.
-  - Ordering matters for correctness, not just tidiness: mods run after
-    the container is confirmed `RUNNING` (so there's something to `exec`
-    into) but before `wait_for_cluster_ready()` starts polling `/health`
-    (so a mod that needs to run before the model finishes loading — e.g.
-    a cache-clearing mod — actually gets the chance to).
-  - Verification: same `--dry-run` pattern as everything else in this
-    plan doesn't fully cover this, since `--dry-run` explicitly never
-    touches a host — mod application needs its own smoke test once the
-    first real mod is ported (apply a no-op mod, confirm the exec
-    happened via container logs).
+- **[New, 2026-08-20; superseded 2026-08-29] `mods:` execution — a real
+  deliverable, mechanism now decided differently.** The 2026-08-20 version
+  of this entry specified adapting eugr's `mods/<n>/run.sh` pattern applied
+  via `docker exec` after the container reaches `RUNNING` and before the
+  health-check poll. **That mechanism is wrong and has been replaced.** The
+  format decision (a mod is a directory containing `run.sh`) stands; the
+  delivery decision does not.
+
+  The 08-20 decision was made against the mod *concept*, without reading any
+  actual `run.sh`. Reading them showed both of its own named first
+  candidates fall outside what an exec-based mechanism can do:
+  `mods/gpu-mem-util-gb` rewrites eight vLLM source files including
+  `vllm/engine/arg_utils.py`, adding a CLI argument that is parsed at
+  process startup — unconditionally too late to apply by exec — and
+  `mods/drop-caches` is a persistent host-level daemon
+  (`/proc/sys/vm/drop_caches` is not namespaced), not a container-scoped
+  operation at all.
+
+  **Current decision: bake a derived image layer before launch.** Full
+  rationale, the survey of eugr's actual mod library, the rejected
+  alternatives, hard constraints (vendored payloads, per-host bake,
+  `WORKSPACE_DIR` handling) and the implementation sequence live in
+  **`ROADMAP.md` → "Model-specific mods: bake a derived image layer"**.
+  That entry is authoritative; this one records only that the field exists,
+  why, and that the mechanism changed. Do not restate the design here — the
+  two documents must not duplicate each other.
+
+  Still true from the 08-20 version: `recipe.mods` already exists in the
+  schema and round-trips through `load_recipes()`, so this is an execution
+  problem rather than a schema migration; and mod *content* is expected to
+  come from eugr's library rather than be written from scratch.
 
 **Status: mostly landed, with one piece corrected after landing.** Recipe
 schema, `recipes/{local,eugr}` split, and the dual-load burn-in period all
@@ -505,11 +502,12 @@ capability:
 
 # Optional runtime patches applied before `vllm serve` starts. Empty until
 # a model actually needs one -- see eugr's mods/ directory for the pattern
-# (curl+patch, pip install, etc.) this is modeled on. Execution mechanism
-# (docker exec of a mod's run.sh, after RUNNING / before the health-check
-# poll) is a scheduled Phase 2 deliverable as of 2026-08-20 -- see that
-# phase's "mods: execution" entry above, not just a schema placeholder
-# anymore.
+# (a run.sh plus vendored payload files) this is modeled on. Execution
+# mechanism decided 2026-08-29: mods are baked into a derived image layer
+# before launch, NOT docker exec'd into a running container (the 2026-08-20
+# exec plan was superseded -- see this doc's Phase 2 mods entry, and
+# ROADMAP.md for the full design). Payloads must be vendored in-repo; no
+# network fetches at bake time.
 mods: []
 
 topologies:
@@ -684,15 +682,23 @@ racked, with zero effect on current behavior.
   *whenever* either field starts appearing in the catalog response (same
   treatment as the `hosts` exclusion it already has) — flagging here so
   that change isn't made in isolation later.
-- **Mods execution mechanism — resolved 2026-08-20, moved to Phase 2.**
-  Previously listed here as undecided ("whether `mods:` commands get
-  wrapped in the same `bash -c` pattern already used for the Ray-head
-  exec, or something more structured -- fine to decide when the first real
-  mod is needed"). Decided: yes, adapt the `bash -c` / `docker exec`
-  pattern directly, same idea as the Ray-head exec. This is no longer an
-  open decision -- see Phase 2's "mods: execution" entry above for the
-  concrete scope (ordering relative to the health-check poll, where mod
-  content is sourced from, what verification looks like).
+- **Mods execution mechanism — resolved twice, currently resolved as
+  "bake a derived image layer" (2026-08-29).** Originally listed here as
+  undecided; resolved 2026-08-20 in favour of eugr's `bash -c` /
+  `docker exec` pattern; **that resolution was overturned 2026-08-29** once
+  eugr's actual mod library was read rather than reasoned about. Of their
+  ~10 mods, all but one are build-time modifications of the vLLM
+  installation, and the decisive counterexample is `gpu-mem-util-gb`
+  (patches a CLI argument parsed at process startup, so exec-after-RUNNING
+  cannot work) — which the 08-20 plan had itself named as a first porting
+  candidate. The one genuine runtime mod, `drop-caches`, turns out not to be
+  a container-scoped operation at all and is tracked separately in
+  `ROADMAP.md`. Current design, rationale, rejected alternatives and
+  implementation sequence: **`ROADMAP.md` → "Model-specific mods: bake a
+  derived image layer"**. Kept in this list rather than deleted because the
+  reversal is itself worth knowing about — the lesson is that this decision
+  was twice made from the mod *concept* and only became correct once the
+  files were read.
 - **Schema adoption — resolved 2026-08-20, not an open question
   anymore.** Whether to adopt eugr's flat `defaults:` + `command:`
   template shape as our own live schema (instead of maintaining a
@@ -741,6 +747,19 @@ step) is still open and still real, but no longer ahead of the above in
 priority — it's not blocking anything the other two are blocking, and
 neither performance nor a broken-recipe launch is something `mods:`
 addresses.
+
+**Update 2026-08-29:** that priority call has partly reversed. `mods:` is
+now the thing blocking a whole class of models rather than a nice-to-have:
+current-generation checkpoints (the triggering case being
+`Gemma-4-26B-A4B-it-NVFP4`) require patched vLLM source to load at all, and
+waiting for upstream is a ~6-month proposition per fix. The mechanism has
+also been redesigned since the note above — see `ROADMAP.md`'s
+"Model-specific mods: bake a derived image layer", which is now the
+authoritative entry and carries a HIGH priority marker. Recipe catalog
+hygiene remains real and unstarted; the DSpark work described above has
+since completed successfully (see `BACKLOG-dspark-sm120-image.md`, now
+recording a working validated configuration rather than an open
+investigation).
 
 ---
 
