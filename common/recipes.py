@@ -99,6 +99,32 @@ def _validate_mod_name(name: str) -> str:
     return name
 
 
+def validate_mod_name(name: str) -> str:
+    """
+    Public entry point for other modules -- concretely, common/mods.py
+    (Task MB) -- to reuse this exact bare-name check rather than
+    re-implementing it or trusting a caller to have already gone through
+    RecipeConfig's pydantic validation. _validate_mod_name() stays the one
+    implementation (this is a thin public wrapper, not a second copy) so
+    the rule enforced at recipe-load time and the rule enforced at
+    bake/resolve time can never independently drift apart -- the exact
+    failure class common/ssh.py's own docstring already describes fixing
+    once for a different pair of near-duplicate functions.
+
+    Added as a scope-crossing hardening fix during Task MB, not new Task
+    MA functionality: MB's resolve_mod_tag() is independently importable
+    and callable outside the normal RecipeConfig -> load_recipes() path
+    (tests, a future CLI tool, a REPL), so it cannot safely assume every
+    mod_names list it's ever handed has already passed through
+    check_mods_are_bare_names(). Without this, a path-shaped name reaching
+    resolve_mod_tag() directly (bypassing RecipeConfig) would resolve via
+    plain Path division -- which does not itself reject '..' segments --
+    and could cause MB to scp/exec the contents of an arbitrary directory
+    during a bake.
+    """
+    return _validate_mod_name(name)
+
+
 class CapabilityConfig(BaseModel):
     """Unused for now -- populated in Phase 4. See docs/PHASE-2-PROMPTS.md."""
 

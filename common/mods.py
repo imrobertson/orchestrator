@@ -58,7 +58,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from common.recipes import MODS_DIR
+from common.recipes import MODS_DIR, validate_mod_name
 from common.ssh import resolve_user_identity_key, run_ssh
 from common.config import load_cluster_config
 
@@ -166,6 +166,22 @@ def resolve_mod_tag(base_image: str, mod_names: list[str]) -> str:
     """
     if not mod_names:
         return base_image
+
+    # Defense in depth, not a redundant check: this module is independently
+    # importable/callable outside the normal RecipeConfig -> load_recipes()
+    # path (tests, a future CLI tool, a REPL), so it cannot assume every
+    # mod_names list it's ever handed has already passed through Task MA's
+    # check_mods_are_bare_names(). Reuses that exact validator (via
+    # common.recipes.validate_mod_name()) rather than re-implementing the
+    # same rule a second time -- see that function's docstring. Re-raised
+    # as ModResolutionError so every failure mode this module's public API
+    # can produce is one of this module's two documented exception types,
+    # not a bare ValueError leaking a different module's error shape.
+    for name in mod_names:
+        try:
+            validate_mod_name(name)
+        except ValueError as exc:
+            raise ModResolutionError(str(exc)) from exc
 
     missing = [name for name in mod_names if not (MODS_DIR / name).is_dir()]
     if missing:

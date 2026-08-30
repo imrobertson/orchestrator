@@ -1,6 +1,51 @@
 # Control Plane Release Tombstones & Fix Log
 
-### 82. Silent HF Token Failures in get_hf_token() (common/ssh.py)
+### 83. Smoke test's independent-verification SSH calls silently broke on multi-word `--format` strings (tests/smoke_test_mods.py)
+
+* **The Trap:** `tests/smoke_test_mods.py` hand-rolled its own `ssh_run()`
+  helper for "independent verification" -- checking `common/mods.py`'s
+  output via plain `docker inspect` calls that don't go through the code
+  being tested. Reasonable goal, wrong layer: the helper duplicated
+  `common/ssh.py`'s `run_ssh()` almost verbatim but dropped its
+  per-argument `shlex.quote()`-then-join step before handing the command
+  to `ssh`. OpenSSH re-concatenates multiple argv elements into ONE string
+  for the remote shell regardless of how carefully the local Python list
+  was built -- there is no wire-level argv boundary preservation. Any
+  argument containing an internal space silently splits into extra, wrong
+  tokens on the far end. `--format {{json .Config.Entrypoint}}` (space
+  between `json` and `.Config.Entrypoint`) became `--format {{json` plus a
+  stray sixth `.Config.Entrypoint}}` argument to `docker inspect`, which
+  failed and printed nothing to stdout -- but the check only compared
+  `base_ep == derived_ep`, both empty strings, with no `returncode` check.
+  Two broken calls silently agreeing with each other read as a PASS.
+  `--format {{.Config.WorkingDir}}` (no internal space) happened to survive
+  unquoted and gave a real, correct result, which is exactly what made the
+  Entrypoint/Cmd false-pass easy to miss at a glance -- most of the same
+  function's checks were genuinely fine.
+
+  This is the identical failure class `common/ssh.py`'s own module
+  docstring already describes fixing once (`run_ssh()` "previously existed
+  as two near-verbatim-but-drifted copies"). Writing a second SSH
+  transport for "independence" reintroduced the exact bug that
+  consolidation was meant to prevent.
+
+* **The Fix:** `ssh_run()` in `tests/smoke_test_mods.py` is now a one-line
+  adapter over `common.ssh.run_ssh()` instead of a parallel implementation.
+  "Independent verification" means not calling `ensure_mods_baked()` to
+  check its own output -- it does not mean re-deriving SSH transport
+  correctness from scratch. Every check that reads `.stdout` after an
+  `ssh_run()` call now also asserts `.returncode == 0` explicitly, so a
+  broken verification call fails loudly instead of two empty strings
+  quietly agreeing.
+
+  General rule going forward: any new script that shells out to a remote
+  host via `ssh <args...>` as a Python argv list, rather than through
+  `common.ssh.run_ssh()`, needs the same `shlex.quote()`-per-arg-then-join
+  treatment -- or it needs to just call `run_ssh()`. There is no
+  "obviously safe" format string; the trigger is a single internal space,
+  which arbitrary Go template format strings, `bash -c` one-liners, or any
+  argument containing a shell metacharacter can carry without warning.
+  ### 82. Silent HF Token Failures in get_hf_token() (common/ssh.py)
 * **Symptom:** vLLM 401'd against a gated/private HF repo with zero
   indication a token was ever the issue — the container launched with no
   HF_TOKEN set, no warning at deploy time. Surfaced during a Gemma 4
