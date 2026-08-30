@@ -27,7 +27,6 @@ Two groups are worth calling out:
 
 Within each group, entries are roughly ordered by priority.
 
-
 ---
 
 ## Deployment mechanics
@@ -438,6 +437,77 @@ real files.
 
 ---
 
+### Recipes carry `VLLM_*` env vars this build silently ignores
+
+**New, 2026-08-30.** vLLM warns at boot about any `VLLM_`-prefixed
+environment variable it doesn't recognise
+(`WARNING [envs.py:2477] Unknown vLLM environment variable detected: X`).
+Nothing surfaces those warnings, so cargo-culted variables accumulate in
+recipes indefinitely, and every one of them feeds `compute_config_hash()` --
+meaning inert config participates in the "has this exact configuration
+launched successfully" join as though it mattered.
+
+**Confirmed instances, 2026-08-29/30, on
+`v0.1.dev20003+gad848fc41.d20260815`:**
+
+| Variable | Source | Actionable? |
+|---|---|---|
+| `VLLM_CPU_OMP_THREADS` | recipe `env_vars` | yes -- removed from `gemma-4-31b.yaml` |
+| `VLLM_ENGINE_INITIALIZATION_TIMEOUT` | recipe `env_vars` | yes -- removed |
+| `VLLM_RPC_TIMEOUT` | recipe `env_vars` | yes -- removed |
+| `VLLM_BASE_DIR=/workspace/vllm` | **image `ENV`** (eugr's Dockerfile) | **no** -- see below |
+
+**The two categories need different handling, and conflating them makes the
+check useless.** `VLLM_BASE_DIR` is baked into `eugr/spark-vllm-b12x` as an
+image-level `ENV` (confirmed via `docker inspect .Config.Env`). It is
+present in every container from that base and in every layer baked on top of
+it, and no recipe edit can remove it. A checker that flags it will fire on
+every eugr-based recipe forever; a warning that always fires gets ignored,
+which then hides the ones that matter. **The check must inspect recipe
+`env_vars` only**, and `VLLM_BASE_DIR` should be documented as
+expected-and-not-actionable rather than suppressed silently.
+
+**Shape of a real fix, cheapest option first:**
+
+- **Parse the boot log, don't maintain an allow-list.** vLLM already emits
+  the warning, for the build actually running, with no maintenance burden.
+  A static list of known-good `VLLM_*` names has to be re-verified on every
+  image bump and will still miss variables neither we nor the list author
+  knew about. Scraping
+  `Unknown vLLM environment variable detected: (\S+)` out of container logs
+  post-deploy catches everything and stays correct by construction.
+- Cross-reference each hit against the recipe's declared `env_vars`. A hit
+  present there is actionable; a hit absent from it is image-inherited --
+  report it differently or not at all.
+- Fold into the per-recipe validation status marker work rather than
+  building a separate reporting path: "launched successfully" and "launched
+  without ignored config" are the same kind of signal about the same
+  `config_hash`.
+
+**A caution on removals.** Every `env_vars` change alters
+`compute_config_hash()` and therefore resets the launch-success history for
+that recipe/topology. That's correct behaviour -- the launched configuration
+genuinely changed -- but it means a bulk strip across the catalog would
+invalidate the entire validation history at once. Strip opportunistically
+when a recipe is being re-validated anyway, not as a sweep.
+
+**Related, unresolved:** `VLLM_USE_V1=0` is *not* in the unknown-variable
+list -- vLLM recognises it -- but on this build it appears to have no
+effect: the engine logged `Initializing a V1 LLM engine` with the variable
+set, on both the 2-node Gemma deploy (2026-08-29) and subsequent runs. This
+bears on `TROUBLESHOOTING.md` Incident #1, which mandates it for all 2-node
+Ray cross-host topologies. Either the rule is stale for this build (no V0
+path left to fall back to) or it still matters for topologies not retested
+since. One data point is not enough to rewrite an incident rule that was
+written from a real failure -- flagged here so it is neither trusted blindly
+nor deleted prematurely. Resolving it wants a deliberate A/B on a 2-node
+deploy, not an inference from logs.
+
+**Depends on:** nothing. Naturally sequenced after the per-recipe status
+marker work.
+
+---
+
 ### `compute_config_hash()` hashes `vllm_args` as a raw string, not parsed
 
 **Context, 2026-08-29.** `common/recipes.py`'s `compute_config_hash()`
@@ -566,6 +636,150 @@ benchmark invocation path.
 ---
 
 ## Runtime robustness
+
+### Retain the full vLLM container log per deploy
+
+**New, 2026-08-30.** When a deployment is torn down, `docker rm` deletes the
+container's log with it. The only record of what vLLM actually said --
+resolved backends, quantization path, ignored env vars, the traceback of a
+crash -- is gone. `TOMBSTONES.md` #7 solved exactly this for Ray crash logs
+by bind-mounting the session dir to a persistent host path; nothing does the
+equivalent for the vLLM container's own stdout.
+
+This session alone, that log answered: which attention backend actually
+resolved (`TRITON_ATTN`, 3x across cluster), whether `--quantization fp8`
+took, that `VLLM_USE_V1=0` was being ignored, that `VLLM_BASE_DIR` is
+image-inherited, and that the M0 probe image booted the NGC entrypoint
+correctly. All of it would have been unrecoverable an hour later.
+
+#### The flush-cadence question is mostly a non-question
+
+**Docker already persists container stdout to disk continuously** via the
+`json-file` logging driver
+(`/var/lib/docker/containers/<id>/<id>-json.log`), on the Spark host, with
+no involvement from us. There is nothing to flush during a run and no
+buffering to worry about. Our containers are launched with `docker run -d`
+and **not** `--rm`, so the log also survives the container exiting -- a
+crashed engine's output stays readable until something removes the
+container.
+
+So the design is not a polling loop. It is:
+
+1. **Capture at teardown, before `docker rm`.** This is the one moment the
+   data is actually at risk. Copy (or `docker logs >`) into the existing
+   per-deploy directory, then proceed with removal.
+2. **A low-frequency incremental safety net**, because relying solely on
+   teardown is fragile in *this* codebase specifically: teardown reporting
+   success regardless of per-host failure is a documented bug class here
+   (see the residual-gaps section), and a host reboot, a manual `docker rm`,
+   or a `docker system prune` all bypass our teardown path entirely. Append
+   `docker logs --since <last_capture>` on a slow cadence -- 60s is ample,
+   and it must be incremental, not a full re-read, or a long deploy re-ships
+   the whole log every minute.
+
+**Do not stream `docker logs -f` from the daemon.** A long-lived follow
+process per container is another thing to leak, and orphaned child processes
+are already a known class of bug in this codebase (see the teardown entries).
+The incremental `--since` poll is bounded, stateless, and reaps itself.
+
+#### Storage and retention
+
+- Reuse `~/.cache/ray-logs/<deploy_run_id>/<host>/` -- it already exists per
+  deploy, is already bind-mounted persistently, and is already covered by
+  `dgx-config prune-ray-logs`.
+- **Needs its own retention knob**, not `crash_log_retention_days: 7`. Ray
+  crash dumps are tiny; a full vLLM log is not. Add
+  `vllm_log_retention_hours` to `cluster_config.yaml`'s `tuning:` block,
+  default 24.
+- **Keep whole logs initially. Do not truncate yet.** A head/tail policy
+  (e.g. first 500 + last 500 lines) is the likely end state and would cover
+  both "what config did it launch with" and "what was it saying when it
+  died" -- but picking those numbers before profiling real sizes is a guess.
+  Worse, the failure modes this is most valuable for are the *slow* ones
+  (the Ray memory-monitor OOM kill, the multi-hour session freeze), where a
+  head/tail policy would discard precisely the hours in which the
+  degradation is visible. Measure first: capture whole logs across a
+  DeepSeek 512K deploy and a short Gemma one, compare sizes, then decide.
+
+#### Check before building
+
+Whether the Docker daemon on the Sparks has `log-opts max-size`/`max-file`
+configured in `/etc/docker/daemon.json`. If so, the json-file log is already
+being rotated and older lines may be gone before we ever capture them --
+which would change this from a retention problem into a logging-driver
+configuration problem. Cheap to check, and it invalidates the "Docker
+already persists everything" premise above if true.
+
+#### Related, and better once this exists
+
+The unrecognised-`VLLM_*`-env-var check described above becomes trivial with
+retained logs: grep a file keyed to a `deploy_run_id` instead of racing a
+live stream. Same for a dashboard warning/error surface -- but note that is
+a genuinely different feature (live, about *during*) from this one
+(post-hoc, about *after*), and this one is the prerequisite: a live scraper
+with no persistence still loses everything at teardown.
+
+**Depends on:** nothing. Small, and the teardown-side capture is the
+majority of the value on its own.
+
+---
+
+### `/api/status` reports `orchestrator_version` but nothing about `common/`
+
+**New, 2026-08-29.** The deploy-confirmation habit (check the dashboard
+version badge or `orchestrator_version` in `/api/status` before trusting a
+fix is live) covers `dgx-orchestrator.py` and nothing else. Every module
+under `common/` -- `ssh.py`, `config.py`, `recipes.py`, `constants.py` --
+can be updated on disk with no observable signal that the *running* daemon
+is still executing the previous version.
+
+**Context: this cost a real debugging round tonight.** A fix to
+`common/ssh.py`'s `get_hf_token()` was deployed and verified present on disk
+(`docker exec dgx-orchestrator-api grep ... common/ssh.py` matched), yet
+deploys continued to launch containers with no `HF_TOKEN` set. Cause:
+`docker-compose.yml` bind-mounts `.:/app`, so the file on disk updated
+immediately, but Python does not reload an already-imported module. The
+long-lived daemon kept executing the pre-fix code until
+`docker compose restart orchestrator-api`. `orchestrator_version` was
+correct and unchanged throughout, because `dgx-orchestrator.py` itself never
+changed -- the one signal we have was structurally incapable of catching
+this.
+
+Note the interaction that makes this worse than it sounds: the bind mount
+means there is no deploy step that would naturally restart the process. For
+`dgx-orchestrator.py` a stale daemon is usually noticed because the version
+badge doesn't move. For `common/`, nothing moves at all.
+
+**What's missing today:** no visibility into which version of the `common/`
+package the running process actually has loaded.
+
+**Shape of a real fix:**
+- Add a `modules` block to `/api/status` reporting, per `common/*.py`, a
+  short content hash or mtime read from `module.__file__` at import time
+  (i.e. what the running process loaded, NOT a fresh read of the file --
+  the whole point is to detect divergence between the two).
+- Optionally compare that against a live re-read of the same files on each
+  status call and surface a `stale_modules: [...]` list when they differ.
+  That is the signal that would have short-circuited tonight's confusion
+  immediately. Watch the cost: `/api/status` is polled continuously, so a
+  per-call re-read of every `common/` file is real I/O on a hot path --
+  cache it against a directory mtime fingerprint the way `load_recipes()`
+  already does, rather than stat-ing on every poll.
+- Surface it next to the existing version badge in the dashboard, so the
+  established habit ("check the badge after deploying") extends to the whole
+  package without anyone needing to learn a second ritual.
+- Consider whether the deploy procedure should simply always restart the
+  API container, making staleness impossible rather than merely visible.
+  Cheaper than the above and strictly more reliable, at the cost of a few
+  seconds of API downtime per deploy -- worth weighing, since a signal
+  nobody reads is worth less than a class of bug that cannot occur.
+
+**Depends on:** nothing. Small, self-contained. Related to the
+`get_hf_token()` silent-failure fixes recorded in `TOMBSTONES.md` #82 --
+same incident, but this is the part that isn't a code bug in
+`get_hf_token()` itself and so wasn't fixed there.
+
+---
 
 ### Engine health monitoring: container RUNNING doesn't mean the engine is alive
 

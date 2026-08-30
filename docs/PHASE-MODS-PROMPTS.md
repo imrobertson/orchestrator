@@ -97,6 +97,34 @@ at bake time and a confusing `--chat-template` failure at serve time.
 > has already produced one x86-only surprise (see
 > `BACKLOG-dspark-sm120-image.md`).
 
+### M0 RESULT — PASSED, 2026-08-30
+
+Run against `eugr/spark-vllm-b12x:latest` on spark-4 (arm64/GB10). All four
+checks green; the design assumption holds and MA may proceed.
+
+- **Config fidelity: empty diff.** `docker inspect --format '{{json .Config}}'`
+  between base and a committed throwaway container was byte-identical across
+  the entire `.Config` block — `Entrypoint`, `Cmd`, `Env`, `WorkingDir`,
+  `Labels`, `ExposedPorts` all preserved. Note `docker create` alone was
+  sufficient; the container never had to be started for the commit to
+  capture config correctly.
+- **`WorkingDir = /workspace/vllm`.** This is the value Task MB must set as
+  `WORKSPACE_DIR` when running each mod's `run.sh`. Independently
+  corroborated: the image also declares `VLLM_BASE_DIR=/workspace/vllm` as
+  an image-level `ENV` (which is where the harmless
+  `Unknown vLLM environment variable detected: VLLM_BASE_DIR` boot warning
+  comes from — it is eugr's, not ours, and cannot be removed by a recipe
+  change).
+- **NGC entrypoint fires from the committed image.** CUDA banner, version
+  string, and NVIDIA license block all present in the derived image's boot
+  log, identical to the base. The container runtime hooks survived the
+  commit — this was the most plausible failure mode and it did not occur.
+- **Derived image deploys and serves indistinguishably.** A committed tag
+  with no mods applied, deployed 1-node through the normal orchestrator
+  path, benchmarked at 6.7 tok/s decode / 38.04–38.08s vs. the base image's
+  6.7 tok/s / 38.38–38.40s the previous day. Within 0.9% on total time,
+  inside the noise floor. Warm TTFT 0.17s matched exactly.
+
 ---
 
 ## Task MA — Mod format and loader schema
@@ -180,6 +208,17 @@ at bake time and a confusing `--chat-template` failure at serve time.
 >   the mod directories in, run each `run.sh` in declared order with
 >   `WORKSPACE_DIR` set per constraint 3, then `docker commit` to the tag,
 >   then remove the throwaway container.
+> - **Verify the tag actually exists on each host after baking, before any
+>   `docker run` is issued.** Do not let `docker run` be the thing that
+>   discovers a missing image. Confirmed during M0: when a locally-baked tag
+>   is absent, Docker does not report "image missing" — it attempts a
+>   registry pull and fails with
+>   `pull access denied for <tag>, repository does not exist or may require
+>   'docker login'`. That reads like a credentials problem. On a 2-node
+>   deploy where the bake succeeded on one host and failed on the other, it
+>   would send an operator down entirely the wrong diagnostic path. A
+>   `docker image inspect <tag>` check per host, with an error naming the
+>   host and the tag, costs nothing and prevents that.
 > - **Fail loudly and abort the deploy if any `run.sh` exits non-zero.**
 >   eugr's own `apply_mod_to_container()` does exactly this. A half-applied
 >   patch set is worse than a refused deploy. Surface the failing mod name,

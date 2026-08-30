@@ -75,6 +75,18 @@
 ### 72. `SessionTracker` Re-Baselined to Zero on Every Restart, Discarding History (V4.8.5)
 * **The Trap:** A freshly-instantiated `SessionTracker` (e.g. after any daemon restart) unconditionally re-baselined its running counters to "whatever vLLM's live cumulative counter reads right now" — silently discarding the tracker's entire prior view of reality. Confirmed in production: one orchestrator restart reduced a session's real lifetime totals of ~29,000,000 prompt tokens and ~730,000 generation tokens to 190/763 in the ledger — a roughly 152,000x undercount, not a rounding error.
 * **The Fix:** Added `_load_last_seen_raw()`, which reads the ledger's persisted `last_seen_raw` checkpoint (now written on every `_commit_session()` call) on the active-transition and resumes from there if vLLM's live counters are still ≥ the checkpoint — i.e. a restart correctly resumes instead of re-baselining to zero. Falls back to the original fresh-start behavior only when counters are genuinely lower than the checkpoint (a real engine redeploy, not just an orchestrator restart). Proven with a reproduction covering all three cases: resume-after-restart, genuine-redeploy, and fully-explicit args. Added `dgx-config correct-ledger` (also `dgx-config cli correct-ledger` and `POST /api/correct-ledger`, plus a standalone `correct_ledger.py` break-glass script) as a one-off repair tool for an already-corrupted ledger entry — auto-detects the currently-serving host/key/topology/live metrics when run with no arguments, refuses to overwrite with smaller values unless `--force`, and backs up the whole ledger file (timestamped) before any write. The specific 190/763 entry from this incident was corrected with it in production (dry-run previewed, then applied for real).
+* * **Repair semantics (documented 2026-08-30):** `correct-ledger` *sets*
+  `lifetime` and `last_seen_raw` rather than adding to them. For a key with
+  a single continuous engine lifetime this is correct — the surviving
+  (wrong, small) `lifetime` numbers are a subset of what `/metrics` reports,
+  not a separate amount to sum with it, so adding would double-count. **This
+  only holds for a single launch.** If a key has accumulated across multiple
+  engine lifetimes, the live counters cover just the most recent one, and
+  set-semantics would silently discard the earlier history. The `--force`
+  guard won't catch that case: the new values will usually still be larger
+  than the corrupted ones, so the sanity check passes while the result is
+  wrong. Check launch history before repairing a key that may have had more
+  than one.
 
 ### 71. Crashed-Worker Logs Didn't Survive Teardown, Making Diagnosis Impossible After the Fact (V4.8.5)
 * **The Trap:** Ray's session directory, including a crashed worker's stdout/stderr, lived only inside the container's own `/tmp/ray` with no persistent mount. A container that crashed and was subsequently torn down took its own crash evidence with it — this is precisely why the first of the two 08-25 OOM crashes (06:15 UTC) could never be conclusively diagnosed: its logs were already gone by the time anyone went looking, and it's now believed to be the same OOM mechanism as the second, confirmed crash, but this remains unconfirmed and probably always will be.

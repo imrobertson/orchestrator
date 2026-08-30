@@ -177,6 +177,25 @@ if it ever recurs *during* active serving rather than only at boot.
 
 
 UPDATE:: Using AttentionBackendEnum.TRITON_ATTN backend. repeated 3x across cluster, quantization=fp8 and kv_cache_dtype=fp8 in the engine config line, 12.0 tok/s decode at TP=2. That's the difference between "we set these flags" and "we confirmed vLLM resolved them" — which is exactly the standard your status: validated marker is meant to encode.
+
+Env vars this build ignores (confirmed 2026-08-30). vLLM v0.1.dev20003+gad848fc41.d20260815 warns at boot about any VLLM_-prefixed variable it doesn't recognise. Three that were in this recipe were doing nothing and have been removed: VLLM_CPU_OMP_THREADS, VLLM_ENGINE_INITIALIZATION_TIMEOUT, VLLM_RPC_TIMEOUT. OMP_NUM_THREADS is not in that set and stays -- it's a real OpenMP variable, not a vLLM one.
+
+VLLM_USE_V1=0 had no observable effect on the 2-node deploy: the engine logged Initializing a V1 LLM engine with the variable set. It has been removed from this recipe. See the general note below before applying that conclusion anywhere else -- Incident #1 mandates this variable for 2-node Ray topologies and was written from a real failure.
+
+Validated single-node figures (2026-08-30): 6.7 tok/s decode, warm TTFT 0.17s, max_model_len: 32768, tp_size: 1. Matches the community single-node figure (~6.5 tok/s) as closely as the 2-node result matched theirs. Scaling 1-node -> 2-node is 1.79x (6.7 -> 12.0), consistent with the expected ~1.7x for TP=2 with inter-node all-reduce overhead. TTFT warms in stages over the first few requests (1.10s -> 0.30s -> 0.17s) and then holds at the floor across subsequent benchmark invocations, so the warmup is one-time per deploy, not per-invocation. Decode speed is completely insensitive to warmup state -- read TTFT and decode as separate signals.
+
+NEW general note for the tuning reference
+Unrecognised VLLM_* environment variables: two categories
+
+vLLM logs WARNING [envs.py:2477] Unknown vLLM environment variable detected: X for any VLLM_-prefixed variable it doesn't know. Useful, but "unrecognised" does not mean "broken" and does not always mean "removable." Two distinct cases, and treating them the same makes the signal useless:
+
+1. Recipe-authored -- actionable. Anything we put in a recipe's env_vars that this vLLM build doesn't consume. Confirmed inert on v0.1.dev20003+gad848fc41.d20260815: VLLM_CPU_OMP_THREADS, VLLM_ENGINE_INITIALIZATION_TIMEOUT, VLLM_RPC_TIMEOUT. Remove these -- but see the caution below.
+
+2. Image-inherited -- not actionable. VLLM_BASE_DIR=/workspace/vllm is baked into eugr/spark-vllm-b12x as an image-level ENV (confirmed via docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}'). It appears in every container from that base and in every layer baked on top of it. No recipe change can remove it. Expect this warning forever on eugr-based images; it is not a defect and not worth investigating again. (It also independently corroborates /workspace/vllm as the image's working directory -- relevant to the mods bake work, see ROADMAP.md.)
+
+Caution on removing category-1 variables. env_vars feeds compute_config_hash(), so deleting one resets the launch-success history for that recipe/topology. That's correct -- the launched configuration really did change -- but it means a bulk strip across the catalog would invalidate every recipe's validation history at once. Strip opportunistically when a recipe is being re-validated anyway.
+
+VLLM_USE_V1=0 is a separate, unresolved case. vLLM recognises this variable (it never appears in the unknown-variable warnings), but on this build it appears to have no effect: the engine logged Initializing a V1 LLM engine with it set, on the 2-node Gemma 4 deploy and on subsequent runs. Incident #1 mandates it for all 2-node Ray cross-host topologies and was written from a real observed failure, so one contradicting data point is not grounds to delete the rule. Most likely this build has no V0 path left to fall back to, making the flag moot rather than wrong. Do not remove it from other 2-node recipes on the strength of this observation alone -- resolving it wants a deliberate A/B on a 2-node deploy. Flagged so the rule is neither trusted blindly nor dropped prematurely.
 ---
 
 ## Incident Log
