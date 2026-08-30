@@ -47,12 +47,22 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from common.config import BASE_DIR, load_cluster_config
 
 RECIPES_DIR = BASE_DIR / "recipes"
 RECIPE_SUBDIRS = ("local", "eugr")
+
+# Repo-root directory mod payloads live under. A recipe's mods: entries are
+# bare directory names resolved against this at bake time (Task MB) -- never
+# host paths, and never anything the orchestrator interpolates directly into
+# a shell command without validation first. See RecipeConfig.mods and
+# _validate_mod_name() below for the load-time shape check; existence of the
+# named directory is deliberately NOT checked here (see module docstring
+# addition below and Task MA's ROADMAP.md entry) -- that's a deploy-time
+# concern, not a catalog-load concern.
+MODS_DIR = BASE_DIR / "mods"
 
 # Only "1" exists today. An unrecognized version is a soft warning, not a
 # hard error -- see _load_single_recipe().
@@ -63,6 +73,30 @@ SUPPORTED_RECIPE_VERSIONS = ["1"]
 # is new recipe-authoring metadata (Phase 2 addition) with no equivalent in
 # the old format, so it is deliberately excluded from the catalog response.
 _TOPOLOGY_OUTPUT_FIELDS = ("max_model_len", "tp_size", "pp_size", "env_vars", "vllm_args")
+
+
+def _validate_mod_name(name: str) -> str:
+    """
+    Shape validation only -- does the string look like a bare directory
+    name a recipe is allowed to carry? Does NOT check whether mods/<name>
+    actually exists on disk: that's Task MB's job, at bake time, per host.
+    Doing it here would mean a missing mod directory takes down the whole
+    catalog via build_catalog_response()'s fail-closed error handling (see
+    that function's docstring) -- exactly the class of incident this
+    module's docstring already describes for the old name/filename split.
+    A bad mod name should fail the one deploy that references it, not
+    every model in the catalog.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"mods entries must be non-empty strings, got {name!r}")
+    if "/" in name or "\\" in name or ".." in name:
+        raise ValueError(
+            f"mods entry {name!r} is not a bare directory name. Recipes "
+            "must reference mods by name only -- the orchestrator resolves "
+            "each name against the repo-root mods/ directory itself. Path "
+            "separators and '..' segments are rejected at load time."
+        )
+    return name
 
 
 class CapabilityConfig(BaseModel):
@@ -99,7 +133,29 @@ class RecipeConfig(BaseModel):
     image: Optional[str] = None
     gpu_util: float
     capability: CapabilityConfig = Field(default_factory=CapabilityConfig)
-    mods: list = Field(default_factory=list)
+    # Each entry is a bare directory name, resolved against the repo-root
+    # mods/ directory by the orchestrator (never a host path -- see
+    # _validate_mod_name()). Shape-validated here (load time); existence of
+    # mods/<name> is deliberately NOT checked here, only at deploy time --
+    # see _validate_mod_name()'s docstring. Still execution-inert as of
+    # Task MA: typed and validated, but not yet read by
+    # build_catalog_response(), the deploy path, or compute_config_hash()
+    # (and must stay out of compute_config_hash() even once wired up --
+    # see that function's docstring for why).
+    mods: list[str] = Field(default_factory=list)
+
+    # NOTE: deliberately not named with a leading underscore. Pydantic v2
+    # treats leading-underscore class attributes as PrivateAttr candidates;
+    # a field_validator-decorated method is exempt via
+    # __pydantic_decorators__, but there's no upside to fighting that
+    # convention for a validator that's part of the model's public
+    # contract (it's why load-time validation errors look the way they
+    # do).
+    @field_validator("mods", mode="after")
+    @classmethod
+    def check_mods_are_bare_names(cls, value: list[str]) -> list[str]:
+        return [_validate_mod_name(item) for item in value]
+
     # Free-form, optional. Human-readable context that doesn't fit any
     # structured field -- known quirks, why a flag is set the way it is,
     # links to an upstream issue, etc. Surfaced under the model
