@@ -44,6 +44,7 @@ import yaml
 
 from common.config import legacy_hosts_dict, load_cluster_config
 from common.constants import ContainerRole
+from common.mods import ModBakeError, ModResolutionError, ensure_mods_baked, resolve_mod_tag
 from common.recipes import build_catalog_response, compute_config_hash, load_recipes
 from common.ssh import get_hf_token, resolve_user_identity_key, run_ssh
 
@@ -2962,9 +2963,56 @@ def authorize_user_key(public_key_path: str) -> dict:
         results[host] = "Authorized" if res.returncode == 0 else f"Failed: {res.stderr.strip()}"
     return {"status": "success", "details": results}
 
+def _resolve_host_image_tag(host: str, ip: str, base_image: str, mod_names: list, dry_run: bool) -> str:
+    """
+    Task MC's one shared mod-resolution entry point. Called once per target
+    host from BOTH the 1-node and 2-node branches of
+    _execute_deployment_impl(), immediately before that host's `docker run`
+    -- never inlined separately in each branch. See PHASE-MODS-PROMPTS.md's
+    Task MC requirements for why: this repo has already paid for the same
+    logic drifting apart across a 1-node/2-node split once (see
+    common/ssh.py's module docstring for the run_ssh/get_hf_token
+    precedent).
+
+    Empty mod_names is a strict no-op in both dry_run and live-deploy
+    cases: returns base_image unchanged with zero SSH round trips. This is
+    the path every existing recipe takes today (mods: [] everywhere), and
+    is what keeps --dry-run output byte-identical to before this function
+    existed -- both resolve_mod_tag() and ensure_mods_baked() implement
+    this fast path themselves (see common/mods.py), so it is not
+    re-implemented here a third time.
+
+    dry_run=True calls resolve_mod_tag() -- pure/local, no SSH, no bake --
+    so "report the resolved tag and what would be baked; make no SSH
+    connections and bake nothing" holds even for a recipe that DOES carry
+    mods.
+
+    dry_run=False calls ensure_mods_baked(), which bakes on `ip` first if
+    that tag isn't already there, then returns the live tag.
+
+    Raises ModResolutionError (missing/invalid mod name -- pure/local, so
+    identical for every host given the same base_image/mod_names; it
+    always surfaces on the first host _execute_deployment_impl touches,
+    before that host's docker run and therefore before any host's) or
+    ModBakeError (this host's bake specifically failed). Both are left
+    unhandled here -- the caller decides how a mid-deploy abort is
+    reported.
+    """
+    if dry_run:
+        return resolve_mod_tag(base_image, mod_names)
+    return ensure_mods_baked(host, ip, base_image, mod_names)
+
+
 def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
     deploy_start_time = time.time()
     docker_run_commands: dict = {}
+    # Populated only for hosts whose mod set is non-empty (see
+    # _resolve_host_image_tag() / Task MC) -- stays {} for every existing
+    # recipe (mods: [] everywhere), so it is only added to the dry_run
+    # response dict below when non-empty. That is what keeps --dry-run
+    # output byte-identical to before this change for the whole current
+    # catalog.
+    mods_report: dict = {}
 
     if nodes not in (1, 2): return {"status": "error", "message": f"Invalid 'nodes' value {nodes!r}: must be 1 or 2."}
     if head not in HOSTS: return {"status": "error", "message": f"Invalid 'head' value {head!r}: must be one of {list(HOSTS.keys())}."}
@@ -3040,6 +3088,29 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     image_tag = model_config.get("image", default_img)
     compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"
 
+    # Task MC: resolve this recipe's mods (Task MA/MB) against image_tag,
+    # per target host, right before that host's docker run -- see
+    # _resolve_host_image_tag() above. build_catalog_response() deliberately
+    # does not surface `mods` in the catalog dict yet (see common/recipes.py
+    # -- still execution-inert as of Task MA/MB), so mod_names is read
+    # straight from the raw RecipeConfig via load_recipes(), not from
+    # model_config. Under USE_LEGACY_CATALOG=1, or for any model not backed
+    # by a recipes/{local,eugr}/*.yaml file, there is no RecipeConfig at
+    # all -- mod_names stays [] (strict no-op), exactly as if the recipe
+    # had an explicit mods: []. A recipe-loading error here (e.g. an
+    # unrelated malformed recipe file elsewhere in recipes/) must not block
+    # this deploy, since this model's own recipe may be perfectly fine (or
+    # may not even come from recipes/ at all under legacy mode) -- so it is
+    # caught and logged, not raised, falling back to mod_names = [].
+    mod_names: list = []
+    try:
+        recipe_obj = load_recipes().get(model)
+        if recipe_obj is not None:
+            mod_names = list(recipe_obj.mods)
+    except Exception as exc:
+        print(f"[!] _execute_deployment_impl({model}): failed to load recipe for mod resolution "
+              f"({type(exc).__name__}: {exc}); proceeding with no mods.")
+
     def _jit_cache_mounts_and_env(vol_mount: str, log_subdir: str) -> tuple[list[str], list[str]]:
         host_hf_dir = vol_mount.split(":", 1)[0]
         host_cache_root = str(Path(host_hf_dir).parent)
@@ -3101,6 +3172,17 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             "--max-model-len", str(max_model_len)
         ] + vllm_args_list
 
+        # Bake happens per target host, before that host's docker run --
+        # see _resolve_host_image_tag(). Mod resolution failure (bad/
+        # missing mod name) aborts here, before this host's docker run and
+        # therefore before any container starts.
+        try:
+            host_image_tag = _resolve_host_image_tag(head, ip, image_tag, mod_names, dry_run)
+        except (ModResolutionError, ModBakeError) as exc:
+            return {"status": "error", "message": f"Mod resolution failed for {model} on {head}: {exc}"}
+        if mod_names:
+            mods_report[head] = {"base_image": image_tag, "mod_names": mod_names, "resolved_tag": host_image_tag}
+
         docker_cmd = [
             "docker", "run", "-d", "--init",
             "--name", ContainerRole.STANDALONE,
@@ -3108,7 +3190,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             "--gpus", "all",
             "-v", vol_mount,
             "-v", compat_mount
-        ] + jit_mounts + env_flags + [image_tag] + container_args
+        ] + jit_mounts + env_flags + [host_image_tag] + container_args
 
         res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
         if dry_run: docker_run_commands[head] = docker_cmd
@@ -3182,6 +3264,23 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             else:
                 entrypoint_cmd = container_args
 
+            # Bake happens per target host, before that host's docker run --
+            # see _resolve_host_image_tag(). Mod resolution failure (bad/
+            # missing mod name) is host-independent given a fixed
+            # (image_tag, mod_names), so if it's going to happen it happens
+            # on the first host in target_hosts, before that host's docker
+            # run and therefore before any container on either host starts.
+            # A bake failure specific to this host aborts here too, but (like
+            # a plain docker-run failure below) does not roll back a prior
+            # host that already started -- consistent with this loop's
+            # existing partial-failure handling.
+            try:
+                host_image_tag = _resolve_host_image_tag(host, ip, image_tag, mod_names, dry_run)
+            except (ModResolutionError, ModBakeError) as exc:
+                return {"status": "error", "message": f"Mod resolution failed for {model} on {host}: {exc}"}
+            if mod_names:
+                mods_report[host] = {"base_image": image_tag, "mod_names": mod_names, "resolved_tag": host_image_tag}
+
             docker_cmd = [
                 "docker", "run", "-d", "--init",
                 "--name", role_name,
@@ -3192,7 +3291,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                 "--gpus", "all",
                 "-v", vol_mount,
                 "-v", compat_mount
-            ] + jit_mounts + env_flags + [image_tag] + entrypoint_cmd
+            ] + jit_mounts + env_flags + [host_image_tag] + entrypoint_cmd
 
             res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
             if dry_run: docker_run_commands[host] = docker_cmd
@@ -3214,13 +3313,24 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             run_ssh(head_ip, None, vllm_exec_cmd, timeout=30)
 
     if dry_run:
-        return {
+        dry_run_result = {
             "status": "dry_run",
             "message": f"Dry-run for {model} across {nodes} node(s) - no SSH connections made, nothing executed.",
             "targets": target_hosts,
             "head": head,
             "docker_run_commands": docker_run_commands,
         }
+        # Only added when at least one host actually has mods to report --
+        # every existing recipe (mods: [] everywhere) leaves mods_report
+        # empty, so this key is simply absent for them, keeping --dry-run
+        # output byte-identical to before Task MC for the whole current
+        # catalog. The resolved tag is already visible inline inside
+        # docker_run_commands either way (it's the image argument);
+        # mods_report additionally spells out "what would be baked" per
+        # Task MC's dry-run requirement.
+        if mods_report:
+            dry_run_result["mods"] = mods_report
+        return dry_run_result
 
     time.sleep(4)
     for host in target_hosts:

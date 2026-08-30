@@ -1,5 +1,74 @@
 # Control Plane Release Tombstones & Fix Log
 
+### 84. Two mod-set failure modes look identical but are not: resolution vs. bake (V?.?.?)
+
+* **The Trap:** `common/mods.py` (Task MB) exposes two distinct exception
+  types for what looks, from the call site, like one kind of failure:
+  `ModResolutionError` (a recipe names a `mods/<n>` directory that doesn't
+  exist — pure/local, no SSH, deterministic for a given
+  `(base_image, mod_names)` pair regardless of which host you ask) and
+  `ModBakeError` (the bake itself failed on a *specific* host — shipping
+  the mod payload, running `run.sh`, `docker commit`, or the post-commit
+  `docker image inspect` verification that same module's docstring
+  explains in detail). Both are easy to catch together (`except
+  (ModResolutionError, ModBakeError)`) and both produce an "abort this
+  deploy" outcome — but they have different blast-radius guarantees. A
+  `ModResolutionError` is guaranteed to surface on the *first* host a
+  caller touches, before that host's `docker run` and therefore before
+  *any* host's, because it doesn't depend on host state at all. A
+  `ModBakeError` has no such guarantee across a 2-node deploy: it's
+  entirely possible for host 1's bake+run to succeed and host 2's bake to
+  fail afterward, in which case a container is already running on host 1
+  when the deploy reports an error. A caller (or a future reader of a
+  deploy failure) who treats "the deploy aborted with a mod error" as
+  meaning "nothing started" will be wrong exactly when it's a bake
+  failure rather than a resolution failure, and that distinction is not
+  visible from the exception message alone unless the message names the
+  exception type or the caller checks `type(exc)` separately per class.
+
+* **The Fix:** Task MC's integration
+  (`_execute_deployment_impl._resolve_host_image_tag()` /
+  `dgx-orchestrator.py`) deliberately keeps the per-host bake-then-run
+  ordering (bake immediately before *that host's* `docker run`, not a
+  bake-all-hosts-then-run-all-hosts pass) specifically because
+  `ModResolutionError`'s host-independence already gives "abort before
+  any container starts" for that failure class for free, without needing
+  a separate upfront resolution pass. `ModBakeError` partial-deploy
+  behavior on 2-node was left matching this codebase's existing
+  `docker run` partial-failure behavior (host 1 can already be running
+  when host 2 fails) rather than being given new rollback semantics — see
+  `M{X}-REVIEW.md`'s "Contradictions" section, item 5, for the full
+  reasoning. If a future change adds rollback-on-partial-2-node-failure
+  for *any* reason, it should cover both `docker run` failures and
+  `ModBakeError` uniformly, not just one of them, or this asymmetry
+  becomes a second, worse version of the same trap.
+
+### 84. `common/mods.py`'s own module docstring names a function that doesn't exist (V?.?.?)
+
+* **The Trap:** `common/mods.py`'s module-level docstring (the "Task MB"
+  header comment) says: *"given a base image tag and an ordered list of
+  mod names, `resolve_and_bake_mods()` below returns the tag of an image
+  with those mods applied, baking it on the target host first if that tag
+  isn't already there."* No function named `resolve_and_bake_mods` exists
+  anywhere in the file — the actual public function that does this is
+  `ensure_mods_baked()`. Anyone who reads only the module docstring
+  (reasonable, since it's positioned as the authoritative summary of what
+  the module does) and then writes `from common.mods import
+  resolve_and_bake_mods` gets an `ImportError` with no obvious connection
+  back to the docstring that suggested the name. This is a small, cheap
+  trap, but it's exactly the "documentation says one thing, code does
+  another, and nothing catches the drift" pattern this repo has already
+  paid for once (the old recipe `name:`-field-vs-filename split
+  `common/recipes.py`'s own docstring documents fixing).
+* **The Fix:** None applied — Task MC's declared scope was
+  `dgx-orchestrator.py` only; `common/mods.py` (MB's deliverable) was left
+  byte-for-byte as uploaded, per this task's scope boundary. Flagging here
+  so MB's owner (or whoever next touches `common/mods.py`) can either
+  rename the docstring reference to `ensure_mods_baked()` or rename the
+  function to match the docstring — either resolves it, but leaving the
+  mismatch in place risks it getting worse if a *third* name shows up in
+  some future PR description or prompt file.
+
 ### 83. Smoke test's independent-verification SSH calls silently broke on multi-word `--format` strings (tests/smoke_test_mods.py)
 
 * **The Trap:** `tests/smoke_test_mods.py` hand-rolled its own `ssh_run()`
