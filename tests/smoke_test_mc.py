@@ -89,8 +89,20 @@ def parse_args():
                          "NOT need this. If omitted, the script tries a couple of sensible "
                          "default locations next to --common-dir before giving up and falling "
                          "back to the bundled fake config.py/constants.py for this run.")
+    p.add_argument("--secrets-file", default=None,
+                    help="Path to your real .secrets file, to round-trip through the real "
+                         "get_hf_token() as an extra check. Optional -- if omitted, the script "
+                         "tries a couple of sensible default locations next to --common-dir; if "
+                         "none is found either way, this one check is skipped (not failed) and "
+                         "the skip is printed explicitly, since a silent skip here is exactly "
+                         "the kind of thing that gets mistaken for a passing check later. The "
+                         "real file is copied into this run's throwaway, 0700 temp BASE_DIR and "
+                         "deleted with it on exit (unless --keep-fixture) -- the token's VALUE is "
+                         "never printed or logged, only whether one was found and its length.")
     p.add_argument("--keep-fixture", action="store_true",
-                    help="Don't delete the temp BASE_DIR fixture on exit (for debugging).")
+                    help="Don't delete the temp BASE_DIR fixture on exit (for debugging). NOTE: "
+                         "if --secrets-file was used, a copy of your real HF token is left behind "
+                         "in the kept fixture -- clean it up yourself when done debugging.")
     return p.parse_args()
 
 
@@ -101,6 +113,18 @@ def find_cluster_config(explicit: str | None, common_dir: Path) -> Path | None:
             sys.exit(f"[!] --cluster-config not found: {p}")
         return p
     for candidate in (common_dir.parent / "cluster_config.yaml", common_dir / "cluster_config.yaml"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def find_secrets_file(explicit: str | None, common_dir: Path) -> Path | None:
+    if explicit:
+        p = Path(explicit).resolve()
+        if not p.exists():
+            sys.exit(f"[!] --secrets-file not found: {p}")
+        return p
+    for candidate in (common_dir.parent / ".secrets", common_dir / ".secrets"):
         if candidate.exists():
             return candidate
     return None
@@ -452,6 +476,24 @@ def main():
 
         used_real_config = build_common_package(work_dir, common_dir, force_fake_config=force_fake_config)
 
+        # Independent of real vs. fake config.py -- get_hf_token() lives in
+        # common/ssh.py and reads its OWN BASE_DIR (same env var, computed
+        # separately). Copy a real .secrets in if we can find one, so the
+        # actual token-parsing logic gets exercised against your actual
+        # file format instead of an empty fixture that can only ever
+        # report "not found" either way.
+        secrets_path = find_secrets_file(args.secrets_file, common_dir)
+        if secrets_path is not None:
+            shutil.copy2(secrets_path, base_dir / ".secrets")
+            print(f"[i] Copied real .secrets from {secrets_path} into the sandboxed BASE_DIR "
+                  f"for a real get_hf_token() round-trip.")
+        else:
+            print(
+                "[i] No .secrets file given (--secrets-file) or found next to --common-dir -- "
+                "the get_hf_token() round-trip check will be SKIPPED, not failed. Pass "
+                "--secrets-file /path/to/.secrets to actually exercise this."
+            )
+
         os.environ["BASE_DIR"] = str(base_dir)
         os.environ["HOME"] = str(home_dir)  # keep resolve_user_identity_key()'s ~/.ssh writes sandboxed
         sys.path.insert(0, str(work_dir))
@@ -502,6 +544,34 @@ def main():
         default_image = dgx.load_cluster_config().default_image
         print(f"[i] Using default_image from {'REAL' if used_real_config else 'fake'} config: {default_image}")
         print()
+
+        # -----------------------------------------------------------
+        # T0: real get_hf_token() round-trip against a real .secrets file,
+        # if one was found/given. Never prints the token value -- only
+        # whether one was found and its length, which is enough to
+        # distinguish "found nothing" from "found something." Temporarily
+        # clears HF_TOKEN from the environment for the duration of this
+        # one call, since get_hf_token() checks the env var FIRST and
+        # would otherwise mask whatever the .secrets file parsing
+        # actually does; restored immediately after regardless of outcome.
+        # -----------------------------------------------------------
+        if secrets_path is not None:
+            _saved_env_token = os.environ.pop("HF_TOKEN", None)
+            try:
+                token = real_ssh.get_hf_token()
+            finally:
+                if _saved_env_token is not None:
+                    os.environ["HF_TOKEN"] = _saved_env_token
+            check(
+                f"get_hf_token() found a non-empty token in {secrets_path.name} "
+                f"(length={len(token)}, value never logged)",
+                bool(token),
+                "get_hf_token() returned an empty string -- see this run's [!] Warning lines "
+                "above for which fallback path it hit and why (empty-after-stripping, "
+                "permission error, parse exception, or genuinely not found).",
+            )
+        else:
+            print("SKIP  get_hf_token() round-trip -- no .secrets file available to this run\n")
 
         # -----------------------------------------------------------
         # T1/T2: --dry-run, mods: [] -- must be a strict no-op: zero SSH
