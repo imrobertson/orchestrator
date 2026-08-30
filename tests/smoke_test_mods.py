@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts/smoke_test_mods.py -- automated live-hardware smoke test for
+tests/smoke_test_mods.py -- automated live-hardware smoke test for
 common/mods.py (Task MB).
 
 Runs the same sequence TESTING-MB.md walks through by hand, as one script:
@@ -9,12 +9,16 @@ verifies the result via plain `docker inspect` (never through the module
 under test), confirms idempotent skip / payload-edit rebake / failing-mod
 abort / per-host independence, then cleans up.
 
-Run from the repo root on `maestro`:
+Run from inside the dgx-orchestrator-api container (matches how dgx-config
+already delegates every CLI invocation -- see dgx-config's docker exec
+wrapper). Since docker-compose.yml bind-mounts `.:/app`, anything dropped
+into tests/ on the host is already visible inside the container with no
+rebuild:
 
-    python3 scripts/smoke_test_mods.py
-    python3 scripts/smoke_test_mods.py --hosts spark-4          # single host
-    python3 scripts/smoke_test_mods.py --keep                   # leave artifacts for inspection
-    python3 scripts/smoke_test_mods.py --serve-check --hf-path facebook/opt-125m
+    docker exec -it dgx-orchestrator-api python3 tests/smoke_test_mods.py
+    docker exec -it dgx-orchestrator-api python3 tests/smoke_test_mods.py --hosts spark-4
+    docker exec -it dgx-orchestrator-api python3 tests/smoke_test_mods.py --keep
+    docker exec -it dgx-orchestrator-api python3 tests/smoke_test_mods.py --serve-check --hf-path Qwen/Qwen3-0.6B
 
 Exits 0 if every check passed, 1 otherwise. Does not touch
 dgx-orchestrator.py or the real deploy path -- this only exercises
@@ -28,11 +32,24 @@ Task MD is responsible for.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+# Bootstrap: this script lives one level below the repo root (tests/), same
+# as common/*.py lives one level below it (common/). Mirrors common/ssh.py's
+# own BASE_DIR resolution exactly -- same env var, same file-relative
+# fallback -- so this agrees with what common.ssh.BASE_DIR resolves to
+# rather than computing a second, potentially-divergent notion of "repo
+# root". Without this, `python3 tests/smoke_test_mods.py` fails to import
+# `common` at all: Python puts the SCRIPT's own directory (tests/) on
+# sys.path, not the repo root, regardless of cwd or host-vs-container.
+_REPO_ROOT = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent.parent))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import yaml
 
