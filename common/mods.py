@@ -281,6 +281,15 @@ def _bake_on_host(host: str, ip: str, user: str, key_path: str, base_image: str,
             f"per constraint 3) while baking tag {tag}: {workspace_res.stderr or 'empty WorkingDir'}"
         )
 
+    # `docker cp` can create the FINAL path component of its destination if
+    # missing, but not a missing parent -- copying into a not-yet-existing
+    # /tmp/mods/<name> fails with "Could not find the file /tmp/mods in
+    # container" rather than creating it. mkdir it explicitly first.
+    mkdir_container_res = run_ssh(ip, user, ["docker", "exec", container_name, "mkdir", "-p", "/tmp/mods"], timeout=15)
+    if mkdir_container_res.returncode != 0:
+        _cleanup()
+        raise ModBakeError(f"[{host}] Failed to create /tmp/mods inside throwaway container for tag {tag}: {mkdir_container_res.stderr}")
+
     for name in mod_names:
         cp_res = run_ssh(
             ip, user,
