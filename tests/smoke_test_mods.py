@@ -53,7 +53,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import yaml
 
-from common.ssh import BASE_DIR, resolve_user_identity_key
+from common.ssh import BASE_DIR, run_ssh
 from common.recipes import MODS_DIR
 from common.mods import ensure_mods_baked, resolve_mod_tag, ModBakeError, ModResolutionError
 
@@ -103,15 +103,22 @@ def load_hosts(selected: list[str] | None) -> dict[str, dict]:
 
 
 def ssh_run(ip: str, user: str, *cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
-    key_path = resolve_user_identity_key()
-    full = [
-        "ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=10", "-i", key_path, f"{user}@{ip}",
-    ] + list(cmd)
-    try:
-        return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(args=full, returncode=124, stdout="", stderr=str(exc))
+    """
+    Thin adapter over common.ssh.run_ssh() for this script's independent
+    verification calls. This used to be its own hand-rolled SSH
+    invocation, built specifically so verification wouldn't trust the same
+    code path being tested -- but that "independence" instinct was aimed
+    at the wrong layer. It should mean "don't call ensure_mods_baked() to
+    verify its own output", not "don't reuse a correct, already-audited
+    SSH transport". The hand-rolled version silently dropped run_ssh()'s
+    per-argument shlex.quote before joining into the remote command
+    string; ssh itself then re-concatenates multiple argv elements into
+    ONE string for the remote shell, so any argument containing a space
+    silently split into extra, wrong tokens on the far end -- see
+    TOMBSTONES.md #83 for the concrete failure this caused (a false-passing
+    Entrypoint/Cmd check).
+    """
+    return run_ssh(ip, user, list(cmd), timeout=timeout)
 
 
 def setup_test_mods() -> list[Path]:
@@ -168,27 +175,45 @@ def check_first_bake(host: str, ip: str, user: str, base_image: str) -> tuple[bo
     passed &= record(f"[{host}] tag present after bake", r.returncode == 0, r.stderr.strip())
 
     r = ssh_run(ip, user, "docker", "run", "--rm", tag, "cat", "/workspace/vllm/mod_order.log")
-    lines = r.stdout.splitlines()
-    order_ok = r.returncode == 0 and len(lines) >= 2 and "marker_a" in lines[0] and "marker_b" in lines[1]
+    # The derived image's real entrypoint (restored, not the throwaway
+    # "sleep" override -- see the Entrypoint/Cmd checks below) still fires
+    # here since --gpus wasn't passed: the NGC wrapper's driver warning
+    # legitimately precedes the actual `cat` output. That's the entrypoint
+    # restoration working correctly, not a mods-ran-out-of-order bug -- so
+    # check that the marker lines appear in order ANYWHERE in stdout,
+    # rather than requiring them to be the first two lines.
+    marker_lines = [ln for ln in r.stdout.splitlines() if "marker_a" in ln or "marker_b" in ln]
+    order_ok = (
+        r.returncode == 0
+        and len(marker_lines) == 2
+        and "marker_a" in marker_lines[0]
+        and "marker_b" in marker_lines[1]
+    )
     passed &= record(f"[{host}] mods applied in declared order", order_ok, r.stdout.strip() or r.stderr.strip())
 
-    base_ep = ssh_run(ip, user, "docker", "inspect", "--format", "{{json .Config.Entrypoint}}", base_image).stdout.strip()
-    derived_ep = ssh_run(ip, user, "docker", "inspect", "--format", "{{json .Config.Entrypoint}}", tag).stdout.strip()
+    ep_a = ssh_run(ip, user, "docker", "inspect", "--format", "{{json .Config.Entrypoint}}", base_image)
+    ep_b = ssh_run(ip, user, "docker", "inspect", "--format", "{{json .Config.Entrypoint}}", tag)
+    passed &= record(f"[{host}] Entrypoint inspect calls succeeded", ep_a.returncode == 0 and ep_b.returncode == 0, (ep_a.stderr or ep_b.stderr).strip())
+    base_ep, derived_ep = ep_a.stdout.strip(), ep_b.stdout.strip()
     passed &= record(f"[{host}] Entrypoint restored to match base", base_ep == derived_ep, f"{base_ep!r} vs {derived_ep!r}")
 
-    base_cmd = ssh_run(ip, user, "docker", "inspect", "--format", "{{json .Config.Cmd}}", base_image).stdout.strip()
-    derived_cmd = ssh_run(ip, user, "docker", "inspect", "--format", "{{json .Config.Cmd}}", tag).stdout.strip()
+    cmd_a = ssh_run(ip, user, "docker", "inspect", "--format", "{{json .Config.Cmd}}", base_image)
+    cmd_b = ssh_run(ip, user, "docker", "inspect", "--format", "{{json .Config.Cmd}}", tag)
+    passed &= record(f"[{host}] Cmd inspect calls succeeded", cmd_a.returncode == 0 and cmd_b.returncode == 0, (cmd_a.stderr or cmd_b.stderr).strip())
+    base_cmd, derived_cmd = cmd_a.stdout.strip(), cmd_b.stdout.strip()
     passed &= record(f"[{host}] Cmd restored to match base", base_cmd == derived_cmd, f"{base_cmd!r} vs {derived_cmd!r}")
 
-    base_wd = ssh_run(ip, user, "docker", "inspect", "--format", "{{.Config.WorkingDir}}", base_image).stdout.strip()
-    derived_wd = ssh_run(ip, user, "docker", "inspect", "--format", "{{.Config.WorkingDir}}", tag).stdout.strip()
-    passed &= record(f"[{host}] WorkingDir preserved", base_wd == derived_wd, derived_wd)
+    wd_a = ssh_run(ip, user, "docker", "inspect", "--format", "{{.Config.WorkingDir}}", base_image)
+    wd_b = ssh_run(ip, user, "docker", "inspect", "--format", "{{.Config.WorkingDir}}", tag)
+    passed &= record(f"[{host}] WorkingDir inspect calls succeeded", wd_a.returncode == 0 and wd_b.returncode == 0, (wd_a.stderr or wd_b.stderr).strip())
+    base_wd, derived_wd = wd_a.stdout.strip(), wd_b.stdout.strip()
+    passed &= record(f"[{host}] WorkingDir preserved", base_wd == derived_wd and bool(derived_wd), derived_wd)
 
     r = ssh_run(ip, user, "docker", "ps", "-a", "--filter", "name=dgx-mods-bake", "--format", "{{.Names}}")
-    passed &= record(f"[{host}] no dangling bake containers", r.stdout.strip() == "", r.stdout.strip())
+    passed &= record(f"[{host}] no dangling bake containers", r.returncode == 0 and r.stdout.strip() == "", r.stdout.strip() or r.stderr.strip())
 
     r = ssh_run(ip, user, "bash", "-c", "ls /tmp | grep dgx-mods-bake || true")
-    passed &= record(f"[{host}] no leftover staging dirs", r.stdout.strip() == "", r.stdout.strip())
+    passed &= record(f"[{host}] no leftover staging dirs", r.returncode == 0 and r.stdout.strip() == "", r.stdout.strip() or r.stderr.strip())
 
     return passed, tag
 
@@ -227,10 +252,10 @@ def check_failing_mod(host: str, ip: str, user: str, base_image: str) -> bool:
     passed &= record(f"[{host}] no partial tag left behind", r.returncode != 0)
 
     r = ssh_run(ip, user, "docker", "ps", "-a", "--filter", "name=dgx-mods-bake", "--format", "{{.Names}}")
-    passed &= record(f"[{host}] no dangling container after failure", r.stdout.strip() == "")
+    passed &= record(f"[{host}] no dangling container after failure", r.returncode == 0 and r.stdout.strip() == "", r.stdout.strip() or r.stderr.strip())
 
     r = ssh_run(ip, user, "bash", "-c", "ls /tmp | grep dgx-mods-bake || true")
-    passed &= record(f"[{host}] no leftover staging dir after failure", r.stdout.strip() == "")
+    passed &= record(f"[{host}] no leftover staging dir after failure", r.returncode == 0 and r.stdout.strip() == "", r.stdout.strip() or r.stderr.strip())
     return passed
 
 
