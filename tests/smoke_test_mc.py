@@ -58,6 +58,7 @@ FAIL lines above the summary for which.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -69,6 +70,24 @@ import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _self_hash() -> str:
+    """
+    Short hash of THIS FILE's own on-disk bytes, printed unconditionally
+    at the very start of every run -- same rationale, same pattern, as
+    dgx-orchestrator.py's own _compute_source_hash_suffix() /
+    ORCHESTRATOR_VERSION: "did my copy of this script actually get
+    updated" is answerable at a glance without a git diff, and without
+    trusting that a push/pull actually landed. Printed BEFORE argparse
+    even runs, specifically so a stale copy announces itself even when
+    the actual failure is "this flag doesn't exist yet" -- that failure
+    mode is exactly what happened the first time this mattered.
+    """
+    try:
+        return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()[:8]
+    except Exception as exc:
+        return f"unknown ({type(exc).__name__}: {exc})"
 
 
 # ---------------------------------------------------------------------
@@ -739,4 +758,5 @@ def main():
 
 
 if __name__ == "__main__":
+    print(f"[i] smoke_test_mc.py self-hash: {_self_hash()}")
     sys.exit(main())

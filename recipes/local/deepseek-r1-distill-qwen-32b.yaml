@@ -14,7 +14,6 @@ topologies:
     pp_size: 1
     env_vars:
     - OMP_NUM_THREADS=16
-    - VLLM_CPU_OMP_THREADS=16
     vllm_args: >-
       --trust-remote-code --kv-cache-dtype fp8 --reasoning-parser deepseek_r1
   2_node:
@@ -23,7 +22,6 @@ topologies:
     pp_size: 1
     env_vars:
     - OMP_NUM_THREADS=16
-    - VLLM_CPU_OMP_THREADS=16
     - TORCHINDUCTOR_AUTOGRAD_CACHE=0
     - TORCHINDUCTOR_FX_GRAPH_CACHE=0
     - NCCL_CUMEM_ENABLE=0
