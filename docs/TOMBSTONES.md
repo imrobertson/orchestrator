@@ -13,15 +13,21 @@ fixed today, recorded here rather than silently:
     entry's last sentence). Both are now properly delimited as their
     own top-level entries; no content was added, removed, or
     reworded.
-  - #77's own Fix paragraph appears to have lost its ending at the
-    exact point #76 was spliced in -- the sentence "...the existing
-    hand-written" trails off mid-thought with no continuation found
-    anywhere in the file. This looks like real content loss, not a
-    formatting artifact. It has NOT been reconstructed or guessed at
-    here -- see the inline `[SENTENCE APPEARS TRUNCATED HERE]` marker
-    in #77's entry below. If the original ending exists in git
-    history or another copy of this file, it should be restored from
-    there, not rewritten from memory.
+  - #77's own Fix paragraph originally appeared to have lost its ending
+    at the exact point #76 was spliced in -- flagged in-place rather
+    than reconstructed, since guessing at incident-log content is worse
+    than an honest gap. RESOLVED same day: the person located an intact
+    copy of #77 from the original session it was written in. The
+    production file's version wasn't corrupted-with-loss -- it was a
+    STALE snapshot of #77 predating two later edits: the git-commit-hash
+    sentence that had been trailing off was fully removed once that work
+    grew into its own dedicated entry (#79), and the "loaded into memory
+    ... memory-only was considered and rejected" description of
+    ACTIVE_DEPLOYMENT_STATE's original (buggy) design was replaced with
+    a forward-reference once #80 fixed that design -- a note that could
+    only have been written after #80 existed. #77 below now reflects
+    that located, correct version verbatim; nothing was reconstructed
+    from memory or guessed.
   - #86 below is new, added today (Task MC's live-hardware
     verification session).
   - Full numbering 27-86 is otherwise contiguous with no other gaps
@@ -227,7 +233,7 @@ fixed today, recorded here rather than silently:
 
 ### 77. Dashboard Model-Select Dropdown Silently Showed the Wrong Deployed Recipe (V4.8.6)
 * **The Trap:** The dashboard (and `SESSION_TRACKER`'s lifetime-token attribution, and the ledger auto-detect CLI's `_detect_live_model_topo_metrics()`) all resolved "which recipe is currently running" the same way: fuzzy-matching the served checkpoint's display name (`active_model`, e.g. `"DeepSeek-V4-Flash-0731"`) against catalog keys and `hf_path`s via `_resolve_catalog_key()`. Two recipes serving the identical checkpoint under materially different configs — `deepseek-v4-flash-0731-1M` and `deepseek-v4-flash-0731-dspark-sm120` both report the same served name — collide under that match by construction, so the code silently took whichever catalog entry it happened to iterate to first, independent of which recipe was actually deployed. Reported symptom: the model-select dropdown kept snapping back to `-1M` regardless of what was actually launched. Same ambiguity also risked misattributing lifetime prompt/generation token counts to the wrong recipe's `model_ledger.json` entry, silently — a data-correctness bug, not just a UI one.
-* **The Fix:** Added `ACTIVE_DEPLOYMENT_STATE`, a disk-backed (`active_deployment_state.json`) per-host record of `{catalog_key, topo_key, config_hash}`, written by `execute_deployment()` at the exact moment it knows what it launched — reusing the same `config_hash` already computed for `PENDING_LAUNCH_STATE` (see #76's launch-success tracking), not a new hashing mechanism. Cleared per-host on teardown (unconditionally, same "always resets" reasoning as `TEARDOWN_STATE`), and loaded into memory once at daemon startup so it survives a restart — memory-only was considered and rejected, since that would silently reintroduce the exact ambiguous-guessing failure mode after every restart. Only trusted when live container discovery confirms something is actually running on that host (`active_container != "None"`), so a stale record can't survive an out-of-band `docker rm` done outside the orchestrator. The three independent copies of "prefer the exact record, fall back to fuzzy match" this fix initially produced (one each in `_finalize_host_status`, `_compute_cluster_status_impl`, `_detect_live_model_topo_metrics`, each with subtly different gating) were consolidated into a single `_resolve_active_recipe()` helper in the same pass, once the duplication was noticed. `/api/status` now exposes `active_recipe_key`/`active_config_hash` per host; `index.html`'s `fetchStatus()` reads that directly instead of re-deriving it via string matching. Also added a git-commit-hash suffix (+ `-dirty` flag) to `ORCHESTRATOR_VERSION`, computed once at daemon startup — the existing hand-written [SENTENCE APPEARS TRUNCATED HERE — see Tombstone reconciliation note at top of this file, 2026-08-31]
+* **The Fix:** Added `ACTIVE_DEPLOYMENT_STATE`, a disk-backed (`active_deployment_state.json`) per-host record of `{catalog_key, topo_key, config_hash}`, written by `execute_deployment()` at the exact moment it knows what it launched — reusing the same `config_hash` already computed for `PENDING_LAUNCH_STATE` (see #76's launch-success tracking), not a new hashing mechanism. Cleared per-host on teardown (unconditionally, same "always resets" reasoning as `TEARDOWN_STATE`). Only trusted when live container discovery confirms something is actually running on that host (`active_container != "None"`), so a stale record can't survive an out-of-band `docker rm` done outside the orchestrator. The three independent copies of "prefer the exact record, fall back to fuzzy match" this fix initially produced (one each in `_finalize_host_status`, `_compute_cluster_status_impl`, `_detect_live_model_topo_metrics`, each with subtly different gating) were consolidated into a single `_resolve_active_recipe()` helper in the same pass, once the duplication was noticed. `/api/status` now exposes `active_recipe_key`/`active_config_hash` per host; `index.html`'s `fetchStatus()` reads that directly instead of re-deriving it via string matching. Note: this entry's original in-memory-caching approach to `ACTIVE_DEPLOYMENT_STATE` was itself found broken and fixed separately — see #80.
 
 ### 76. `SessionTracker` Self-Deadlock — The Real Cause of the Multi-Hour Dashboard Freezes (V4.8.5)
 * **The Trap:** `SessionTracker.lock` was a plain `threading.Lock()`. `update()` holds this lock for its entire body, and when its periodic "flush while still active" condition fires (>1hr of sustained activity — true of essentially any real serving session), it calls `self._commit_session()`, which *also* acquires the same lock. A plain `Lock` cannot be re-acquired by the thread already holding it: permanent, deterministic, self-inflicted deadlock, with no recovery short of restarting the process. Since `get_cluster_status()` only ever keeps one `_STATUS_INFLIGHT` future in flight at a time (see #40), this single wedged thread froze *all* status polling indefinitely — the actual root cause of the dashboard-frozen-for-hours incidents on 2026-08-25, 08-27, and 08-28, pre-existing before any of this session's other fixes and misdiagnosed each time as something else (see #74, and the ruled-out SSH/thread-pool theories below). This is also why restarting the daemon only ever gave temporary relief: a fresh `SessionTracker` starts unlocked, then reliably deadlocks again roughly an hour into the next real session.
