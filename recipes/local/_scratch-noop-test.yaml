@@ -39,4 +39,14 @@ topologies:
     # weigh against it the way gemma-4-31b.yaml does, so it stays on.
     env_vars:
       - "VLLM_USE_V1=0"
-    vllm_args: ""
+    # Required to route _execute_deployment_impl()'s use_ray check onto the
+    # Ray-based launch path (ray start --head / --address=..., then a
+    # separate `vllm serve` exec on the head once Ray registers both
+    # nodes) instead of the --nnodes/--node-rank/--master-addr/--headless
+    # manual path. Omitting this was the actual cause of Task MD's first
+    # 2-node attempt crashing (AssertionError: collective_rpc should not
+    # be called on follower node, from vllm's multiproc_executor.py) --
+    # not a mods-mechanism defect. gemma-4-31b.yaml is this cluster's one
+    # other real, live-verified 2-node recipe, and it goes through this
+    # same Ray branch.
+    vllm_args: "--distributed-executor-backend ray"
