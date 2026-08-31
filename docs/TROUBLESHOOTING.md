@@ -68,6 +68,21 @@ do.
 in `env_vars` for any 2-node topology. See failure mode #1 below for why
 the alternative (`mp` backend) doesn't work across physical hosts.
 
+**Trap confirmed 2026-08-31 (Task MD):** this isn't only "don't
+deliberately choose the `mp` backend" — an *empty* `vllm_args` on a
+2-node recipe hits the identical failure silently. `_execute_deployment_
+impl()`'s `use_ray` check requires the literal tokens
+`--distributed-executor-backend` and `ray` to both already be present in
+`vllm_args`; if they're not — including simply never having set
+`vllm_args` on a hand-authored recipe — the code does not error and does
+not default to Ray. It silently falls through to the
+`--nnodes`/`--node-rank`/`--master-addr`/`--headless` path instead, which
+is exactly Incident #1's failure signature. Reproduced independently on a
+from-scratch `Qwen/Qwen3-0.6B` TP=2 recipe with `vllm_args: ""` — nothing
+DeepSeek- or Gemma-specific about the trigger. **Any new 2-node recipe
+must explicitly carry `--distributed-executor-backend ray` in
+`vllm_args`; there is no safe default to fall back on.**
+
 ### Speculative decoding / MTP (DSpark) config shape
 
 **Unconfirmed.** A `--speculative-config
@@ -204,6 +219,7 @@ VLLM_USE_V1=0 is a separate, unresolved case. vLLM recognises this variable (it 
 * **Failure:** `AssertionError: collective_rpc should not be called on follower node` or workers hanging post-NCCL initialization.
 * **Cause:** vLLM V1 `mp` (multiprocessing) backend relies on Linux shared memory (`/dev/shm`), which cannot cross physical network boundaries.
 * **Rule:** 2-node topologies across physical hosts MUST pass `--distributed-executor-backend ray` and set `VLLM_USE_V1=0` in `env_vars` to force the V0 cross-host Ray executor.
+* **Reproduced again, independently, 2026-08-31 (Task MD):** a from-scratch `_scratch-noop-test.yaml` (unrelated to whatever recipe originally triggered this incident) hit this exact signature purely from `vllm_args: ""` on `2_node`. The trigger doesn't have to be a deliberately wrong flag — an *absent* one is enough, since `use_ray` requires the Ray tokens to be explicitly present rather than defaulting to them if unset. See "Multi-node executor requirements" in the Recipe Tuning Reference above.
 
 ### 2. GB10 SwiGLU Clamp Validation Error
 * **Failure:** `ValueError` during initialization regarding `swiglu_limit=10.0` or missing MoE backends.
