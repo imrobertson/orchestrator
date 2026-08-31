@@ -90,12 +90,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
+
+# This script lives in tests/, one level below the repo root -- when invoked
+# as `python3 tests/smoke_test_gemma4_nvfp4.py`, Python puts tests/ on
+# sys.path[0], not the repo root, so `common` is not importable as-is
+# (dgx-orchestrator.py doesn't hit this because it lives at the repo root
+# itself). Mirrors common/config.py's own BASE_DIR resolution -- respects
+# the BASE_DIR env var docker-compose.yml sets (=/app in the orchestrator
+# container) and falls back to computing it from this file's own location
+# otherwise, rather than hardcoding /app.
+_REPO_ROOT = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent.parent))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from common.config import BASE_DIR, legacy_hosts_dict, load_cluster_config
 from common.constants import ContainerRole
