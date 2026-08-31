@@ -1,3 +1,32 @@
+> **Revision note 2 (session close-out):** Live hardware verification is
+> now done — real 1-node and real 2-node deploys of `gemma-4-31b`
+> (`mods: []`), both against the actual `spark-3`/`spark-4` cluster via
+> `cluster_config.yaml`. Both succeeded. The "Live hardware: None" claim
+> below is superseded by a new "Live hardware" section with the actual
+> results; the prior scripted-only verification stands unchanged above it.
+> Also folded in: `smoke_test_mc.py` gained `--secrets-file` (a real
+> `get_hf_token()` round-trip, added after an initial false alarm — see
+> below), a self-hash line printed at startup (to catch exactly the
+> stale-local-copy problem that caused the false alarm's confusion), and
+> `--cluster-config` auto-discovery was exercised against the real file.
+> Two things surfaced during live verification that are worth recording
+> even though neither is a defect in this task's code — see the two
+> callouts at the end of the new "Live hardware" section.
+
+> **Revision note 3 (session close-out, continued):** Corrects an error in
+> Revision note 2 / Contradictions item 6 below: `TOMBSTONES.md`'s `#82`
+> was reported as "missing from the file entirely." It wasn't — a
+> too-strict grep missed it because it was spliced onto the end of
+> `#83`'s entry with bad formatting, not actually absent. The person
+> caught this by grepping looser than I had. A second, worse splice (on
+> `#76`, zero separation, mid-word) was then found the same way an
+> exhaustive scan would have caught the first one. Both are now fixed,
+> along with the duplicate `#84`, directly in `TOMBSTONES.md` — delivered
+> this session as the corrected file itself, not a standalone addendum.
+> See the updated Contradictions item 6 for full detail, including the
+> one thing that could NOT be safely fixed (apparent lost content in
+> `#77`, flagged in-place rather than reconstructed).
+
 # Task MC — Deploy-path integration — Review
 
 > **Revision note (after initial delivery):** The person supplied the real
@@ -21,12 +50,11 @@
 
 ## Status
 
-**Complete.** Verified against a scripted/mocked transport only (no real
-hardware in this session — no live `spark-3`/`spark-4` SSH access was
-available). The two "real deploy" verification items in the task prompt
-(one live 1-node deploy, one live 2-node deploy of a known-good `mods: []`
-recipe) are **not yet done** and need to be run against the actual cluster
-before this is fully signed off per the task's own verification section.
+**Complete, verified live.** Every requirement in the task's own
+verification section has now been met: `--dry-run` byte-identical output
+(scripted, then confirmed against the real catalog), and one real 1-node
+deploy plus one real 2-node deploy of a known-good `mods: []` recipe,
+both against the actual cluster.
 
 ## What was built
 
@@ -187,14 +215,94 @@ coverage.
 
 ### Live hardware
 
-**None.** No SSH/Tailscale access to `spark-3`/`spark-4` was available in
-this session. The task's own verification section calls for "One real
-1-node deploy and one real 2-node deploy of a known-good recipe with no
-mods, confirming no behaviour change" — that has not been done. Given the
-scripted-harness result showing byte-identical `--dry-run` output and
-zero extra SSH traffic for `mods: []`, I'd expect these to pass cleanly,
-but that is a prediction, not a verification, and should not be treated
-as equivalent to the real thing.
+**Done, both real deploys succeeded.** Model: `gemma-4-31b`
+(`recipes/local/gemma-4-31b.yaml`, `mods: []`, `image:
+eugr/spark-vllm-b12x:latest` — a per-recipe image override, not the
+cluster's `default_image` of `nvcr.io/nvidia/vllm:26.07-py3`), against the
+real `spark-3`/`spark-4` pair via `cluster_config.yaml`.
+
+**`--dry-run` on the real catalog, both topologies** (run first, before
+touching any host): both responses had the recipe's own image override
+unchanged as the sole image argument, no `"mods"` key, and correct
+head/worker role assignment (`spark-4` → `vllm-head`, `spark-3` →
+`vllm-worker`, worker's `ray start --address=` pointing at spark-4's real
+`management_ip`) — matching `PRIMARY_HOST`/`SECONDARY_HOST` ordering
+derived from the real `cluster_config.yaml`'s `hosts:` block. This is the
+first time this task's dry-run path has been exercised against a real,
+in-production recipe with an image override, rather than a synthetic
+fixture — confirms `model_config.get("image", default_img)` correctly
+feeds the per-recipe override into mod resolution, not the cluster
+default.
+
+**Real 1-node deploy:** `python3 dgx-orchestrator.py deploy --model
+gemma-4-31b --nodes 1 --head spark-4 --wait` → `{"status": "success", ...}`.
+`curl http://10.0.14.43:8000/health` → `200`. `docker ps` on spark-4:
+`vllm-standalone`, image `eugr/spark-vllm-b12x:latest`, `Up`. Warmup took
+660s per the orchestrator's own log line, consistent with
+`TROUBLESHOOTING.md`'s validated single-node timing.
+
+**Real 2-node deploy** (teardown of the 1-node container happened
+automatically as part of this call, per `_execute_deployment_impl`'s
+existing teardown-before-deploy step — not something this task added):
+same command with `--nodes 2` → `{"status": "success", ...}`. Health
+check `200`. `docker ps` on **both** hosts confirmed: `vllm-head` on
+spark-4, `vllm-worker` on spark-3, both `eugr/spark-vllm-b12x:latest`,
+both `Up`. Warmup took 360s — faster than 1-node's 660s, consistent with
+TP=2 splitting the model load across both GPUs, not a red flag.
+
+**What this does NOT cover, even now:** only the success path was
+exercised live. A live resolution-failure abort, a live bake failure
+partway through a 2-node deploy, and a live mod-bearing recipe (this repo
+has none yet — every recipe still has `mods: []`, so there was nothing
+to bake against real hardware) all remain scripted-only, per the "no
+hardware" section above. "Live-verified" here means specifically: the
+exact two deploys the task's verification section asked for, on the
+exact recipe shape (`mods: []`) every current recipe has.
+
+**Two things surfaced during this live pass, neither a defect in this
+task's code, both worth recording:**
+
+1. **A caution I raised turned out to be based on incomplete
+   information, not a real risk.** Before the 2-node deploy, I flagged
+   that `gemma-4-31b.yaml`'s `2_node.env_vars` is missing `VLLM_USE_V1=0`,
+   which my summarized memory of this repo's history described as
+   required for all 2-node Ray topologies (Incident #1). The person chose
+   to run it anyway rather than add the variable first. It succeeded
+   cleanly. Only afterward did I have `TROUBLESHOOTING.md` in front of me,
+   which already documents this exact case: `VLLM_USE_V1=0` was tested on
+   this specific recipe/build, found to have "no observable effect" (the
+   engine still logged `Initializing a V1 LLM engine` with it set), and
+   was deliberately removed from `gemma-4-31b.yaml` for that reason —
+   while `TOMBSTONES.md`/Incident #1's general rule was explicitly *not*
+   deleted for other 2-node recipes on the strength of that one
+   observation ("moot rather than wrong... do not remove it from other
+   2-node recipes on the strength of this observation alone"). This
+   session's successful 2-node deploy is now a second real data point
+   supporting that "moot rather than wrong" conclusion, for whatever
+   that's worth toward eventually resolving it properly per
+   `TROUBLESHOOTING.md`'s own note that it "wants a deliberate A/B on a
+   2-node deploy" — this session's deploy wasn't run as a controlled A/B
+   (no comparison run WITH the variable set), so it adds a data point,
+   not a resolution. Recorded here rather than silently letting the
+   caution evaporate once it turned out to be moot, since a caution that
+   turns out wrong is exactly the kind of thing worth being explicit
+   about rather than quietly not mentioning again.
+
+2. **`--dry-run` output embeds the live `HF_TOKEN` in plaintext**, since
+   `docker_run_commands` is literally the argv `docker run` would receive,
+   including `-e HF_TOKEN=<value>`. This isn't new in this task — the
+   `-e HF_TOKEN=...` flag construction predates Task MC entirely — but it
+   became directly relevant during this session's live verification: a
+   real dry-run response, containing a real token, was pasted into this
+   conversation as part of confirming the dry-run output looked correct.
+   No code change was made for this (out of MC's scope, and not something
+   to fix reactively mid-review without discussing the right approach —
+   e.g. masking any `-e (HF_TOKEN|.*_TOKEN|.*_KEY)=` value before it's
+   ever added to a response dict, versus leaving `--dry-run` output
+   untouched but documenting that it must never be pasted anywhere
+   unredacted). Flagged here and in `TOMBSTONES.md` as a real operational
+   trap, not filed as a Task MC defect since the behavior predates this
+   task and wasn't introduced by it.
 
 ## Contradictions and things the plan didn't specify
 
@@ -293,6 +401,37 @@ as equivalent to the real thing.
    interleaved per-host bake-then-run, not a bake-all-then-run-all
    ordering).
 
+6. **`TOMBSTONES.md`'s numbering was found broken, independent of
+   anything this task did — and has since been repaired.** Once the real
+   file was uploaded (this session, for reconciling the earlier
+   addendum), an initial pass wrongly concluded `#82` was missing
+   entirely — it wasn't; a strict `^### 82\.` line-start grep simply
+   missed it because its header had stray leading whitespace and no
+   preceding blank line, having been spliced directly onto the end of
+   `#83`'s own entry. Retracting that "missing" claim explicitly rather
+   than letting it stand corrected only in a later revision's diff. A
+   second, worse instance of the same splice was then found on `#76`
+   (glued with **zero** separation onto `#77`'s last sentence, mid-word),
+   which an exhaustive scan (every `### N.` occurrence anywhere in the
+   raw text, not just at line-start) confirmed was the *only* other
+   instance — full range `27`-`84` was otherwise contiguous, with `#84`
+   genuinely duplicated across two different entries as the one real
+   numbering collision. All of this has now been fixed directly in
+   `TOMBSTONES.md` (delivered this session): the duplicate `#84` pair
+   renumbered to `85`/`84` (newest on top, per the file's own
+   convention), both splices given proper header separation, and this
+   task's new `#86` entry (the `--dry-run` secret exposure, see below)
+   added at the top. One real content-loss finding survived the cleanup
+   and could **not** be safely fixed: `#77`'s own Fix paragraph appears
+   to end mid-sentence exactly at the point `#76` was spliced in — *"...
+   the existing hand-written"* trails off with no continuation found
+   anywhere in the file. This is flagged in-place in the delivered file
+   (`[SENTENCE APPEARS TRUNCATED HERE]`) rather than reconstructed or
+   guessed at; if the original ending exists in git history, it should
+   be restored from there, not rewritten from memory. Full reconciliation
+   detail is in an HTML comment at the top of the delivered
+   `TOMBSTONES.md` itself.
+
 ## Scope check
 
 Nothing from the "note on scope" was built: no runtime mod *application*
@@ -300,15 +439,18 @@ beyond what MB already implemented (this task only wires MB's existing
 bake/resolve into the deploy path — it doesn't touch `run.sh` execution
 semantics), no `phase:` field, no mod distribution via a registry.
 
-**Only `dgx-orchestrator.py` was touched.** `common/mods.py`,
-`common/recipes.py`, and `common/ssh.py` (all supplied as attachments)
-are unmodified — confirmed via `diff` against the uploaded originals
-before writing this doc; all three diffs are empty. `TOMBSTONES.md` was
-**not** touched — it wasn't provided as an uploaded file, so a
-new-tombstone entry is included below in this review and as a separate
-`TOMBSTONE-ENTRY-83-ADDENDUM.md` file for you to merge into the real
-file, rather than my fabricating or guessing at the rest of that file's
-contents.
+**Only `dgx-orchestrator.py` was touched by Task MC's own implementation
+work.** `common/mods.py`, `common/recipes.py`, and `common/ssh.py` (all
+supplied as attachments) are unmodified — confirmed via `diff` against
+the uploaded originals before writing this doc; all three diffs are
+empty. `TOMBSTONES.md` **was** touched, but only in a later session
+close-out pass once the real file was uploaded, and only to: add this
+task's own `#86` entry, renumber a pre-existing duplicate `#84` (not this
+task's doing — see Contradictions item 6), and repair two malformed
+entries (`#82`, `#76`) that predate this task entirely. No content was
+added, removed, or reworded anywhere outside those specific fixes — see
+item 6 and the delivered file's own top-of-file reconciliation comment
+for the full account of what changed and why.
 
 The one item outside a literal reading of "wire it into
 `_execute_deployment_impl()`": adding the `mods` key to the `--dry-run`
@@ -317,15 +459,20 @@ the literal minimum. I judged it in-scope (it directly answers "report
 ... what would be baked") but am calling it out here per the review
 format's instruction to flag anything beyond a strict reading.
 
-**`smoke_test_mc.py`** (added in this revision, at the person's explicit
-request for a smoke test script) is a new deliverable, not a change to
-any of MA/MB/MC's existing files — it's a standalone verification tool
-that imports the delivered `dgx-orchestrator.py` plus a `common/` dir the
-person points it at. It is not part of the `_execute_deployment_impl()`
-integration itself and doesn't touch `TOMBSTONES.md`-worthy repo
-behavior on its own; noting it here only because "what changed" should
-include every file this revision added, not just code changes to the
-deploy path.
+**`smoke_test_mc.py`** (added in an earlier revision, at the person's
+explicit request for a smoke test script; substantially extended since —
+`--cluster-config`, `--secrets-file`, dynamic (not hardcoded) expected
+IPs/image, directory-vs-file argument handling, and a self-hash line — is
+a standalone verification tool, not a change to any of MA/MB/MC's
+existing files. It imports the delivered `dgx-orchestrator.py` plus a
+`common/` dir the person points it at. Not part of the
+`_execute_deployment_impl()` integration itself and doesn't touch
+`TOMBSTONES.md`-worthy repo behavior on its own; noting it here only
+because "what changed" should include every file this revision touched,
+not just code changes to the deploy path. `SMOKE-TEST-PLAYBOOK.md` (also
+delivered this session, separately) is process documentation about how
+to extend this script for future phases — not code, not part of the
+deploy path, included for the same "every file touched" reason.
 
 ## Changed files, in full
 

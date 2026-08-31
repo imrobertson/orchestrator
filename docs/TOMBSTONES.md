@@ -1,6 +1,62 @@
 # Control Plane Release Tombstones & Fix Log
 
-### 84. Two mod-set failure modes look identical but are not: resolution vs. bake (V?.?.?)
+<!--
+Reconciliation note (2026-08-31): this file had accumulated real
+inconsistencies from uncoordinated concurrent edits across sessions --
+fixed today, recorded here rather than silently:
+  - #84 was duplicated across two different entries. Resolved by
+    renumbering the topmost (newest) of the pair to #85 -- no entry
+    below it was renumbered or reordered.
+  - #82 and #76 both existed but were spliced into the END of the
+    entry above them with no blank-line separator (#76's splice had
+    literally zero separation -- glued mid-word onto the preceding
+    entry's last sentence). Both are now properly delimited as their
+    own top-level entries; no content was added, removed, or
+    reworded.
+  - #77's own Fix paragraph appears to have lost its ending at the
+    exact point #76 was spliced in -- the sentence "...the existing
+    hand-written" trails off mid-thought with no continuation found
+    anywhere in the file. This looks like real content loss, not a
+    formatting artifact. It has NOT been reconstructed or guessed at
+    here -- see the inline `[SENTENCE APPEARS TRUNCATED HERE]` marker
+    in #77's entry below. If the original ending exists in git
+    history or another copy of this file, it should be restored from
+    there, not rewritten from memory.
+  - #86 below is new, added today (Task MC's live-hardware
+    verification session).
+  - Full numbering 27-86 is otherwise contiguous with no other gaps
+    or duplicates, confirmed by an exhaustive scan of every "### N."
+    occurrence in the raw file (not just line-start matches, since
+    that's exactly what let #76 hide undetected as long as it did).
+-->
+
+### 86. `--dry-run` output embeds live secrets in plaintext (V?.?.?)
+
+* **The Trap:** `docker_run_commands` in a `--dry-run` response is the
+  literal argv `docker run` would receive, including every `-e
+  KEY=value` flag — which means it includes `-e HF_TOKEN=<real token>`
+  whenever `get_hf_token()` finds one. `--dry-run` reads as "nothing real
+  happens," which makes it feel safe to paste the output anywhere: a bug
+  report, a chat, a log line, a Slack message asking "does this look
+  right." It doesn't occur to most people that a command whose entire
+  point is "don't execute anything" can still leak a live credential in
+  its own output. This isn't a bug introduced by Task MC — the `-e
+  HF_TOKEN=...` construction predates it — but it became a real incident
+  during Task MC's own live-hardware verification, when a real dry-run
+  response containing a real token was pasted into a conversation as
+  part of confirming the output looked correct.
+* **The Fix:** None applied yet. Worth deciding deliberately rather than
+  patched reactively: either mask any `-e (HF_TOKEN|.*_TOKEN|.*_KEY)=...`
+  value before it's ever added to a response dict (so `--dry-run`,
+  `docker_run_commands`, and any future JSON/log surface stay safe to
+  paste anywhere), or leave the raw output as-is but make it loudly
+  documented that dry-run output must be treated as sensitive and never
+  pasted unredacted. The masking approach is probably right long-term,
+  but touches the same code path real deploys use to build `env_flags`,
+  so it wants its own small task and review, not a patch bolted onto an
+  unrelated one.
+
+### 85. Two mod-set failure modes look identical but are not: resolution vs. bake (V?.?.?)
 
 * **The Trap:** `common/mods.py` (Task MB) exposes two distinct exception
   types for what looks, from the call site, like one kind of failure:
@@ -114,7 +170,8 @@
   "obviously safe" format string; the trigger is a single internal space,
   which arbitrary Go template format strings, `bash -c` one-liners, or any
   argument containing a shell metacharacter can carry without warning.
-  ### 82. Silent HF Token Failures in get_hf_token() (common/ssh.py)
+
+### 82. Silent HF Token Failures in get_hf_token() (common/ssh.py)
 * **Symptom:** vLLM 401'd against a gated/private HF repo with zero
   indication a token was ever the issue — the container launched with no
   HF_TOKEN set, no warning at deploy time. Surfaced during a Gemma 4
@@ -170,7 +227,9 @@
 
 ### 77. Dashboard Model-Select Dropdown Silently Showed the Wrong Deployed Recipe (V4.8.6)
 * **The Trap:** The dashboard (and `SESSION_TRACKER`'s lifetime-token attribution, and the ledger auto-detect CLI's `_detect_live_model_topo_metrics()`) all resolved "which recipe is currently running" the same way: fuzzy-matching the served checkpoint's display name (`active_model`, e.g. `"DeepSeek-V4-Flash-0731"`) against catalog keys and `hf_path`s via `_resolve_catalog_key()`. Two recipes serving the identical checkpoint under materially different configs — `deepseek-v4-flash-0731-1M` and `deepseek-v4-flash-0731-dspark-sm120` both report the same served name — collide under that match by construction, so the code silently took whichever catalog entry it happened to iterate to first, independent of which recipe was actually deployed. Reported symptom: the model-select dropdown kept snapping back to `-1M` regardless of what was actually launched. Same ambiguity also risked misattributing lifetime prompt/generation token counts to the wrong recipe's `model_ledger.json` entry, silently — a data-correctness bug, not just a UI one.
-* **The Fix:** Added `ACTIVE_DEPLOYMENT_STATE`, a disk-backed (`active_deployment_state.json`) per-host record of `{catalog_key, topo_key, config_hash}`, written by `execute_deployment()` at the exact moment it knows what it launched — reusing the same `config_hash` already computed for `PENDING_LAUNCH_STATE` (see #76's launch-success tracking), not a new hashing mechanism. Cleared per-host on teardown (unconditionally, same "always resets" reasoning as `TEARDOWN_STATE`), and loaded into memory once at daemon startup so it survives a restart — memory-only was considered and rejected, since that would silently reintroduce the exact ambiguous-guessing failure mode after every restart. Only trusted when live container discovery confirms something is actually running on that host (`active_container != "None"`), so a stale record can't survive an out-of-band `docker rm` done outside the orchestrator. The three independent copies of "prefer the exact record, fall back to fuzzy match" this fix initially produced (one each in `_finalize_host_status`, `_compute_cluster_status_impl`, `_detect_live_model_topo_metrics`, each with subtly different gating) were consolidated into a single `_resolve_active_recipe()` helper in the same pass, once the duplication was noticed. `/api/status` now exposes `active_recipe_key`/`active_config_hash` per host; `index.html`'s `fetchStatus()` reads that directly instead of re-deriving it via string matching. Also added a git-commit-hash suffix (+ `-dirty` flag) to `ORCHESTRATOR_VERSION`, computed once at daemon startup — the existing hand-written### 76. `SessionTracker` Self-Deadlock — The Real Cause of the Multi-Hour Dashboard Freezes (V4.8.5)
+* **The Fix:** Added `ACTIVE_DEPLOYMENT_STATE`, a disk-backed (`active_deployment_state.json`) per-host record of `{catalog_key, topo_key, config_hash}`, written by `execute_deployment()` at the exact moment it knows what it launched — reusing the same `config_hash` already computed for `PENDING_LAUNCH_STATE` (see #76's launch-success tracking), not a new hashing mechanism. Cleared per-host on teardown (unconditionally, same "always resets" reasoning as `TEARDOWN_STATE`), and loaded into memory once at daemon startup so it survives a restart — memory-only was considered and rejected, since that would silently reintroduce the exact ambiguous-guessing failure mode after every restart. Only trusted when live container discovery confirms something is actually running on that host (`active_container != "None"`), so a stale record can't survive an out-of-band `docker rm` done outside the orchestrator. The three independent copies of "prefer the exact record, fall back to fuzzy match" this fix initially produced (one each in `_finalize_host_status`, `_compute_cluster_status_impl`, `_detect_live_model_topo_metrics`, each with subtly different gating) were consolidated into a single `_resolve_active_recipe()` helper in the same pass, once the duplication was noticed. `/api/status` now exposes `active_recipe_key`/`active_config_hash` per host; `index.html`'s `fetchStatus()` reads that directly instead of re-deriving it via string matching. Also added a git-commit-hash suffix (+ `-dirty` flag) to `ORCHESTRATOR_VERSION`, computed once at daemon startup — the existing hand-written [SENTENCE APPEARS TRUNCATED HERE — see Tombstone reconciliation note at top of this file, 2026-08-31]
+
+### 76. `SessionTracker` Self-Deadlock — The Real Cause of the Multi-Hour Dashboard Freezes (V4.8.5)
 * **The Trap:** `SessionTracker.lock` was a plain `threading.Lock()`. `update()` holds this lock for its entire body, and when its periodic "flush while still active" condition fires (>1hr of sustained activity — true of essentially any real serving session), it calls `self._commit_session()`, which *also* acquires the same lock. A plain `Lock` cannot be re-acquired by the thread already holding it: permanent, deterministic, self-inflicted deadlock, with no recovery short of restarting the process. Since `get_cluster_status()` only ever keeps one `_STATUS_INFLIGHT` future in flight at a time (see #40), this single wedged thread froze *all* status polling indefinitely — the actual root cause of the dashboard-frozen-for-hours incidents on 2026-08-25, 08-27, and 08-28, pre-existing before any of this session's other fixes and misdiagnosed each time as something else (see #74, and the ruled-out SSH/thread-pool theories below). This is also why restarting the daemon only ever gave temporary relief: a fresh `SessionTracker` starts unlocked, then reliably deadlocks again roughly an hour into the next real session.
 * **The Fix:** `threading.Lock()` → `threading.RLock()` — reentrant-safe for the same-thread re-acquire case, no change to cross-thread contention semantics. Found via a live `py-spy dump` against the actually-wedged production process, not inferred — the stack trace showed the exact `_commit_session` → `update` → `_compute_cluster_status_impl` chain, blocked. Proven with a reproduction of the real production call sequence: confirmed the original `Lock()` deadlocks within 5s every time, and `RLock()` completes and flushes correctly every time. Two theories investigated and ruled out along the way, kept here so they aren't re-walked: SSH subprocess-level hangs in `run_ssh()` (its `subprocess.run(..., timeout=...)` reliably kills its child and returns within its own timeout, even against a detached grandchild holding stdout/stderr open); and naive `WORKER_POOL` backlog growth from serial polling (tested over 150s against a deliberately slow host — the pool self-limits, backlog stabilizes). A third, `WORKER_POOL` starvation from a stuck teardown, is real (see #70) but bounded to roughly 5 minutes worst-case, not hours — a genuine but secondary bug, not this one.
 
