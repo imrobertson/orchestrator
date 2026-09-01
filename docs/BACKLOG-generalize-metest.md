@@ -1,5 +1,12 @@
 # BACKLOG: Generalize tests/metest.py into a reusable tuning harness
 
+**STATUS: DONE (2026-09-01).** Landed in two passes -- see "Resolution"
+below for what actually shipped, where it deviated from the shape
+sketched here, and what's still explicitly out of scope. This document
+is kept as the historical record of the original ask; treat the
+Resolution section as authoritative over the rest of the file where they
+disagree.
+
 **Priority:** MEDIUM-HIGH -- not urgent, but the DSpark/DeepSeek-V4-Flash
 backlog item (BACKLOG-dspark-sm120-image.md, HIGH) is the next natural
 consumer of this, so doing the generalization now pays for itself almost
@@ -100,3 +107,63 @@ layer only, not a rewrite of anything that's already been debugged.
   decision risks introducing a bug into results someone's about to act
   on. Do it as its own dedicated pass once the current comparison is
   settled.
+
+## Resolution (2026-09-01)
+
+Landed in two dedicated passes, both after the Gemma 4 MTP-vs-DFlash
+prompt sweep this backlog item was explicitly deferred behind actually
+settled (Task ME closed out same day, `ME-REVIEW.md` written) -- the
+sequencing constraint above was honored, not skipped.
+
+**Pass 1 -- the STAGE_SPECS refactor, as sketched above.** Replaced
+`run_stage1()`/`run_dflash_stage()` with a `STAGE_SPECS` data table plus
+one `run_stage()` that branches on `uses_recipe_path`, exactly the shape
+proposed in this document. Verified via a standalone before/after
+construction-diff harness (recipe YAML for the recipe-path stages,
+`docker_cmd` argv for the raw-docker stage) rather than a visual
+read-through -- all three original stages' construction matched the
+pre-refactor code byte-for-byte / argv-for-argv.
+
+**Pass 2 -- generalized well past the original sketch, then renamed.**
+The proposed shape above assumed `--stage` would become an arbitrary
+*named config* selecting into a fixed table. What actually shipped goes
+further: each side (`--variant-a`/`--variant-b`) auto-detects into one of
+four shapes -- a `KNOWN_PRESETS` bundle (the original three Gemma4
+stages, preserved), an **existing catalog recipe deployed exactly as-is**
+(no scratch file at all, full mods pipeline, shares its `historical_tps`
+ledger entry with a normal dashboard deploy -- not something the original
+sketch anticipated), that same preset/recipe with specific fields
+overridden on top, or a fully ad-hoc / raw-docker-run variant. `--stage`
+is gone; `--variant-a`/`--variant-b` (optional independently, so a single
+recipe can be profiled alone or two compared head-to-head) replaced it.
+The script was renamed `tests/metest.py` -> `tests/ab_test.py` to match
+what it actually does now.
+
+This pass also caught a real regression via the same before/after
+construction-diff verification method Pass 1 established: generalizing
+the `dflash` preset into a reusable builder silently reordered several
+`docker run` flags (functionally inert, but not the byte-for-byte parity
+the verification standard requires) -- caught by the diff harness before
+it ever reached real hardware, not by review. See `TOMBSTONES.md` #90.
+
+**What's still explicitly NOT done, deliberately:**
+- No DeepSeek-V4-Flash / DSpark `STAGE_SPECS`/`KNOWN_PRESETS` entry --
+  same reasoning as this document's original "Explicitly NOT in scope"
+  section: that model's tuned recipe values aren't finalized. It's now
+  the natural next real user of `--variant-a`/`--variant-b` (as either
+  an existing catalog recipe once one exists, or an ad-hoc variant via
+  `--a-hf-path`/`--a-vllm-args` in the meantime) rather than a hardcoded
+  preset -- no further generalization work is needed to support it.
+- No live-hardware run of the generalized tool yet -- verification so far
+  is construction-layer only (argv/YAML diffing against stubs), per this
+  document's own "Explicitly NOT in scope" list not extending to
+  re-verifying already-proven pieces, but a real run against the cluster
+  is still worth doing before trusting a comparison's numbers.
+- 2-node support exists only for the pure named-recipe-passthrough path
+  (forwarded straight to the real CLI's own topology handling); ad-hoc
+  scratch recipes and the raw-docker path remain 1-node-only, same as
+  before this generalization.
+
+See `tests/AB_TEST_USAGE.md` for the full usage reference, and
+`USERMANUAL.md` / `UsageShortcut.md` for where this is now cross-linked
+from the cluster's main docs.

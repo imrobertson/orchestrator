@@ -36,6 +36,54 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 90. Generalizing `tests/metest.py`'s Gemma4 presets into `tests/ab_test.py` silently reordered `dflash`'s docker serve-args — caught only by explicit argv diffing, not review (V?.?.?)
+
+* **The Trap:** Refactoring `run_dflash_stage()`'s hardcoded raw-docker
+  build into a reusable "preset" (a static partial argv list + an
+  `.append()` of the host/port/max-model-len/gpu-util flags, tacked on
+  once those values were known) produced a `docker run` command with the
+  exact same set of flags and values as the pre-refactor version, just in
+  a different order (`--host`/`--port`/`--max-model-len`/
+  `--gpu-memory-utilization` moved from their original interleaved
+  positions to the very end of the argv list). This is functionally
+  inert for vLLM's own argparse-based CLI — flag order among independent
+  flags doesn't change behavior — but it is a real, silent deviation from
+  the previous construction, and would have read as a clean pass under
+  visual review or under a looser "does it still deploy successfully"
+  smoke test, since a live deploy with reordered-but-otherwise-identical
+  flags works fine either way. Only surfaced because the generalization
+  was checked against a dedicated before/after construction-diff harness
+  (build the argv both the old, hardcoded way and the new,
+  preset-plus-override way, for identical inputs, and assert list
+  equality) rather than eyeballing the refactored code or trusting that
+  it ran without error. Same root lesson as #88 (a construction-layer
+  change that "looks" behavior-preserving needs to actually be checked
+  byte-for-byte / argv-for-argv, not reasoned about) and the same script
+  lineage as #87/#88 — this file's earlier entries for it were written
+  under its prior names, `tests/smoke_test_gemma4_nvfp4.py` (#87) and
+  `tests/metest.py` (#88); the script has since been generalized from a
+  fixed 3-stage Gemma4 smoke test into a general two-sided recipe A/B rig
+  and renamed to `tests/ab_test.py`.
+* **The Fix:** Converted the static partial-list-plus-append pattern into
+  a closure (`build_serve_args(port, max_model_len, gpu_util)`) that
+  places every flag at its exact original argv position, called once the
+  final values are resolved, rather than appending anything after the
+  fact. Verified via a standalone harness that reconstructs the OLD
+  inline construction logic (recipe YAML generation for the recipe-path
+  presets, `docker_cmd` list for the raw-docker preset) and diffs it
+  against the NEW `KNOWN_PRESETS`/`resolve_variant()`-driven construction
+  for identical inputs — the harness caught this exact ordering
+  regression on its first run, before it ever reached real hardware, and
+  passes clean (31/31 checks, including full CLI-argument-parsing
+  wiring, not just the construction functions in isolation) after the
+  fix. General rule going forward for this file's own generalize-a-
+  hardcoded-script work: a refactor that claims to preserve behavior
+  needs an explicit before/after diff of the actual constructed
+  artifact (recipe YAML, docker argv, etc.) as its verification step,
+  not a visual read-through or "it still runs" — see #88's `yaml.safe_load()`
+  round-trip for the same principle applied to a different construction
+  layer.
+
 ### 89. `eugr/spark-vllm-b12x`'s forked `Gemma4Proposer` breaks MTP speculative decoding — mainline vLLM doesn't (V?.?.?)
 
 * **The Trap:** Deploying Gemma 4 26B-A4B NVFP4 with native MTP

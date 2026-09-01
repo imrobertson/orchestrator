@@ -151,6 +151,38 @@ dgx-config deploy --model qwen-2.5-coder-32b --nodes 1 --wait --benchmark
 </syntaxhighlight>
 Results (time-to-first-token, decode tokens/sec) are written to <code>benchmark_results.txt</code> and appended to <code>benchmark_ledger.csv</code> for historical comparison across runs.
 
+== A/B Testing & Recipe Comparison (<code>tests/ab_test.py</code>) ==
+
+For comparing two model/engine variants head-to-head — or just profiling
+one recipe end-to-end — run <code>tests/ab_test.py</code> instead of a
+one-off manual deploy/benchmark/teardown cycle. It handles the whole
+sequence itself: deploy, health-check (with a stabilization re-check, not
+just the first <code>/health</code> response), a boot-log scan, a
+benchmark sweep across one or more prompt presets, then teardown —
+automatically, for one or two variants in a row, with the full container
+log and run transcript saved to <code>tests/logs/</code> regardless of
+whether the run passes or fails.
+
+<syntaxhighlight lang="bash">
+python3 tests/ab_test.py --variant-a gemma4-26b-a4b-nvfp4 --variant-b deepseek-v4-flash-0731-nvfp4 --prompts all
+</syntaxhighlight>
+
+Each <code>--variant-a</code>/<code>--variant-b</code> can be an existing
+catalog recipe (deployed exactly as it exists on disk — no scratch file,
+full mods pipeline, shares that recipe's throughput ledger history with
+a normal dashboard deploy), that same recipe with specific fields
+overridden, a fully from-scratch ad-hoc configuration, or a raw
+<code>docker run</code> for an image whose default entrypoint isn't the
+stock vLLM API server. <code>--variant-b</code> is optional — give only
+<code>--variant-a</code> to profile a single recipe on its own.
+
+'''Full flag reference and worked examples for every mode:''' see
+<code>tests/AB_TEST_USAGE.md</code>. This section is deliberately just
+the pointer — that document covers the override flags, the built-in
+Gemma4 comparison presets, the prompt-preset sweep, and the entrypoint
+constraint (a structural limit of the deploy path itself, not something
+this tool works around) in full.
+
 == Model Catalog & Capabilities ==
 
 Use the CLI keys in the table below with the <code>--model</code> flag, or select them from the Web Dashboard.

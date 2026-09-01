@@ -58,6 +58,14 @@ python3 benchmark.py
 
 All runs are automatically appended to `benchmark_ledger.csv` with precise Time-To-First-Token (TTFT) and Decode speed metrics. The tool is hardened against vLLM Multi-Token Prediction (MTP) stream buffering to ensure mathematical accuracy.
 
+== A/B Testing Two Recipes ==
+
+Skip the manual deploy/benchmark/teardown cycle — `tests/ab_test.py` does the whole thing for one or two variants automatically, logs everything regardless of pass/fail, and prints a side-by-side comparison if you gave it two:
+
+python3 tests/ab_test.py --variant-a recipe-one --variant-b recipe-two --prompts all
+
+Either side can be an existing recipe name, an existing recipe with fields overridden, or a fully ad-hoc config — see `tests/AB_TEST_USAGE.md` for the full reference. One thing worth knowing up front: an image with a non-default entrypoint (needs `--a-entrypoint`) can't go through mods, and can't use `--a-nodes 2` — that's a structural limit of the deploy path, not a flag you're missing.
+
 == If something looks wrong ==
 
 * '''Model dropdown totally empty''' (not just missing one model): a single malformed recipe file can currently break the whole catalog, not just itself. Worth flagging rather than assuming it's just slow to load — see `USERMANUAL.md`'s Troubleshooting section.
