@@ -436,6 +436,90 @@
     let teardownMessage = '';
     let isDeploying = false;
 
+    // ---- ETA monotonic clamp -------------------------------------------
+    //
+    // The backend re-derives its ETA from scratch on every 4s poll, keyed
+    // off whichever log line detect_model_stage() saw most recently. Those
+    // keyword buckets interleave in real vLLM startup logs ("kernel" and
+    // "compiling" for COMPILING, "kv cache" / "capturing" for WARMUP), so
+    // the phase label -- and with it the baseline estimate -- flips back
+    // and forth mid-load. Rendering info.eta_display verbatim meant the
+    // user watched the number jump backwards and forwards every 4s.
+    //
+    // This does NOT try to fix the backend estimate. It only enforces the
+    // one property a countdown must have to be readable: it never goes up.
+    // Each poll takes min(server estimate, our own projection), so a poll
+    // may only ever pull the number DOWN, and a 1s ticker interpolates
+    // between polls so it counts rather than stepping in 4s jumps.
+    //
+    // Known gap, deliberately left in: monotonicity holds only WITHIN one
+    // countdown. When the estimate is exhausted (eta_seconds hits 0) the
+    // clamp releases and the server's own text shows verbatim -- "Ready",
+    // "Finishing startup (+Ns over est.)", a crash string. If the backend
+    // then reports a fresh large estimate (phase flipped back to
+    // DOWNLOADING, say), a new countdown starts and the number does step
+    // up once. That is the honest option: the alternative is pinning at
+    // "Finishing startup" for the rest of a load that may genuinely have
+    // thousands of seconds left, and this ledger has recorded loads over
+    // 14000s. The backend estimate is what needs fixing there, not the
+    // display. State is keyed on container+model and resets on change.
+    const ETA_CLAMP = {};
+
+    function etaClampUpdate(host, info) {
+        const identity = `${info.container_name || 'None'}|${info.active_model || 'None'}`;
+        const serverEta = Number(info.eta_seconds) || 0;
+        const display = info.eta_display || 'N/A';
+
+        let st = ETA_CLAMP[host];
+        if (!st || st.identity !== identity) {
+            st = ETA_CLAMP[host] = { identity: identity, floor: null, anchorMs: 0, noHistory: false };
+        }
+
+        // serverEta of 0 covers Ready / N/A / CRASHED / overrun. Release the
+        // clamp and let the backend string speak for itself.
+        if (serverEta <= 0) {
+            st.floor = null;
+            return display;
+        }
+
+        const now = Date.now();
+        const projected = st.floor === null
+            ? Infinity
+            : st.floor - (now - st.anchorMs) / 1000;
+        const next = Math.min(serverEta, projected);
+
+        if (next <= 0) {
+            st.floor = null;
+            return display;
+        }
+
+        st.floor = next;
+        st.anchorMs = now;
+        // Preserve the backend's own "no history" qualifier rather than
+        // re-deriving it -- has_history lives server-side.
+        st.noHistory = /no historic data|no history/i.test(display);
+        return etaClampRender(st) || display;
+    }
+
+    function etaClampRender(st) {
+        if (!st || st.floor === null) return null;
+        const secs = Math.ceil(Math.max(0, st.floor - (Date.now() - st.anchorMs) / 1000));
+        if (secs <= 0) return null;
+        return `~${secs}s remaining${st.noHistory ? ' (Initial run - no history)' : ''}`;
+    }
+
+    // Between polls, tick the rendered value down in place. Host cards are
+    // rebuilt wholesale by fetchStatus(), so target by data-host rather than
+    // holding element references across renders.
+    function tickEtaDisplays() {
+        document.querySelectorAll('.eta-val[data-host]').forEach(function (el) {
+            const st = ETA_CLAMP[el.dataset.host];
+            const text = etaClampRender(st);
+            if (text !== null && el.textContent !== text) el.textContent = text;
+        });
+    }
+    // ---- end ETA monotonic clamp ---------------------------------------
+
     function stripAnsiCodes(str) {
         return str.replace(/[\u001b\u009b]\[[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqv-y]/g, '');
     }
@@ -724,7 +808,7 @@
                         <div class="metric-row"><span>Container:</span><span class="metric-val">${runtimeDisplay}</span></div>
                         <div class="metric-row"><span>Loaded Model:</span><span class="metric-val">${info.active_model || 'None'}</span></div>
                         <div class="metric-row"><span>Model Status:</span><span class="metric-val">${modelBadge}</span></div>
-                        <div class="metric-row"><span>ETA:</span><span class="metric-val">${info.eta_display || 'N/A'}</span></div>
+                        <div class="metric-row"><span>ETA:</span><span class="metric-val eta-val" data-host="${host}">${etaClampUpdate(host, info)}</span></div>
                         <div class="telemetry-ticker">${telemetryHtml}</div>
                     </div>
                 `;
@@ -1178,6 +1262,10 @@
     setInterval(fetchCatalog, 15000);
     setInterval(fetchStatus, 4000);
     setInterval(fetchLogs, 5000);
+    // Interpolates the clamped ETA between the 4s status polls. Purely
+    // cosmetic -- it reads ETA_CLAMP state written by fetchStatus() and
+    // never issues a request of its own.
+    setInterval(tickEtaDisplays, 1000);
 </script>
 </body>
 </html>

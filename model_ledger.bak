@@ -1,0 +1,575 @@
+{
+  "deepseek-v4-flash-0731-nvfp4::2_node": {
+    "cached": [
+      649
+    ],
+    "compiled": [
+      2515,
+      3108,
+      361,
+      848,
+      323,
+      1332,
+      1509,
+      1803,
+      318,
+      1715,
+      1732,
+      504,
+      323,
+      630,
+      548,
+      1966,
+      551
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 19730,
+      "out": 6456,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "5d46cd519afaefcf": {
+        "last_success_ts": 1787864880.3730989,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 20834.0,
+      "g": 6506.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "deepseek-v4-flash-0731::2_node": {
+    "cached": [
+      329
+    ],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    }
+  },
+  "DeepSeek-V4-Flash-0731::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 380,
+      "out": 1502,
+      "draft": 0,
+      "accepted": 0
+    }
+  },
+  "qwen-3.8-27b-nvfp4-sqk2::1_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [
+      257,
+      252,
+      240
+    ],
+    "lifetime": {
+      "in": 70966,
+      "out": 4109,
+      "draft": 5970,
+      "accepted": 2917
+    },
+    "launch_history": {
+      "f36a9874bd3200b6": {
+        "last_success_ts": 1787949108.951646,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 201.0,
+      "g": 768.0,
+      "d": 1395.0,
+      "a": 486.0
+    }
+  },
+  "Qwen3.8-27B-NVFP4::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 134,
+      "out": 701,
+      "draft": 1385,
+      "accepted": 428
+    }
+  },
+  "deepseek-v4-flash-0731-1M::2_node": {
+    "cached": [
+      369,
+      348
+    ],
+    "compiled": [
+      320,
+      323,
+      322,
+      321,
+      391,
+      344,
+      2408
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 28968651,
+      "out": 734251,
+      "draft": 1360,
+      "accepted": 444
+    },
+    "launch_history": {
+      "9fbab327cfe89b7f": {
+        "last_success_ts": 1787862779.245586,
+        "count": 2
+      }
+    },
+    "last_seen_raw": {
+      "p": 285.0,
+      "g": 768.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "nemotron-3.5-lightning-bf16::1_node": {
+    "cached": [
+      597,
+      611
+    ],
+    "compiled": [
+      571,
+      674,
+      1017,
+      3001
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "65c268515202a4f7": {
+        "last_success_ts": 1787946737.4961932,
+        "count": 1
+      }
+    }
+  },
+  "nemotron-3.5-lightning-bf16::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 62,
+      "out": 720,
+      "draft": 0,
+      "accepted": 0
+    },
+    "last_seen_raw": {
+      "p": 93.0,
+      "g": 768.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "deepseek-v4-flash-0731-dspark::2_node": {
+    "cached": [
+      444,
+      407,
+      408
+    ],
+    "compiled": [
+      376,
+      372,
+      377,
+      378,
+      1689,
+      387,
+      377,
+      376,
+      379,
+      374
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 16909969,
+      "out": 284894,
+      "draft": 408580,
+      "accepted": 203130
+    },
+    "launch_history": {
+      "16ec6382d9cec64a": {
+        "last_success_ts": 1788232896.214062,
+        "count": 9
+      }
+    },
+    "last_seen_raw": {
+      "p": 16902828.0,
+      "g": 280731.0,
+      "d": 401695.0,
+      "a": 200333.0
+    }
+  },
+  "qwen-3.5-122b::2_node": {
+    "cached": [],
+    "compiled": [
+      694
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 50,
+      "out": 767,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "6a820af15bf1d9a0": {
+        "last_success_ts": 1787957805.1614602,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 75.0,
+      "g": 768.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "deepseek-v4-flash-0731-dspark-sm120::2_node": {
+    "cached": [],
+    "compiled": [
+      443
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 128,
+      "out": 2197,
+      "draft": 3635,
+      "accepted": 1477
+    },
+    "launch_history": {
+      "16ec6382d9cec64a": {
+        "last_success_ts": 1788019575.5054107,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 144.0,
+      "g": 2304.0,
+      "d": 3780.0,
+      "a": 1554.0
+    }
+  },
+  "deepseek-v4-flash-0731-dspark-gb10-hazyumps-512k::2_node": {
+    "cached": [],
+    "compiled": [
+      378,
+      1565
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 32,
+      "out": 652,
+      "draft": 1030,
+      "accepted": 445
+    },
+    "launch_history": {
+      "2f2ef39818c621fb": {
+        "last_success_ts": 1788022008.0567236,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 48.0,
+      "g": 768.0,
+      "d": 1195.0,
+      "a": 527.0
+    }
+  },
+  "deepseek-v4-flash-0731-dspark-512k::2_node": {
+    "cached": [],
+    "compiled": [
+      370
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 80,
+      "out": 1436,
+      "draft": 2435,
+      "accepted": 945
+    },
+    "launch_history": {
+      "2f2ef39818c621fb": {
+        "last_success_ts": 1788024446.8589604,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 96.0,
+      "g": 1536.0,
+      "d": 2590.0,
+      "a": 1013.0
+    }
+  },
+  "deepseek-r1-distill-qwen-32b::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [
+      383
+    ],
+    "lifetime": {
+      "in": 140,
+      "out": 2282,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "38f0f26a2f9f8ee9": {
+        "last_success_ts": 1788040561.4575694,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 60.0,
+      "g": 768.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "gemma-4-31b::2_node": {
+    "cached": [
+      483
+    ],
+    "compiled": [],
+    "downloaded": [
+      462,
+      14276,
+      440
+    ],
+    "lifetime": {
+      "in": 189,
+      "out": 2263,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "1aa3998ca1b9284f": {
+        "last_success_ts": 1788043253.4343674,
+        "count": 1
+      },
+      "43c05c6b6fd72d32": {
+        "last_success_ts": 1788115324.1242445,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 81.0,
+      "g": 768.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "gemma-4-31b::1_node": {
+    "cached": [
+      701,
+      731
+    ],
+    "compiled": [],
+    "downloaded": [
+      681,
+      992,
+      701,
+      653
+    ],
+    "lifetime": {
+      "in": 189,
+      "out": 2274,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "ce408f0888fbf505": {
+        "last_success_ts": 1788061439.346177,
+        "count": 2
+      }
+    },
+    "last_seen_raw": {
+      "p": 81.0,
+      "g": 750.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "_m0_probe::1_node": {
+    "cached": [
+      656
+    ],
+    "compiled": [],
+    "downloaded": [
+      630
+    ],
+    "lifetime": {
+      "in": 54,
+      "out": 744,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "ee98442c1275ddbd": {
+        "last_success_ts": 1788104051.5090942,
+        "count": 1
+      }
+    },
+    "last_seen_raw": {
+      "p": 81.0,
+      "g": 768.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "deepseek-r1-distill-qwen-32b::1_node": {
+    "cached": [],
+    "compiled": [
+      591
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    }
+  },
+  "_scratch-noop-test::1_node": {
+    "cached": [
+      163,
+      71
+    ],
+    "compiled": [],
+    "downloaded": [
+      140,
+      45,
+      623
+    ],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    }
+  },
+  "_scratch-noop-test::2_node": {
+    "cached": [
+      243,
+      189
+    ],
+    "compiled": [],
+    "downloaded": [
+      218,
+      138
+    ],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    }
+  },
+  "_scratch-gemma4-nvfp4-baseline::1_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [
+      370,
+      262,
+      267
+    ],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    }
+  },
+  "_scratch-gemma4-nvfp4-baseline::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 54,
+      "out": 496,
+      "draft": 0,
+      "accepted": 0
+    },
+    "last_seen_raw": {
+      "p": 81.0,
+      "g": 669.0,
+      "d": 0.0,
+      "a": 0.0
+    }
+  },
+  "Active Container::1_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [
+      484,
+      377,
+      366,
+      396,
+      292,
+      295,
+      286,
+      281,
+      296,
+      301,
+      304
+    ],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    }
+  },
+  "_scratch-gemma4-nvfp4-mtp::1_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [
+      282,
+      262,
+      309,
+      282,
+      256,
+      283,
+      254,
+      250,
+      252,
+      248,
+      281,
+      259,
+      279,
+      281,
+      257,
+      276
+    ],
+    "lifetime": {
+      "in": 766,
+      "out": 2218,
+      "draft": 7374,
+      "accepted": 1539
+    },
+    "last_seen_raw": {
+      "p": 807.0,
+      "g": 2442.0,
+      "d": 7540.0,
+      "a": 1679.0
+    }
+  }
+}

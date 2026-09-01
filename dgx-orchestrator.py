@@ -32,6 +32,7 @@ import re
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -1215,6 +1216,39 @@ def _record_launch_success(model: str, topo_key: str, config_hash: str):
     _write_json_state(LEDGER_PATH, data)
 
 def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached") -> tuple[int, bool]:
+    """Estimated seconds-to-ready for (model, topo_key) in `load_type`, plus
+    whether that estimate came from recorded history or a hardcoded default.
+
+    Uses the MEDIAN of recorded samples, not the mean. Every phase list in
+    this ledger that has more than two samples follows the same shape: a
+    tight cluster of warm runs plus exactly one cold run an order of
+    magnitude longer. Concretely, at the time this changed:
+
+        deepseek-v4-flash-0731-1M::2_node compiled
+            [320, 321, 322, 323, 344, 391, 2408]   mean 632  median 323
+        deepseek-v4-flash-0731-dspark::2_node compiled
+            [372..387 x9, 1689]                    mean 508  median 377
+        gemma-4-31b::2_node downloaded
+            [440, 462, 14276]                      mean 5059 median 462
+
+    One cold run permanently inflating every subsequent estimate by 2-11x
+    is worse than ignoring it: the countdown parks on a number the load
+    will never approach, which reads as a stalled dashboard. The median
+    tracks "what this usually takes" and one anomalous sample cannot move
+    it.
+
+    Known limits, neither of which median fixes:
+      - The high sample is often NOT noise -- it is the genuine first-JIT
+        run, filed into the same bucket as the warm reruns because
+        record_load_time() classifies by substring-scanning `docker logs
+        --tail 5000` at READY. So a genuinely cold first deploy will now
+        underestimate and land in "Finishing startup (+Ns over est.)".
+        That is the honest failure direction, but the real fix is discrete
+        per-phase timestamps, not a different average.
+      - No recency weighting. A config change that legitimately shifts
+        load time takes ceil(n/2) runs to move the median. The phase lists
+        are not keyed by config_hash the way launch_history is.
+    """
     default_ests = {"cached": 180, "compiled": 1500, "downloaded": 4500}
     default_est = default_ests.get(load_type, 180)
     
@@ -1228,8 +1262,14 @@ def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached"
     key_data = data.get(f"{model}::{topo_key}", {})
     if isinstance(key_data, dict):
         times = key_data.get(load_type, [])
-        if times:
-            return int(sum(times) / len(times)), True
+        # Guard the list shape as well as its truthiness -- this file is
+        # hand-editable (see ledger_set_lifetime()'s CLI command) and a
+        # malformed entry must degrade to the default, not raise inside a
+        # status poll.
+        if times and isinstance(times, list):
+            numeric = [t for t in times if isinstance(t, (int, float))]
+            if numeric:
+                return int(statistics.median(numeric)), True
     return default_est, False
 
 def get_vllm_metrics(head_ip: str = PRIMARY_HOST_IP, port: int = 8000) -> dict:
