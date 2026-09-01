@@ -1,7 +1,7 @@
 recipe_version: '1'
 hf_path: Inferact/Muse-Glimmer-30B-NVFP4-W4A4
 image: eugr/spark-vllm-b12x:latest
-gpu_util: 0.70
+gpu_util: 0.75
 capability:
   task: null
   context_class: null
@@ -14,8 +14,9 @@ topologies:
     pp_size: 1
     env_vars:
     - OMP_NUM_THREADS=16
-    - VLLM_CPU_OMP_THREADS=16
     vllm_args: >-
       --trust-remote-code --kv-cache-dtype fp8 --enable-chunked-prefill 
-      --enable-auto-tool-choice --tool-call-parser hermes 
-      --compilation-config '{"mode": 0}' --max-num-seqs 8
+      --enable-auto-tool-choice --tool-call-parser muse_glimmer 
+      --reasoning-parser muse_glimmer --generation-config auto 
+      --attention-backend FLASH_ATTN --compilation-config '{"mode": 0}' 
+      --max-num-seqs 8
