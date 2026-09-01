@@ -36,6 +36,113 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 89. `eugr/spark-vllm-b12x`'s forked `Gemma4Proposer` breaks MTP speculative decoding — mainline vLLM doesn't (V?.?.?)
+
+* **The Trap:** Deploying Gemma 4 26B-A4B NVFP4 with native MTP
+  speculative decoding on this cluster's usual image
+  (`eugr/spark-vllm-b12x:latest`) boots cleanly — model loads, MTP draft
+  layers map correctly, `/health` passes — then crashes on the very
+  first real generation request with:
+  `TypeError: Gemma4Proposer._greedy_sample() takes 2 positional
+  arguments but 3 were given`. Confirmed via a captured full traceback,
+  not a guess: `llm_base_proposer.py`'s generic `_sample_draft_tokens()`
+  calls `self._greedy_sample(hidden_states, spec_step_idx)`, but this
+  fork's `Gemma4Proposer` override was never updated to accept the
+  `spec_step_idx` parameter the base proposer class gained when it added
+  multi-step draft support. The crash never surfaces during the synthetic
+  CUDA-graph-capture warmup — only on a genuine request — which is why
+  `/health` passing gives false confidence here. `-b12x` is a genuinely
+  different vLLM lineage from this cluster's other image
+  (`eugr/spark-vllm:latest`, mainline-tracking) — built from
+  [lukealonso's fork](https://github.com/lukealonso/b12x) for custom
+  SM120 MoE/dense kernels, with its own separate tag history (version
+  strings like `0.1.dev20003+g...` rather than `0.26.x`-style mainline
+  versions are the tell). Two false leads investigated and ruled out
+  before landing on this: (1) the vLLM build being stale — re-tested
+  against `-b12x`'s own historical pinned tag with the identical result,
+  so it isn't a regression from a newer pull; (2) forcing
+  `VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass` — this image's own
+  `envs.py` reports it as an unrecognized variable, and a sibling AEON
+  model's own docs suggest the auto-selected `VLLM_CUTLASS` MoE backend
+  is the *intended* default anyway, not something to correct.
+* **The Fix:** Use `eugr/spark-vllm:latest` (mainline) for MTP
+  deployments of this model, not `-b12x`. Confirmed working across 8
+  live runs (`num_speculative_tokens` 2 and 4, 4 runs each): clean
+  boot, no crash, ~50-53 tok/s single-stream. `-b12x`'s own MoE-kernel
+  speedup is real and worth keeping for models/workloads that don't need
+  MTP — this is specific to the MTP proposer path, not a blanket
+  "don't use -b12x" finding. Landed in
+  `recipes/local/gemma4-26b-a4b-nvfp4.yaml`, which pins `image:
+  eugr/spark-vllm:latest` with an explicit comment naming this bug so a
+  future edit doesn't "helpfully" swap back to this cluster's usual
+  image and reintroduce the crash.
+
+### 88. YAML double-quoted scalars silently break on `vllm_args` containing embedded JSON — use a block scalar instead (tests/metest.py)
+
+* **The Trap:** `tests/metest.py`'s scratch-recipe generator wrapped
+  `vllm_args` in a YAML double-quoted string
+  (`vllm_args: "{vllm_args}"`). This works fine for a plain flag string,
+  but the moment `vllm_args` contains a `--speculative-config` value —
+  itself a JSON object, which uses double quotes internally — the YAML
+  parser terminates the string at the FIRST embedded `"` and the rest of
+  the line becomes a syntax error. The resulting recipe file failed to
+  load into the catalog, and the failure surfaced as `Model '...' not
+  defined in catalog` — nothing in that error message points at a YAML
+  syntax problem, let alone which file or which character. Confirmed via
+  a direct `yaml.safe_load()` repro
+  (`expected <block end>, but found '<scalar>'`) before shipping the fix,
+  not inferred from the symptom alone. Same underlying class of trap as
+  #42/#28 (YAML scalar handling for `vllm_args` — comment pollution in a
+  folded scalar, in those cases), different specific mechanism (embedded
+  quote characters, not embedded `#` comments).
+* **The Fix:** Write `vllm_args` as a YAML block scalar (`>-`) instead of
+  a quoted flow scalar — block scalars have no quote-delimiter for
+  embedded content to collide with, so arbitrary JSON, single quotes, or
+  other YAML-special characters inside the value are never a problem
+  regardless of what they contain. Verified via a real `yaml.safe_load()`
+  round-trip (recovers the exact original string byte-for-byte) and
+  `shlex.split()` (produces the correct argv) against both the simple
+  case (no embedded quotes) and the JSON-`--speculative-config` case,
+  not just reasoned about. `>-` was already this codebase's own
+  established convention for `vllm_args` per #42 — the double-quoted
+  version was the actual anomaly, not a reasonable default that happened
+  to hit an edge case.
+
+### 87. `tests/` scripts can't import `common.*` without adding the repo root to `sys.path` themselves (tests/smoke_test_gemma4_nvfp4.py)
+
+* **The Trap:** A script living in `tests/` (or any subdirectory other than
+  the repo root) that does `from common.X import ...` fails immediately
+  with `ModuleNotFoundError: No module named 'common'` when invoked
+  directly — confirmed live on the first real run of
+  `tests/smoke_test_gemma4_nvfp4.py`:
+  `docker exec -it dgx-orchestrator-api python3 tests/smoke_test_gemma4_nvfp4.py`.
+  Python puts the *script's own directory* (`tests/`) on `sys.path[0]`,
+  not the repo root — `common/` lives one level up and is simply never on
+  the path. `dgx-orchestrator.py` never hits this because it lives at the
+  repo root itself, which is exactly what made the failure mode easy to
+  miss when writing a new script under `tests/` with the same import
+  style. Same root shape as #83 (a `tests/` script quietly diverging from
+  an assumption that only holds for code at the repo root), different
+  specific mechanism.
+* **The Fix:** Resolve the repo root via the `BASE_DIR` env var
+  (`docker-compose.yml` sets `BASE_DIR=/app` in the orchestrator
+  container) with a fallback to `Path(__file__).resolve().parent.parent`,
+  and `sys.path.insert(0, ...)` it before any `common` import:
+
+  ```python
+  import os, sys
+  from pathlib import Path
+  _REPO_ROOT = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent.parent))
+  if str(_REPO_ROOT) not in sys.path:
+      sys.path.insert(0, str(_REPO_ROOT))
+  ```
+
+  General rule going forward: any new script placed anywhere other than
+  the repo root that needs `common.*` needs this shim before its first
+  `from common...` import — copying `dgx-orchestrator.py`'s bare import
+  block into a script that doesn't share its location isn't safe by
+  default.
+
 ### 86. `--dry-run` output embeds live secrets in plaintext (V?.?.?)
 
 * **The Trap:** `docker_run_commands` in a `--dry-run` response is the
