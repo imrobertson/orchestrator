@@ -2182,6 +2182,30 @@ def _resolve_active_recipe(host: str, catalog_models: dict, loaded_model: str,
         return deployment["catalog_key"], deployment.get("config_hash"), True
     return _resolve_catalog_key(loaded_model, catalog_models), None, False
 
+def _config_hash_for(model: str, topo_key: str) -> Optional[str]:
+    """
+    Best-effort config_hash for a running model, for attaching to a run-log
+    archive. Returns None rather than raising for anything that isn't a
+    live catalog recipe -- `model` here is whatever _resolve_active_recipe()
+    settled on, which may be a raw HF basename or the "Active Container"
+    placeholder, and neither has a recipe to hash. A null config_hash in an
+    archive is honest ("we could not identify the config"); a wrong one
+    would be worse than none.
+
+    Mirrors the lookup at _execute_deployment_impl()'s
+    ACTIVE_DEPLOYMENT_STATE write, deliberately: both must agree on what
+    hash a given (model, topo_key) has, or the archive won't join to
+    launch_history.
+    """
+    try:
+        recipe = load_recipes().get(model)
+        if recipe is None or topo_key not in recipe.topologies:
+            return None
+        return compute_config_hash(recipe, topo_key)
+    except Exception:
+        return None
+
+
 def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool, container_info: dict, serving_host: str, catalog_models: dict) -> tuple:
     ip = meta["ip"]
     user = None
@@ -2242,6 +2266,7 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                     model_key=matched_key, topo_key=topo_key,
                     started_ts=crash_start_ts, outcome="crashed",
                     elapsed_sec=int(time.time() - crash_start_ts),
+                    config_hash=_config_hash_for(matched_key, topo_key),
                 )
     elif active_container == ContainerRole.WORKER and head_crashed:
         model_status = "ORPHANED (HEAD CRASHED)"
@@ -2285,6 +2310,7 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                         model_key=matched_key, topo_key=topo_key,
                         started_ts=start_ts, outcome="ready",
                         load_type=load_type, elapsed_sec=elapsed,
+                        config_hash=_config_hash_for(matched_key, topo_key),
                     )
         elif cluster_ready:
             model_status = "READY"
