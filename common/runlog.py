@@ -257,6 +257,7 @@ def archive_run_log(
     config_hash: Optional[str] = None,
     load_type: Optional[str] = None,
     elapsed_sec: Optional[int] = None,
+    inductor_cache_disabled: Optional[bool] = None,
 ) -> Optional[dict]:
     """
     Capture one container's full logs plus image provenance.
@@ -264,6 +265,11 @@ def archive_run_log(
     `outcome` is free-form but should be one of "ready" / "crashed" -- a
     crashed load is frequently the more informative sample, so this is
     deliberately not restricted to successful loads.
+
+    `inductor_cache_disabled`: passed straight through to extract_phases()
+    -- see common/phase_extract.py's "COMPILE CONFIDENCE, REFINED" module
+    docstring section. This function has no opinion on it; the caller
+    (dgx-orchestrator.py) is the one holding the recipe.
 
     Returns the manifest entry, or None if the capture did not happen (for
     any reason, including "already archived"). Callers must not depend on
@@ -345,7 +351,9 @@ def archive_run_log(
         # recognize this log's shape" vs. "some other extractor bug" --
         # since the first is expected on a new stack and the second isn't.
         try:
-            entry["phases"] = extract_phases(cleaned).to_ledger_dict()
+            entry["phases"] = extract_phases(
+                cleaned, inductor_cache_disabled=inductor_cache_disabled
+            ).to_ledger_dict()
             entry["phase_extraction_error"] = None
         except UnrecognizedLogShape as exc:
             entry["phases"] = None

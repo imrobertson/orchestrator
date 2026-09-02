@@ -50,6 +50,39 @@ stack rather than guessing, and a totally unrecognized log (no loader
 markers of any kind matched) raises UnrecognizedLogShape rather than
 returning an empty/zero-filled result that looks like real data.
 
+COMPILE MAGNITUDE: NOT A THRESHOLD, A CACHE-STATE QUESTION
+
+The original open question here was "how big does a reported compile_sec
+need to be before it counts as a genuine cold compile rather than a
+trivial per-launch recompile?" Two real archives on 2-node topologies
+that disable TORCHINDUCTOR_FX_GRAPH_CACHE / TORCHINDUCTOR_AUTOGRAD_CACHE
+(gemma-4-31b::2_node, 78.32s; llama-4-fp8::2_node, 31.78s) settle this
+differently than a magnitude cutoff would: with that cache off, there is
+no persistent artifact to hit, so ANY reported compile_sec on those
+launches is a genuine from-scratch compile by construction -- no
+threshold needed to tell it apart from a cache hit, because a cache hit
+is structurally impossible. The tiny values seen elsewhere (nemotron
+0.17s, qwen-r1-distill 0.31s) are on 1-node recipes that don't disable
+that cache, so they're plausibly real cache hits from a prior launch of
+the same shape, not evidence that compile is "trivial" for those models.
+
+This can't be detected from the log text itself -- checked directly: a
+torch-inductor "standalone_compile artifact generation failed, cannot
+save" warning appears in the gemma-4-31b archive (consistent with a
+disabled cache) but is ABSENT from the llama-4-fp8 archive despite that
+recipe disabling the same env vars, so it's a different cache path
+inside torch inductor and not a generalizable signal. The only reliable
+source for this is the deploying recipe's own env_vars, which this
+module never sees -- it only gets raw log text. extract_phases() and
+extract_phases_from_archive() take an optional `inductor_cache_disabled`
+argument for a caller that knows the recipe to pass through; when
+omitted, this module says so explicitly via
+compile_stage_confidence="reported_cache_state_unknown" rather than
+guessing either way. Wiring the actual recipe env_vars through from
+dgx-orchestrator.py's deploy path down to runlog.archive_run_log's call
+into extract_phases() is a separate, small follow-up -- this module's
+side of the contract is ready for it now.
+
 NOT YET VALIDATED: COLD COMPILE
 
 All 4 real archives collected so far are warm starts (280-375s total).
@@ -89,6 +122,33 @@ gad848fc41.d20260815 -- the same build as the gemma-4-31b archive).
 Whether other stacks phrase or even self-report this line at all is
 unconfirmed; absence is handled the same way compile_sec's absence is
 -- a `download_confidence` field, not a silent zero.
+
+COMPILE CONFIDENCE, REFINED: CACHE-DISABLED RECIPES ARE STRUCTURALLY COLD
+
+Two real "reported" compile_sec samples now exist: gemma-4-31b::2_node
+(78.32s) and llama-4-fp8::2_node (31.78s), against much smaller values
+on 1-node recipes (nemotron 0.17s, deepseek-r1-distill-qwen-32b 0.31s).
+The gap isn't necessarily "cold vs warm JIT" -- it's that both 2-node
+recipes set TORCHINDUCTOR_FX_GRAPH_CACHE=0 / TORCHINDUCTOR_AUTOGRAD_CACHE=0
+in env_vars, deliberately disabling vLLM/Inductor's persistent compile
+cache, while the 1-node recipes with tiny reported values do not. A
+recipe that disables the cache genuinely cannot serve a cache hit --
+every reported value under that config is a real per-launch compile by
+construction, regardless of magnitude. A recipe that leaves the cache
+enabled might report a tiny number because it genuinely compiled fast,
+or because a prior launch of the same shape already warmed the on-disk
+cache -- this module has no way to tell those apart from the log alone.
+
+This env var lives in the recipe's env_vars, not anywhere in the log
+text itself (confirmed: grepped for TORCHINDUCTOR/FX_GRAPH_CACHE across
+every real archive collected so far, zero hits) -- so extract_phases()
+cannot infer it from the archive. The caller must supply it, since the
+caller (dgx-orchestrator.py) is the one holding the recipe at archive
+time. `inductor_cache_disabled: Optional[bool]` is an explicit input
+to extract_phases() for exactly this reason: None means "caller didn't
+tell us" and preserves the old "reported"/"absent_known_stack" values
+unchanged, so this is additive, not a breaking change to existing
+callers or existing ledger data.
 
 MULTI-RANK AGGREGATION (2-NODE / TP>1)
 
@@ -256,7 +316,13 @@ class PhaseResult:
     download_confidence: str             # "reported" | "absent_known_stack" | "absent_unknown"
     compile_sec: Optional[float]         # AUTHORITATIVE where present; None means the
                                           # stack doesn't self-report it, NOT zero compile time
-    compile_stage_confidence: str        # "reported" | "absent_known_stack" | "absent_unknown"
+    compile_stage_confidence: str        # "reported_no_cache" | "reported_cache_possible" |
+                                          # "reported_cache_state_unknown" | "absent_known_stack"
+                                          # -- see module docstring "COMPILE MAGNITUDE" section.
+                                          # The three "reported_*" values all mean compile_sec is
+                                          # a real self-reported number; they differ only in
+                                          # whether the caller told this module if the recipe's
+                                          # inductor cache was disabled for this launch.
     engine_init_sec: Optional[float]     # AUTHORITATIVE
     rank_count: int
     by_rank: dict                        # rank_id -> RankTiming, for load-imbalance inspection
@@ -307,10 +373,16 @@ def _parse_lines(text: str):
         yield (ts - first).total_seconds(), m.group(2)
 
 
-def extract_phases(log_text: str) -> PhaseResult:
+def extract_phases(log_text: str, inductor_cache_disabled: Optional[bool] = None) -> PhaseResult:
     """
     Parse one archive's full log text (already merge-sorted -- see
     common.runlog._merge_streams_by_timestamp) into a PhaseResult.
+
+    `inductor_cache_disabled`: whether the deploying recipe's env_vars
+    disabled TORCHINDUCTOR_FX_GRAPH_CACHE for this launch. Not derivable
+    from the log itself -- see module docstring "COMPILE CONFIDENCE,
+    REFINED". None (the default) means the caller doesn't know or didn't
+    pass it; existing callers need no changes.
 
     Raises UnrecognizedLogShape if no loader marker is found at all.
     """
@@ -432,7 +504,12 @@ def extract_phases(log_text: str) -> PhaseResult:
                                if rt.engine_init_compile_sec is not None]
     if per_rank_compile or per_rank_engine_compile:
         compile_sec = max(per_rank_compile + per_rank_engine_compile)
-        confidence = "reported"
+        if inductor_cache_disabled is True:
+            confidence = "reported_no_cache"
+        elif inductor_cache_disabled is False:
+            confidence = "reported_cache_possible"
+        else:
+            confidence = "reported_cache_state_unknown"
     else:
         # Absent is only meaningful once we've established this is a real,
         # recognized log (saw_any_marker is True by this point) -- so this
@@ -468,7 +545,7 @@ def extract_phases(log_text: str) -> PhaseResult:
     )
 
 
-def extract_phases_from_archive(path: Path) -> PhaseResult:
+def extract_phases_from_archive(path: Path, inductor_cache_disabled: Optional[bool] = None) -> PhaseResult:
     """Convenience wrapper: decompress a run_logs/*.log.gz and parse it."""
     with gzip.open(path, "rt") as handle:
-        return extract_phases(handle.read())
+        return extract_phases(handle.read(), inductor_cache_disabled=inductor_cache_disabled)

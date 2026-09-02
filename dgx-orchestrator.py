@@ -2361,6 +2361,30 @@ def record_run_phases(model: str, topo_key: str, archive_entry: Optional[dict]) 
         pass
 
 
+def _inductor_cache_disabled_for(model: str, topo_key: str) -> Optional[bool]:
+    """
+    Whether this recipe's env_vars for this topology disable
+    TORCHINDUCTOR_FX_GRAPH_CACHE -- see common/phase_extract.py's
+    "COMPILE CONFIDENCE, REFINED" module docstring section for why this
+    matters: it's the difference between a self-reported compile_sec
+    being a genuine per-launch compile versus a possible cache hit, and
+    that module has no way to see env_vars itself.
+
+    Same defensive shape as _config_hash_for() immediately above, same
+    reason: `model` may not resolve to a live catalog recipe, and a wrong
+    answer here (mislabeling a real compile as "cache possible" or vice
+    versa) is worse than admitting we don't know via None.
+    """
+    try:
+        recipe = load_recipes().get(model)
+        if recipe is None or topo_key not in recipe.topologies:
+            return None
+        env_vars = recipe.topologies[topo_key].env_vars
+        return "TORCHINDUCTOR_FX_GRAPH_CACHE=0" in env_vars
+    except Exception:
+        return None
+
+
 def _config_hash_for(model: str, topo_key: str) -> Optional[str]:
     """
     Best-effort config_hash for a running model, for attaching to a run-log
@@ -2446,6 +2470,7 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                     started_ts=crash_start_ts, outcome="crashed",
                     elapsed_sec=int(time.time() - crash_start_ts),
                     config_hash=_config_hash_for(matched_key, topo_key),
+                    inductor_cache_disabled=_inductor_cache_disabled_for(matched_key, topo_key),
                 )
                 # New capability, not a replacement of anything: crashes
                 # never populated the old cached/compiled/downloaded
@@ -2518,6 +2543,7 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                         started_ts=start_ts, outcome="ready",
                         load_type=load_type, elapsed_sec=elapsed,
                         config_hash=_config_hash_for(matched_key, topo_key),
+                        inductor_cache_disabled=_inductor_cache_disabled_for(matched_key, topo_key),
                     )
                     record_run_phases(matched_key, topo_key, archive_entry)
         elif cluster_ready:
