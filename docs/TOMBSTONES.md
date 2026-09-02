@@ -36,6 +36,236 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 96. `eta_seconds` was computed, latched, shipped in every `/api/status` payload, and never rendered — the dashboard had been showing the raw re-derived string all along (V?.?.?)
+
+* **The Trap:** The reported symptom was an ETA that "violently snaps
+  backwards" mid-load, and the obvious reading was that the backend
+  estimate was wrong. It is wrong, but that was not why the number
+  bounced on screen. `_finalize_host_status()` computes both an
+  `eta_seconds` integer and an `eta_display` string, and ships both.
+  `index.html` read `info.eta_display` and nothing else — one line, line
+  727 — so the numeric field that every server-side smoothing attempt
+  was aimed at had no consumer at all. Every four seconds the dashboard
+  simply re-rendered whatever string the backend had most recently
+  derived from `detect_model_stage()`, which scans `reversed(lines)` and
+  returns on the first keyword match from the bottom. Those buckets
+  interleave constantly in real vLLM startup logs — `"kernel"` puts it in
+  COMPILING, `"kv cache"` and `"capturing"` put it in WARMUP — so the
+  phase label, and with it the baseline estimate, flips back and forth
+  many times during a single load. A proposed server-side "phase
+  latching" patch would have partially addressed this, and would have
+  been invisible on screen regardless, because nothing rendered the field
+  it wrote to. Worth noting the latch also would not have covered the
+  common case: it only fires once `elapsed` exceeds the shorter cached
+  baseline, so a phase flip at elapsed=100s against a 180s baseline
+  leaves the displayed remaining dropping from ~1400s to ~80s with the
+  latch never triggering.
+* **The Fix:** Client-side monotonic clamp in `index.html`, no backend
+  change. Each poll takes `min(server estimate, own projection)` so a
+  poll may only ever pull the number down, and a 1s ticker interpolates
+  between the 4s polls so it counts rather than stepping. State keys on
+  `container_name|active_model` and resets when either changes.
+  Verified by extracting the clamp block verbatim from the shipped file
+  and replaying poll sequences under a faked clock — the early-flip case
+  above renders 100s→80s, 120s→60s, 160s→20s with zero monotonicity
+  violations, where the raw server string would have gone 80→1380→1340.
+  Two things stated plainly rather than papered over. First,
+  monotonicity holds WITHIN a countdown, not across a whole load: when
+  `eta_seconds` reaches 0 the clamp releases and the server's own text
+  shows verbatim, so a fresh large estimate does step up once. Pinning at
+  zero was considered and rejected — it would mean no ETA for the
+  remainder of a load that may genuinely have thousands of seconds left,
+  and this ledger has a recorded 14276s. Second, this is cosmetic. At
+  elapsed=160s in that trace the dashboard reads ~20s while the backend
+  believes 1340s. The display is now smooth and wrong rather than jumpy
+  and wrong; only #95 and per-phase timing make the estimate itself
+  better.
+
+### 95. Averaging a phase bucket that contains exactly one cold-JIT run parked the ETA on a number the load would never approach (V?.?.?)
+
+* **The Trap:** `get_estimated_load_time()` returned
+  `int(sum(times) / len(times))` over the recorded samples for
+  `model::topo`. Every multi-sample series in `model_ledger.json` turns
+  out to have the same shape — a tight cluster of warm runs plus exactly
+  one run an order of magnitude longer:
+  `deepseek-v4-flash-0731-1M::2_node` compiled
+  `[320, 321, 322, 323, 344, 391, 2408]`;
+  `deepseek-v4-flash-0731-dspark::2_node` compiled
+  `[372..387 ×9, 1689]`; `gemma-4-31b::2_node` downloaded
+  `[440, 462, 14276]`. The mean is dragged 2–11× above the value the
+  next run will actually take (632 vs 323, 508 vs 377, 5059 vs 462), so
+  the countdown sits on a figure the load never approaches and reads as a
+  stalled dashboard. Two things made this hard to see. The high sample is
+  never the oldest entry — `record_load_time()` appends and trims
+  `[-20:]`, so list order is chronological, and in `-1M` and `nemotron`
+  the cold run is the NEWEST, which defeats the natural "first boot then
+  warm" reading. And the cold run is not noise: it is the genuine
+  first-JIT compile, filed into the same bucket as the warm reruns
+  because classification is a substring scan of `docker logs --tail 5000`
+  performed once at READY. The buckets are whole-run totals labelled by
+  whichever keyword survived the tail window, not phase durations.
+* **The Fix:** `statistics.median(numeric)` instead of the mean, plus a
+  shape guard on the list itself — the ledger is hand-editable via
+  `ledger_set_lifetime()`, and a malformed entry must degrade to the
+  hardcoded default rather than raise inside a 4s status poll. 8 of 20
+  series changed; `gemma-4-31b::2_node` downloaded went 5059 → 462.
+  Stated explicitly rather than sold as a clean win: median does not
+  remove noise, it selects the warm-run population and discards the cold
+  one. A genuinely cold first deploy will now UNDERestimate and land in
+  "Finishing startup (+Ns over est.)". That is the better failure
+  direction — an overrun message is honest, a countdown parked at 5059s
+  is not — but it is a real behaviour change.
+  `deepseek-v4-flash-0731-nvfp4::2_node` is the weakest case: its 17
+  samples run 318→3108 fairly continuously, so median 848 sits
+  mid-spread and neither statistic describes the series. Median is a
+  holding action. The actual defect is that the buckets conflate cold and
+  warm runs, which only discrete per-phase timestamps separate — see #93
+  for the archive that makes reconstructing them possible.
+
+### 94. Redacting `authorization: <value>` with `\S+` absorbed the word "Bearer" and archived the credential (V?.?.?)
+
+* **The Trap:** `common/runlog.py` redacts secrets before anything
+  touches disk, since run-log archives are meant to be kept indefinitely
+  and shared while investigating a load, and this codebase has already
+  leaked a token once (`--dry-run` rendered `HF_TOKEN` in plaintext in an
+  API response). The generic key/value rule was
+  `(authorization|api[_-]?key|token|secret|password)(\s*[=:]\s*)(\S+)`.
+  Against `authorization: Bearer sk-topsecretvalue` the `\S+` group
+  matches `Bearer` — so the substitution replaced the scheme name,
+  produced `authorization: ***REDACTED***`, and wrote the actual
+  credential to the archive immediately after it. The output looks
+  *more* redacted than an untouched line, which is what makes it
+  dangerous: a visual scan of the archive shows a redaction marker
+  exactly where the secret is. This is the standard shape of an HTTP
+  Authorization header, so it is the likeliest form for a real leak to
+  take, not an edge case.
+* **The Fix:** Optional `(?:bearer\s+)?` group between the separator and
+  the captured value, so the scheme is consumed and the credential is
+  what gets replaced. Caught by a test asserting the specific secret
+  string is absent from the decompressed archive, rather than asserting
+  that a redaction marker is present — the latter would have passed.
+  General rule: a redaction test must assert the SECRET IS GONE, never
+  that the marker appeared. And redaction here remains a regex pass, not
+  a guarantee: it covers `hf_*`, `gh*_*`, and `key: value` shapes, and a
+  secret in an unrecognised format still lands in the archive.
+
+### 93. A failed `docker logs` was archived as though it were the container's log, because stdout and stderr are concatenated unconditionally (V?.?.?)
+
+* **The Trap:** Every existing reader in `dgx-orchestrator.py` does
+  `log_res.stdout + log_res.stderr` — correctly, because a container's
+  own stderr arrives on the stderr channel and dropping it would lose
+  most of vLLM's output. `common/runlog.py`'s archive path copied that
+  idiom. But on a *failed* invocation the same concatenation captures the
+  SSH/docker error message instead, and the emptiness check
+  (`if not raw.strip()`) passes, because an error message is not empty.
+  The result is a gzipped archive that exists, appears in `index.json`
+  with a plausible manifest entry, and contains nothing but the failure
+  text. In the harness this produced a 61-byte `.log.gz` holding the
+  string `boom`. Nothing downstream would flag it: it has a valid
+  `run_id`, real image provenance, and a nonzero size. It would simply be
+  a run whose logs "don't say anything useful" — indistinguishable from a
+  quiet load, and only noticed much later when someone tried to
+  reconstruct phase boundaries from it.
+* **The Fix:** Check `log_res.returncode != 0` and return `None` before
+  touching the concatenation — archive nothing rather than something
+  false. Surfaced by a test that deliberately failed the `docker logs`
+  call and asserted the function returns `None`, rather than asserting it
+  "doesn't crash"; the pre-fix version did not crash, it succeeded
+  wrongly. The wider rule for this module: `archive_run_log()` is
+  best-effort and swallows its own failures, which makes "returned
+  something" a much weaker signal than it looks — every failure path
+  needs an explicit assertion about WHAT it returned, not just that it
+  survived.
+
+### 92. `vllm_args` was hashed as a raw string, so a trailing newline from a YAML block-scalar edit silently reverted a validated recipe to untested (V?.?.?)
+
+* **The Trap:** `compute_config_hash()` sorted `env_vars` before hashing
+  — explicitly, so that reordering entries would not invalidate tested
+  status — but passed `vllm_args` through as the raw string. Its
+  docstring acknowledged flag reordering as a known simplification
+  ("fine unless flags get reordered without changing them in practice")
+  and missed the case that actually bites: whitespace. Measured against
+  the live payload, all of these launch identically and hash
+  differently:
+  `"--max-model-len 8192 --gpu-memory-utilization 0.9"` →
+  `900aba72892d8030`;
+  the same two flags reversed → `9e2b7868d633cbfc`;
+  `"--max-model-len 8192 --trust-remote-code"` → `df5c83140a73ea07`;
+  with a doubled space → `84e5bba7dda6ac15`; with a trailing newline →
+  `fe4ff081a038f4e5`. Recipes write this field as a YAML `>-` folded
+  scalar, so reflowing the block, or an editor appending a newline, is
+  enough to orphan the recipe's entire launch history with no change to
+  what gets launched.
+* **The Fix:** `_canonicalize_vllm_args()` — `shlex.split()`, group into
+  flag→value pairs, sort. Three deliberate bail-outs to the raw string,
+  each trading a possible false "untested" for never a false
+  "validated": unparseable input (unbalanced quotes must not raise out
+  of `load_recipes()` and empty the whole catalog over one malformed
+  recipe); a flag appearing more than once (argparse is last-wins, so
+  `--max-model-len 8192 --max-model-len 4096` and its reverse genuinely
+  differ and sorting would merge them); and any token not starting with
+  `--`, kept positional and unsorted, which covers short flags like
+  `-tp 2` and negative values. Verified against the live
+  `gemma4-26b-a4b-nvfp4` recipe, whose `vllm_args` carries a
+  single-quoted JSON `--speculative-config` blob containing spaces and
+  nested double quotes — `shlex` tokenizes it into one value, pairs it
+  correctly, and leaves `positional` empty, which is the check that
+  proves no flag got mis-paired. One known false negative left in
+  deliberately: reformatting the JSON *inside* that value changes the
+  hash, because the canonicalizer treats flag values as opaque strings
+  and does not know one of them is JSON.
+
+### 91. `mods` was excluded from `config_hash` on an "inert metadata" premise that stopped being true when the bake pipeline landed — two recipes differing only in mods shared each other's "launched successfully" record (V?.?.?)
+
+* **The Trap:** `compute_config_hash()`'s docstring listed `mods` under
+  "Deliberately EXCLUDES capability/mods (inert metadata, Phase 4)", and
+  `RecipeConfig.mods` carried a stronger instruction still: mods "must
+  stay out of `compute_config_hash()` even once wired up". Both were
+  correct when written. Task MC made them false — `mods` names now reach
+  `_resolve_host_image_tag()`, which calls
+  `resolve_mod_tag()`/`ensure_mods_baked()` immediately before each
+  `docker run` and substitutes a mod-baked image tag. So two recipes
+  identical except `mods: []` versus `mods: ["gemma4-nvfp4"]` produced
+  the SAME `config_hash` and DIFFERENT running images, and a recipe that
+  had never been launched inherited the no-mod variant's success record.
+  This is a false POSITIVE — the opposite failure direction from #92, and
+  the strictly worse one: a spurious "untested" is an annoyance, a
+  spurious "validated" is a wrong answer to the only question this hash
+  is asked. Not hypothetical. The live ledger contains two pairs of
+  differently-named recipes sharing a hash (`16ec6382d9cec64a` across
+  `deepseek-v4-flash-0731-dspark` and `-dspark-sm120`;
+  `2f2ef39818c621fb` across `-dspark-gb10-hazyumps-512k` and
+  `-dspark-512k`), and it took a ledger analysis days later to notice,
+  because nothing reported collisions. The general trap: a comment
+  asserting a field is inert is a claim about a *point in time*, and it
+  does not update itself when the field is wired up. The wiring commit
+  is not where anyone thinks to re-read a hash function's exclusion list.
+* **The Fix:** `mods` is now part of the payload, as an ORDERED list —
+  deliberately NOT sorted, unlike `env_vars`. Mods bake in sequence and a
+  later mod can overwrite an earlier one's changes, so `["a", "b"]` and
+  `["b", "a"]` are genuinely different images and sorting would merge
+  them; this is the one field where reordering is a real change, and it
+  is called out in both the field comment and the function docstring so
+  nobody "fixes" it for consistency later. Bumped to
+  `_CONFIG_HASH_SCHEMA = 2` and recorded the schema inside the payload
+  itself, so a future reader can distinguish "computed under the old
+  scheme" from "genuinely never launched". Migration cost accepted
+  knowingly: every existing `launch_history` entry orphans and its recipe
+  reverts to showing as never-launched. That is correct rather than
+  merely tolerable, since schema 1 could not distinguish the mods case
+  and some of those records attest to a configuration never actually run.
+  Added `config_registry.json` (`_sync_config_registry()`, append-only,
+  rides the catalog path) so every hash decodes back to the payload it
+  came from and `sources` lists every recipe producing it — a collision
+  is now visible the day it appears. Two follow-ups left explicitly open
+  rather than assumed: `capability` is still excluded on the *same*
+  "inert" premise and should be re-verified, not trusted; and whether
+  `resolve_mod_tag()`'s digest hashes mod NAMES or mod CONTENTS is
+  unresolved — if names, editing `mods/<name>/run.sh` leaves the tag
+  unchanged, `ensure_mods_baked()` treats it as a cache hit, skips the
+  rebake, and the edit silently never reaches the container. That is the
+  same class of failure as this entry, one layer down.
+
 ### 90. Generalizing `tests/metest.py`'s Gemma4 presets into `tests/ab_test.py` silently reordered `dflash`'s docker serve-args — caught only by explicit argv diffing, not review (V?.?.?)
 
 * **The Trap:** Refactoring `run_dflash_stage()`'s hardcoded raw-docker
