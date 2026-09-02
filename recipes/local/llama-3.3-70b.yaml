@@ -21,5 +21,5 @@ topologies:
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
     vllm_args: >-
-      --disable-custom-all-reduce --trust-remote-code --max-num-seqs 16 --max-num-batched-tokens
+      --distributed-executor-backend ray --disable-custom-all-reduce --trust-remote-code --max-num-seqs 16 --max-num-batched-tokens
       8192 --kv-cache-dtype fp8 --enable-chunked-prefill --enforce-eager
