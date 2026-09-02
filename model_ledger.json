@@ -712,5 +712,69 @@
         "unaccounted_sec": 22.289895
       }
     ]
+  },
+  "minimax-m2_7-nvfp4-gb10::2_node": {
+    "runs": [
+      {
+        "run_id": "1788386837-spark-4-000c685da9b7",
+        "ts": 1788386837.0,
+        "outcome": "crashed",
+        "config_hash": "980fa91f015d0789",
+        "total_sec": 2428.445519,
+        "pre_load_sec": 133.399526,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": null,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": null,
+        "rank_count": 3,
+        "unaccounted_sec": 2295.0459929999997
+      }
+    ]
+  },
+  "nemotron-3-nano-30b-a3b-nvfp4::1_node": {
+    "runs": [
+      {
+        "run_id": "1788389280-spark-4-deea6e655ec4",
+        "ts": 1788389280.0,
+        "outcome": "ready",
+        "config_hash": "b3f475eec69c762a",
+        "total_sec": 351.635178,
+        "pre_load_sec": 31.025151,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 139.29,
+        "download_sec": 106.291579,
+        "download_confidence": "reported",
+        "compile_sec": 18.06,
+        "compile_stage_confidence": "reported",
+        "engine_init_sec": 67.62,
+        "rank_count": 1,
+        "unaccounted_sec": 0.0
+      }
+    ],
+    "cached": [
+      386
+    ]
+  },
+  "nemotron-3-nano-30b-a3b-nvfp4::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 62,
+      "out": 663,
+      "draft": 0,
+      "accepted": 0
+    },
+    "last_seen_raw": {
+      "p": 93.0,
+      "g": 768.0,
+      "d": 0.0,
+      "a": 0.0
+    }
   }
 }
