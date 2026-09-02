@@ -670,5 +670,40 @@
       "d": 0.0,
       "a": 0.0
     }
+  },
+  "llama-4-fp8::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "c9097cbf66ec5e01": {
+        "last_success_ts": 1788382524.7647538,
+        "count": 1
+      }
+    },
+    "runs": [
+      {
+        "run_id": "1788382201-spark-4-918567dfae65",
+        "ts": 1788382201.0,
+        "outcome": "ready",
+        "config_hash": "c9097cbf66ec5e01",
+        "total_sec": 320.883658,
+        "pre_load_sec": 143.183763,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 71.99,
+        "compile_sec": 31.78,
+        "compile_stage_confidence": "reported",
+        "engine_init_sec": 51.64,
+        "rank_count": 3,
+        "unaccounted_sec": 22.289895
+      }
+    ]
   }
 }
