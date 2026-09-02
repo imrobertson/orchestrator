@@ -340,11 +340,17 @@ def build_config_registry_entries(recipes: dict[str, RecipeConfig]) -> dict:
     makes the hash a correct answer to "has this configuration launched".
     It also makes them indistinguishable by hash alone, so anything wanting
     to know *which recipe file* ran needs the run record, not the hash.
-    Surfacing the list means a collision is visible the moment it appears
-    rather than being inferred later from ledger archaeology -- two live
-    pairs (deepseek-v4-flash-0731-dspark / -dspark-sm120 and
-    -dspark-gb10-hazyumps-512k / -dspark-512k) went unnoticed for days
-    precisely because nothing reported this.
+    Surfacing the list means a genuine collision is visible the moment it
+    appears rather than being inferred later from ledger archaeology.
+
+    It also disambiguates the case that looks identical from the ledger
+    but isn't: a RENAME. model_ledger.json keys on filename stem and never
+    deletes entries, so renaming a recipe leaves the old name's
+    launch_history behind carrying the same config_hash as the new one --
+    which reads exactly like two live recipes colliding, and was in fact
+    misread that way here. This registry is built from recipes that
+    currently exist, so a renamed-away recipe simply drops out of
+    `sources` instead of masquerading as a second live config.
     """
     entries: dict[str, dict] = {}
     for name in sorted(recipes):

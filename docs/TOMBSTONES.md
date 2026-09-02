@@ -231,12 +231,28 @@ fixed today, recorded here rather than silently:
   This is a false POSITIVE — the opposite failure direction from #92, and
   the strictly worse one: a spurious "untested" is an annoyance, a
   spurious "validated" is a wrong answer to the only question this hash
-  is asked. Not hypothetical. The live ledger contains two pairs of
-  differently-named recipes sharing a hash (`16ec6382d9cec64a` across
+  is asked. CORRECTION, recorded rather than quietly revised: this entry
+  originally cited two pairs of differently-named recipes sharing a hash
+  in the live ledger (`16ec6382d9cec64a` across
   `deepseek-v4-flash-0731-dspark` and `-dspark-sm120`;
   `2f2ef39818c621fb` across `-dspark-gb10-hazyumps-512k` and
-  `-dspark-512k`), and it took a ledger analysis days later to notice,
-  because nothing reported collisions. The general trap: a comment
+  `-dspark-512k`) as production evidence of this bug biting. That was
+  wrong. Neither `-dspark-sm120.yaml` nor `-dspark-gb10-hazyumps-512k.yaml`
+  exists — both were RENAMES, and the shared hash is `config_hash`
+  working exactly as designed, since it is deliberately filename-
+  independent and the same recipe content must hash the same under any
+  name. The ledger keys on filename stem and never deletes, so the old
+  name's `launch_history` persists as an orphan and reads like a
+  collision to anyone looking only at the ledger. The `mods` exclusion is
+  still a real defect — demonstrable from code, since mods reach
+  `_resolve_host_image_tag()` and change the launched image, and
+  confirmed in a harness where two configs differing only in `mods`
+  hashed identically under schema 1 — but it is not known to have caused
+  a false "validated" on this cluster. The mistake that produced the bad
+  claim is itself worth keeping: a ledger entry was read as evidence of
+  what is running now, without checking whether the recipe file still
+  existed. Same failure as #95's cold-run samples — a number recorded
+  without the context needed to interpret it. The general trap: a comment
   asserting a field is inert is a claim about a *point in time*, and it
   does not update itself when the field is wired up. The wiring commit
   is not where anyone thinks to re-read a hash function's exclusion list.

@@ -2714,8 +2714,15 @@ def _sync_config_registry() -> None:
       - A schema bump stops being destructive: hashes nothing computes
         anymore stay readable, so historical launch_history and run records
         can still be explained after the fact.
-      - Collisions surface the day they appear via the `sources` list,
-        instead of being reverse-engineered out of the ledger later.
+      - Genuine collisions surface the day they appear via the `sources`
+        list, instead of being reverse-engineered out of the ledger later
+        -- and, just as usefully, a RENAME stops looking like one. The
+        ledger keys on filename stem and never deletes, so a renamed
+        recipe leaves its old name's launch_history behind carrying the
+        same hash as the new name; read from the ledger alone that is
+        indistinguishable from two live recipes colliding, and was in
+        fact misread that way. This registry is rebuilt from recipes that
+        currently exist, so the old name simply drops out.
 
     APPEND-ONLY, deliberately. Entries are never removed and an existing
     entry's payload is never rewritten -- a hash is a pure function of its
