@@ -42,6 +42,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Optional
@@ -163,11 +164,26 @@ class RecipeConfig(BaseModel):
     # mods/ directory by the orchestrator (never a host path -- see
     # _validate_mod_name()). Shape-validated here (load time); existence of
     # mods/<name> is deliberately NOT checked here, only at deploy time --
-    # see _validate_mod_name()'s docstring. Still execution-inert as of
-    # Task MA: typed and validated, but not yet read by
-    # build_catalog_response(), the deploy path, or compute_config_hash()
-    # (and must stay out of compute_config_hash() even once wired up --
-    # see that function's docstring for why).
+    # see _validate_mod_name()'s docstring.
+    #
+    # NO LONGER execution-inert. As of Task MC these names reach
+    # _resolve_host_image_tag() in dgx-orchestrator.py, which calls
+    # resolve_mod_tag()/ensure_mods_baked() immediately before each
+    # `docker run` and substitutes a mod-baked image tag. mods therefore
+    # changes what actually launches and IS part of compute_config_hash().
+    # The previous version of this comment instructed the opposite ("must
+    # stay out of compute_config_hash() even once wired up"); that
+    # instruction rested on mods being inert metadata, which stopped being
+    # true when the bake pipeline landed. Leaving it excluded meant two
+    # recipes differing only in mods shared a config_hash and therefore
+    # shared each other's "last launched successfully" record -- a false
+    # positive, the exact failure this hash exists to prevent.
+    #
+    # Order is significant and must NOT be sorted: mods bake in sequence
+    # and a later mod can overwrite an earlier one's changes, so
+    # ["a", "b"] and ["b", "a"] are genuinely different images. This is the
+    # deliberate exception to the "reordering equivalent input must not
+    # change the hash" rule the rest of this payload follows.
     mods: list[str] = Field(default_factory=list)
 
     # NOTE: deliberately not named with a leading underscore. Pydantic v2
@@ -191,6 +207,160 @@ class RecipeConfig(BaseModel):
     topologies: dict[str, TopologyConfig]
 
 
+# Bumped whenever the compute_config_hash() payload shape changes. Every
+# existing launch_history entry orphans on a bump (recipes revert to showing
+# as never-launched), so the value is recorded in the payload itself: a
+# future reader can tell "this hash was computed under the old scheme" from
+# "this recipe genuinely never launched".
+#   1 -- original: env_vars sorted, vllm_args hashed as a raw string, mods
+#        excluded.
+#   2 -- vllm_args canonicalized (flag order and whitespace no longer
+#        significant); mods included, order-significant.
+_CONFIG_HASH_SCHEMA = 2
+
+
+def _canonicalize_vllm_args(raw: str):
+    """
+    Normalize a vllm_args string so that semantically identical arg strings
+    hash identically, without ever merging two strings that would actually
+    launch differently.
+
+    The raw-string approach this replaces was both order- and
+    whitespace-sensitive. Measured against the live payload:
+
+        "--max-model-len 8192 --gpu-memory-utilization 0.9"   900aba72892d8030
+        "--gpu-memory-utilization 0.9 --max-model-len 8192"   9e2b7868d633cbfc
+        "--max-model-len 8192 --trust-remote-code"            df5c83140a73ea07
+        "--max-model-len  8192 --trust-remote-code"           84e5bba7dda6ac15
+        "--max-model-len 8192 --trust-remote-code\\n"          fe4ff081a038f4e5
+
+    All five launch the same container. Under the old hash, reformatting a
+    YAML block scalar -- or letting an editor add a trailing newline --
+    silently reverted a validated recipe to "untested".
+
+    Returns a JSON-serializable structure, not a string; the caller embeds
+    it in the payload dict.
+
+    Three deliberate bail-outs to the raw string, because a false "these are
+    the same config" is far worse than a false "these differ":
+
+      - Unparseable input (unbalanced quotes). Never raise out of here:
+        this runs under load_recipes(), and a hard failure would empty the
+        whole catalog over one malformed recipe.
+      - A flag appearing more than once. argparse is last-wins, so
+        "--max-model-len 8192 --max-model-len 4096" and its reverse launch
+        with DIFFERENT values. Sorting would collapse them. Order is
+        load-bearing here, so preserve the raw string verbatim.
+      - Anything not starting with "--" is treated as positional and kept
+        in original order rather than sorted. That covers short flags
+        (-tp 2) and bare values; being conservative costs only a spurious
+        "untested", never a spurious "validated".
+    """
+    if not raw or not raw.strip():
+        return ""
+
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return raw
+
+    pairs: list[tuple[str, Optional[str]]] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if not token.startswith("--"):
+            # Includes negative numeric values (--seed -1 keeps -1 as this
+            # flag's value via the lookahead below, so a bare "-1" only
+            # lands here if it had no preceding flag).
+            positional.append(token)
+            i += 1
+            continue
+        if "=" in token:
+            flag, _, value = token.partition("=")
+            pairs.append((flag, value))
+            i += 1
+        elif i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+            pairs.append((token, tokens[i + 1]))
+            i += 2
+        else:
+            pairs.append((token, None))
+            i += 1
+
+    flags = [flag for flag, _ in pairs]
+    if len(set(flags)) != len(flags):
+        return raw
+
+    ordered = sorted(pairs, key=lambda pair: (pair[0], "" if pair[1] is None else pair[1]))
+    return {
+        "positional": positional,
+        "flags": [[flag, value] for flag, value in ordered],
+    }
+
+
+def build_config_payload(recipe: RecipeConfig, topo_key: str) -> dict:
+    """
+    The exact dict compute_config_hash() hashes, returned rather than
+    discarded.
+
+    Split out so the config registry (the "decoder ring" -- see
+    _sync_config_registry() in dgx-orchestrator.py) records the *same*
+    structure the hash was computed over, byte for byte. If the registry
+    rebuilt its own approximation of this payload the two would drift, and
+    a decoder ring that decodes to something other than what was hashed is
+    worse than none.
+
+    See compute_config_hash() for what's included, what's excluded, and why.
+    """
+    topo = recipe.topologies[topo_key]
+    return {
+        "_schema": _CONFIG_HASH_SCHEMA,
+        "hf_path": recipe.hf_path,
+        "image": recipe.image,
+        "gpu_util": recipe.gpu_util,
+        "max_model_len": topo.max_model_len,
+        "tp_size": topo.tp_size,
+        "pp_size": topo.pp_size,
+        "env_vars": sorted(topo.env_vars),
+        "vllm_args": _canonicalize_vllm_args(topo.vllm_args),
+        "mods": list(recipe.mods),
+    }
+
+
+def build_config_registry_entries(recipes: dict[str, RecipeConfig]) -> dict:
+    """
+    Map every (recipe, topo_key) in `recipes` to its config hash, returning
+    {config_hash: {"_schema", "payload", "sources": [{recipe, topo_key}]}}.
+
+    Pure -- builds and returns, never touches disk. The caller merges this
+    into the persisted registry (see _sync_config_registry()).
+
+    `sources` is a LIST because collisions are by design: two recipes with
+    genuinely identical launch configs must hash the same, which is what
+    makes the hash a correct answer to "has this configuration launched".
+    It also makes them indistinguishable by hash alone, so anything wanting
+    to know *which recipe file* ran needs the run record, not the hash.
+    Surfacing the list means a collision is visible the moment it appears
+    rather than being inferred later from ledger archaeology -- two live
+    pairs (deepseek-v4-flash-0731-dspark / -dspark-sm120 and
+    -dspark-gb10-hazyumps-512k / -dspark-512k) went unnoticed for days
+    precisely because nothing reported this.
+    """
+    entries: dict[str, dict] = {}
+    for name in sorted(recipes):
+        recipe = recipes[name]
+        for topo_key in sorted(recipe.topologies):
+            payload = build_config_payload(recipe, topo_key)
+            canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+            entry = entries.setdefault(
+                digest,
+                {"_schema": _CONFIG_HASH_SCHEMA, "payload": payload, "sources": []},
+            )
+            entry["sources"].append({"recipe": name, "topo_key": topo_key})
+    return entries
+
+
 def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
     """
     Stable content hash identifying "this exact launch configuration" for
@@ -205,38 +375,56 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
     enrich_catalog() in dgx-orchestrator.py for where it's compared against
     launch history.
 
-    Deliberately narrow about what's included:
+    The governing rule: reordering input that launches identically must NOT
+    change the hash, and any input that launches differently MUST change it.
+    The second half matters more -- a false "untested" is an annoyance, a
+    false "validated" is a wrong answer to the only question this hash is
+    asked.
+
+    Included, and why:
       - hf_path, image, gpu_util, and topo_key's max_model_len / tp_size /
         pp_size / env_vars / vllm_args -- everything that changes what
         actually gets launched.
       - env_vars is sorted before hashing: reordering entries in the list
         changes nothing about the resulting `docker run -e ...` flags, so it
-        shouldn't invalidate "tested" status. vllm_args is hashed as the raw
-        string (not shlex-split/reordered) -- simpler, and fine unless flags
-        get reordered without changing them in practice.
-      - Deliberately EXCLUDES capability/mods (inert metadata, Phase 4) and
-        notes (documentation, never reaches the container).
-      - Deliberately EXCLUDES the HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE
-        env_vars injection build_catalog_response() performs based on
-        cluster_config.yaml's global offline flags -- that's a runtime,
-        cluster-wide toggle applied on top of the recipe, not part of the
-        recipe itself, and flipping online/offline mode must not silently
-        invalidate every recipe's tested status. This function must only
-        ever be called against the raw, as-loaded RecipeConfig/TopologyConfig
-        (i.e. via load_recipes()), never against the enriched catalog dict.
+        shouldn't invalidate "tested" status.
+      - vllm_args is canonicalized rather than hashed raw, so flag order and
+        whitespace stop being significant. See _canonicalize_vllm_args()
+        for the exact normalization and the cases it deliberately refuses
+        to normalize.
+      - mods, as an ORDERED list. These are not inert: they reach
+        _resolve_host_image_tag() in dgx-orchestrator.py, which substitutes
+        a mod-baked image tag immediately before `docker run`. Two recipes
+        differing only in mods launch different images and must not share a
+        hash. Order is preserved deliberately -- mods bake in sequence and
+        a later mod can overwrite an earlier one, so sorting would merge two
+        genuinely different images. This is the one field where reordering
+        is a real change.
+
+    Deliberately EXCLUDED:
+      - capability -- authoring metadata, still never reaches the container.
+        Verify that remains true before trusting it; the same assumption
+        about mods went stale without this docstring noticing.
+      - notes -- documentation, never reaches the container.
+      - The HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE env_vars injection
+        build_catalog_response() performs based on cluster_config.yaml's
+        global offline flags -- that's a runtime, cluster-wide toggle
+        applied on top of the recipe, not part of the recipe itself, and
+        flipping online/offline mode must not silently invalidate every
+        recipe's tested status. This function must only ever be called
+        against the raw, as-loaded RecipeConfig/TopologyConfig (i.e. via
+        load_recipes()), never against the enriched catalog dict.
+
+    NOTE ON MIGRATION: this is schema 2. Every config_hash recorded under
+    schema 1 is now unreachable, so all existing launch_history entries
+    orphan and their recipes revert to showing as never-launched. That is
+    correct rather than merely tolerable -- schema 1 could not distinguish
+    two recipes differing only in mods, so some of those records attest to
+    a configuration that was never actually launched.
     """
-    topo = recipe.topologies[topo_key]
-    payload = {
-        "hf_path": recipe.hf_path,
-        "image": recipe.image,
-        "gpu_util": recipe.gpu_util,
-        "max_model_len": topo.max_model_len,
-        "tp_size": topo.tp_size,
-        "pp_size": topo.pp_size,
-        "env_vars": sorted(topo.env_vars),
-        "vllm_args": topo.vllm_args,
-    }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        build_config_payload(recipe, topo_key), sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 

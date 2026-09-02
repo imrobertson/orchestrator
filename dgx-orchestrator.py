@@ -46,7 +46,13 @@ import yaml
 from common.config import legacy_hosts_dict, load_cluster_config
 from common.constants import ContainerRole
 from common.mods import ModBakeError, ModResolutionError, ensure_mods_baked, resolve_mod_tag
-from common.recipes import build_catalog_response, compute_config_hash, load_recipes
+from common.runlog import archive_run_log
+from common.recipes import (
+    build_catalog_response,
+    build_config_registry_entries,
+    compute_config_hash,
+    load_recipes,
+)
 from common.ssh import get_hf_token, resolve_user_identity_key, run_ssh
 
 try:
@@ -113,6 +119,7 @@ def _compute_source_hash_suffix() -> str:
 ORCHESTRATOR_VERSION = f"{ORCHESTRATOR_VERSION_SLUG}+{_compute_source_hash_suffix()}"
 MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 LEDGER_PATH = BASE_DIR / "model_ledger.json"
+CONFIG_REGISTRY_PATH = BASE_DIR / "config_registry.json"
 BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
 BENCHMARK_RESULTS_PATH = BASE_DIR / "benchmark_results.txt"
 # Records catalog_key -> hf_path (+ derived cache dirname) every time a
@@ -2214,6 +2221,28 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
         model_status = f"CRASHED ({container_state.upper()})"
         eta_display = "Check Docker Logs"
         eta_seconds = 0
+        # A crashed load is frequently the MORE informative sample -- it is
+        # the one someone will want to explain later, and today its logs
+        # vanish the moment the container is torn down. Same once-per-
+        # container-start guard as the READY path, keyed on StartedAt so a
+        # container that crashes, is redeployed, and crashes again produces
+        # two distinct archives.
+        crash_time_res = run_ssh(ip, user, ["docker", "inspect", active_container,
+                                            "--format", "{{.State.StartedAt}}"], timeout=5)
+        if crash_time_res.returncode == 0 and crash_time_res.stdout.strip():
+            crash_start_ts = parse_iso_time(crash_time_res.stdout.strip())
+            crash_key = f"crash:{host}:{active_container}"
+            with _RECORDED_LOAD_STARTS_LOCK:
+                crash_already = _RECORDED_LOAD_STARTS.get(crash_key) == crash_start_ts
+                if not crash_already:
+                    _RECORDED_LOAD_STARTS[crash_key] = crash_start_ts
+            if not crash_already:
+                archive_run_log(
+                    host=host, ip=ip, user=user, container=active_container,
+                    model_key=matched_key, topo_key=topo_key,
+                    started_ts=crash_start_ts, outcome="crashed",
+                    elapsed_sec=int(time.time() - crash_start_ts),
+                )
     elif active_container == ContainerRole.WORKER and head_crashed:
         model_status = "ORPHANED (HEAD CRASHED)"
         eta_display = "Requires Teardown"
@@ -2241,6 +2270,22 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                         load_type = "cached"
                         
                     record_load_time(matched_key, topo_key, elapsed, load_type)
+
+                    # Archive the full log alongside the timing. This runs
+                    # inside the same already_recorded guard, so it fires
+                    # once per container start, not once per 4s poll.
+                    # archive_run_log() is best-effort and swallows its own
+                    # failures -- see common/runlog.py -- so nothing here
+                    # needs guarding beyond that. The classification above
+                    # is passed as `load_type` for context only: it is the
+                    # substring-scan guess this archive exists to let a
+                    # later reader check, not a fact.
+                    archive_run_log(
+                        host=host, ip=ip, user=user, container=active_container,
+                        model_key=matched_key, topo_key=topo_key,
+                        started_ts=start_ts, outcome="ready",
+                        load_type=load_type, elapsed_sec=elapsed,
+                    )
         elif cluster_ready:
             model_status = "READY"
         else:
@@ -2649,9 +2694,84 @@ def _load_model_catalog_legacy() -> dict:
     except Exception as e:
         return {"error": str(e), "catalog": {"models": {}}}
 
+def _sync_config_registry() -> None:
+    """
+    Maintain config_registry.json: an append-only decoder ring mapping every
+    config_hash this cluster has ever computed back to the payload it was
+    computed from.
+
+    A config_hash is a good answer to "has THIS configuration launched
+    successfully" and a bad anchor for anything else. It is not a complete
+    description of what ran (mutable image tags like `:latest` move
+    underneath it; mods payload *contents* can change while the mod's name
+    doesn't), it is schema-versioned and so goes un-joinable on a bump, and
+    it is deliberately non-unique -- two recipes with identical configs are
+    supposed to collide. This registry does not fix any of that. It makes
+    the hash *decodable*, which is a different and achievable goal:
+
+      - Diffing two recipe variants becomes reading two payloads rather
+        than guessing from filenames.
+      - A schema bump stops being destructive: hashes nothing computes
+        anymore stay readable, so historical launch_history and run records
+        can still be explained after the fact.
+      - Collisions surface the day they appear via the `sources` list,
+        instead of being reverse-engineered out of the ledger later.
+
+    APPEND-ONLY, deliberately. Entries are never removed and an existing
+    entry's payload is never rewritten -- a hash is a pure function of its
+    payload, so a hash already on disk cannot legitimately decode to
+    something else, and letting it be overwritten would destroy exactly the
+    history this exists to keep. `sources` is refreshed (recipe files get
+    renamed, added, deleted) but `first_seen` is preserved.
+
+    Best-effort throughout: this is a traceability aid, and a failure here
+    must never break catalog load. Silent on error, same contract as
+    _write_json_state().
+    """
+    try:
+        entries = build_config_registry_entries(load_recipes())
+    except Exception:
+        return
+    if not entries:
+        return
+
+    registry = _read_json_state(CONFIG_REGISTRY_PATH) or {}
+    now = time.time()
+    dirty = False
+
+    for digest, entry in entries.items():
+        existing = registry.get(digest)
+        if existing is None:
+            registry[digest] = {
+                "first_seen": now,
+                "last_seen": now,
+                "_schema": entry["_schema"],
+                "payload": entry["payload"],
+                "sources": entry["sources"],
+            }
+            dirty = True
+            continue
+        # Payload is never rewritten -- see docstring. Only the mutable
+        # bookkeeping around it moves.
+        if existing.get("sources") != entry["sources"]:
+            existing["sources"] = entry["sources"]
+            dirty = True
+        existing["last_seen"] = now
+        dirty = True
+
+    if dirty:
+        _write_json_state(CONFIG_REGISTRY_PATH, registry)
+
+
 def load_model_catalog() -> dict:
     if os.environ.get("USE_LEGACY_CATALOG") == "1": raw_cat = _load_model_catalog_legacy()
     else: raw_cat = build_catalog_response()
+    # Registry sync rides the catalog path so every config that exists gets
+    # recorded, not just ones that have launched -- an unlaunched config is
+    # exactly the one whose payload you want when working out why it never
+    # ran. load_recipes() is lru_cached, so the common case is a cache hit
+    # plus a dict comparison.
+    _sync_config_registry()
     return enrich_catalog(raw_cat)
 
 # In-flight JIT compilation shells out to nvcc/ptxas/cicc as child
