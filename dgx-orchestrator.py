@@ -1222,9 +1222,81 @@ def _record_launch_success(model: str, topo_key: str, config_hash: str):
 
     _write_json_state(LEDGER_PATH, data)
 
+MIN_RUNS_FOR_PHASE_ESTIMATE = 3  # threshold applies PER SLICE (see
+                                  # _runs_slice_for_load_type), not per key
+
+
+def _runs_slice_for_load_type(runs: list, load_type: str) -> list:
+    """
+    Filter a key's runs[] (Task C phase data) down to the subset relevant
+    to `load_type`, mirroring what the legacy cached/compiled/downloaded
+    buckets tried to distinguish -- but sliced from real per-run
+    self-reported phase data instead of a READY-time keyword guess.
+
+      "cached"     -> runs with NO self-reported compile step
+                      (compile_stage_confidence != "reported")
+      "compiled"   -> runs WITH a self-reported compile step
+                      (compile_stage_confidence == "reported")
+      "downloaded" -> NOT YET SUPPORTED, returns [] unconditionally.
+                      extract_phases() has no download-phase marker --
+                      all 4 real archives used to build it were warm
+                      starts with weights already on disk; none exercised
+                      an actual HF download, so there was nothing to
+                      pattern-match against. A "downloaded" query always
+                      falls through to tier 2 until that marker exists.
+                      This is a known, stated gap, not a silent one.
+
+    Malformed entries (missing/non-string compile_stage_confidence, a
+    non-dict run) are excluded rather than raising -- runs[] is written
+    by record_run_phases() but read here on every call, and a status-poll
+    path must degrade rather than crash on unexpected shape.
+    """
+    if load_type == "downloaded":
+        return []
+    want_compiled = (load_type == "compiled")
+    out = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        is_compiled = run.get("compile_stage_confidence") == "reported"
+        if is_compiled == want_compiled:
+            out.append(run)
+    return out
+
+
 def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached") -> tuple[int, bool]:
     """Estimated seconds-to-ready for (model, topo_key) in `load_type`, plus
     whether that estimate came from recorded history or a hardcoded default.
+
+    THREE TIERS, NEVER BLENDED. Falls through top to bottom; the first
+    tier that clears its own bar wins outright, and nothing from a lower
+    tier is averaged in once a higher tier fires.
+
+      1. runs[] (Task C phase data), sliced by load_type via
+         _runs_slice_for_load_type(), median of `total_sec` across the
+         slice -- but only once the slice has at least
+         MIN_RUNS_FOR_PHASE_ESTIMATE samples. Below that, a median is
+         just whichever 1-2 samples happened to land, which is exactly
+         the instability the tier-2 median fix (below) exists to avoid;
+         better to fall through than trust too little data.
+      2. The legacy cached/compiled/downloaded buckets (median, see
+         below). FROZEN as of Task C -- nothing writes to these anymore,
+         so this tier is a fixed, shrinking-in-relevance safety net for
+         any key/load_type combination that hasn't accumulated enough
+         runs[] history yet, not a currently-growing data source.
+      3. Hardcoded per-model-family default.
+
+    Tier 1 deliberately still respects `load_type` rather than
+    collapsing to "median total_sec, whatever the scenario" -- the
+    catalog display (avg_load_display) shows "~180s (C) / ~1500s (JIT)"
+    specifically to warn when a model has a real cold-compile penalty,
+    and that comparison is meaningless if both queries return the same
+    number. Slicing by compile_stage_confidence answers "did vLLM report
+    a compile step for this run" directly from real data, which is a
+    more precise version of what load_type's READY-time keyword guess
+    was always trying and failing to approximate (see #95/#97).
+
+    Tier 2 (unchanged from the median fix -- kept verbatim below):
 
     Uses the MEDIAN of recorded samples, not the mean. Every phase list in
     this ledger that has more than two samples follows the same shape: a
@@ -1244,17 +1316,16 @@ def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached"
     tracks "what this usually takes" and one anomalous sample cannot move
     it.
 
-    Known limits, neither of which median fixes:
-      - The high sample is often NOT noise -- it is the genuine first-JIT
-        run, filed into the same bucket as the warm reruns because
-        record_load_time() classifies by substring-scanning `docker logs
-        --tail 5000` at READY. So a genuinely cold first deploy will now
-        underestimate and land in "Finishing startup (+Ns over est.)".
-        That is the honest failure direction, but the real fix is discrete
-        per-phase timestamps, not a different average.
-      - No recency weighting. A config change that legitimately shifts
-        load time takes ceil(n/2) runs to move the median. The phase lists
-        are not keyed by config_hash the way launch_history is.
+    NOT FIXED BY ANY TIER HERE: the LIVE in-progress countdown (see
+    _finalize_host_status's current_load_type) still derives its
+    "which scenario is this" guess from detect_model_stage()'s log-
+    keyword classification WHILE a container is still loading -- that
+    classifier is unchanged by Task C/D, which only touched READY-time
+    and crash-time recording. So a live load can still flip between
+    "cached" and "compiled" queries mid-run for the same reason the
+    index.html ETA clamp exists; this function returning a better number
+    for whichever load_type it's asked about does not stop it from being
+    asked a different load_type four seconds later. That remains open.
     """
     default_ests = {"cached": 180, "compiled": 1500, "downloaded": 4500}
     default_est = default_ests.get(load_type, 180)
@@ -1267,16 +1338,30 @@ def get_estimated_load_time(model: str, topo_key: str, load_type: str = "cached"
     if data is None:
         return default_est, False
     key_data = data.get(f"{model}::{topo_key}", {})
-    if isinstance(key_data, dict):
-        times = key_data.get(load_type, [])
-        # Guard the list shape as well as its truthiness -- this file is
-        # hand-editable (see ledger_set_lifetime()'s CLI command) and a
-        # malformed entry must degrade to the default, not raise inside a
-        # status poll.
-        if times and isinstance(times, list):
-            numeric = [t for t in times if isinstance(t, (int, float))]
-            if numeric:
-                return int(statistics.median(numeric)), True
+    if not isinstance(key_data, dict):
+        return default_est, False
+
+    # Tier 1: runs[] (Task C).
+    runs = key_data.get("runs")
+    if isinstance(runs, list) and runs:
+        sliced = _runs_slice_for_load_type(runs, load_type)
+        totals = [r.get("total_sec") for r in sliced
+                 if isinstance(r, dict) and isinstance(r.get("total_sec"), (int, float))]
+        if len(totals) >= MIN_RUNS_FOR_PHASE_ESTIMATE:
+            return int(statistics.median(totals)), True
+
+    # Tier 2: legacy buckets, frozen.
+    times = key_data.get(load_type, [])
+    # Guard the list shape as well as its truthiness -- this file is
+    # hand-editable (see ledger_set_lifetime()'s CLI command) and a
+    # malformed entry must degrade to the default, not raise inside a
+    # status poll.
+    if times and isinstance(times, list):
+        numeric = [t for t in times if isinstance(t, (int, float))]
+        if numeric:
+            return int(statistics.median(numeric)), True
+
+    # Tier 3: hardcoded default.
     return default_est, False
 
 def get_vllm_metrics(head_ip: str = PRIMARY_HOST_IP, port: int = 8000) -> dict:
@@ -2208,6 +2293,55 @@ _RE_DOWNLOADING = re.compile(r'\b(?:re)?(?:downloading|fetching)\b')
 _RE_COMPILING = re.compile(r'\b(?:re)?(?:tilelang completes|jit compilation|compiling)\b')
 
 
+RUNS_PER_KEY_CAP = 20  # matches the legacy cached/compiled/downloaded [-20:] cap
+
+
+def record_run_phases(model: str, topo_key: str, archive_entry: Optional[dict]) -> None:
+    """
+    Append one run's phase summary to model_ledger.json's `runs[]` for
+    model::topo_key. This REPLACES record_load_time() as the thing that
+    populates new ledger data -- see the module-level note near
+    get_estimated_load_time() (#95/#97) for why the old cached/compiled/
+    downloaded buckets were unreliable, and common/phase_extract.py for
+    what replaces them.
+
+    Deliberately does nothing (not even an empty entry) when
+    archive_entry is None (archiving itself failed -- see
+    common/runlog.py's own best-effort contract) or when
+    archive_entry["phases"] is None (extraction failed or the log's shape
+    wasn't recognized). Absence in `runs[]` must mean "we don't have
+    phase data for this run", never "this run took zero time" -- writing
+    a zero-filled entry would be the exact failure #95/#97 exist because
+    of, one layer further down.
+
+    Old cached/compiled/downloaded buckets are left entirely alone here
+    -- not read, not written, not migrated. They stop growing the moment
+    callers switch from record_load_time() to this function, and stay on
+    disk as frozen, still-readable history until get_estimated_load_time()
+    is updated to read `runs[]` (tracked separately; until then estimates
+    keep coming from whatever legacy data already exists per key).
+    """
+    if archive_entry is None or archive_entry.get("phases") is None:
+        return
+    try:
+        data = _read_json_state(LEDGER_PATH) or {}
+        key = f"{model}::{topo_key}"
+        entry = data.setdefault(key, {})
+        runs = entry.setdefault("runs", [])
+        runs.append({
+            "run_id": archive_entry.get("run_id"),
+            "ts": archive_entry.get("started_ts"),
+            "outcome": archive_entry.get("outcome"),
+            "config_hash": archive_entry.get("config_hash"),
+            **archive_entry["phases"],
+        })
+        if len(runs) > RUNS_PER_KEY_CAP:
+            entry["runs"] = runs[-RUNS_PER_KEY_CAP:]
+        _write_json_state(LEDGER_PATH, data)
+    except Exception:
+        pass
+
+
 def _config_hash_for(model: str, topo_key: str) -> Optional[str]:
     """
     Best-effort config_hash for a running model, for attaching to a run-log
@@ -2287,13 +2421,21 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                 if not crash_already:
                     _RECORDED_LOAD_STARTS[crash_key] = crash_start_ts
             if not crash_already:
-                archive_run_log(
+                archive_entry = archive_run_log(
                     host=host, ip=ip, user=user, container=active_container,
                     model_key=matched_key, topo_key=topo_key,
                     started_ts=crash_start_ts, outcome="crashed",
                     elapsed_sec=int(time.time() - crash_start_ts),
                     config_hash=_config_hash_for(matched_key, topo_key),
                 )
+                # New capability, not a replacement of anything: crashes
+                # never populated the old cached/compiled/downloaded
+                # buckets at all. A crash with enough log to extract a
+                # partial phase breakdown (e.g. crashed during weight
+                # load, before READY) now gets recorded; one that crashed
+                # before any known marker appears is correctly absent
+                # from runs[] rather than recorded as zero-time.
+                record_run_phases(matched_key, topo_key, archive_entry)
     elif active_container == ContainerRole.WORKER and head_crashed:
         model_status = "ORPHANED (HEAD CRASHED)"
         eta_display = "Requires Teardown"
@@ -2333,8 +2475,13 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                     else:
                         load_type = "cached"
                         
-                    record_load_time(matched_key, topo_key, elapsed, load_type)
-
+                    # record_load_time() no longer called here -- Task C
+                    # replaces the cached/compiled/downloaded buckets with
+                    # runs[] (see record_run_phases()). The old buckets are
+                    # left on disk, frozen, and still read by
+                    # get_estimated_load_time() until that function is
+                    # updated to read runs[] instead.
+                    #
                     # Archive the full log alongside the timing. This runs
                     # inside the same already_recorded guard, so it fires
                     # once per container start, not once per 4s poll.
@@ -2343,14 +2490,17 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                     # needs guarding beyond that. The classification above
                     # is passed as `load_type` for context only: it is the
                     # substring-scan guess this archive exists to let a
-                    # later reader check, not a fact.
-                    archive_run_log(
+                    # later reader check, not a fact -- phase extraction
+                    # (inside archive_run_log itself) is what actually
+                    # replaces it.
+                    archive_entry = archive_run_log(
                         host=host, ip=ip, user=user, container=active_container,
                         model_key=matched_key, topo_key=topo_key,
                         started_ts=start_ts, outcome="ready",
                         load_type=load_type, elapsed_sec=elapsed,
                         config_hash=_config_hash_for(matched_key, topo_key),
                     )
+                    record_run_phases(matched_key, topo_key, archive_entry)
         elif cluster_ready:
             model_status = "READY"
         else:

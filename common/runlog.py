@@ -85,6 +85,7 @@ from pathlib import Path
 from typing import Optional
 
 from common.config import BASE_DIR
+from common.phase_extract import UnrecognizedLogShape, extract_phases
 from common.ssh import run_ssh
 
 RUN_LOGS_DIR = BASE_DIR / "run_logs"
@@ -121,6 +122,51 @@ def _redact(text: str) -> str:
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     return text
+
+
+_LINE_TS = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z) ?(.*)$')
+
+
+def _merge_streams_by_timestamp(stdout_text: str, stderr_text: str) -> str:
+    """
+    `docker logs --timestamps` prefixes every line with an RFC3339
+    timestamp, but stdout and stderr are two SEPARATE streams -- naive
+    concatenation (stdout in full, then stderr in full) produces a file
+    that looks chronological and isn't. Confirmed on a real capture
+    (gemma4-26b-a4b-nvfp4, run 1788360581): line 143 read 14:54:23.940
+    (APIServer, end of stdout) and line 144 read 14:49:57.450 (a Python
+    warnings.warn from stderr, near the start of the run) -- a 266-second
+    jump backwards sitting in the middle of the file with nothing to flag
+    it. A reader that assumes file order is chronological order will get
+    phase boundaries wrong by however far the two streams diverge, silently.
+
+    Merges by parsed timestamp instead. Lines without a parseable
+    timestamp (tqdm progress-bar fragments updated via \\r -- docker only
+    timestamps the first fragment of each) are attached to whichever
+    timestamped line precedes them, in their original stream and order,
+    so no line is dropped and relative order within a stream is
+    preserved for the untimestamped runs between timestamped anchors.
+
+    Stable sort, so truly simultaneous lines (same timestamp) keep stdout
+    before stderr and original within-stream order -- there is no better
+    tiebreak available than that.
+    """
+    def tag(text: str, stream: int) -> list:
+        out = []
+        last_ts = None
+        for line in text.splitlines():
+            m = _LINE_TS.match(line)
+            if m:
+                last_ts = m.group(1)
+            out.append((last_ts, stream, line))
+        return out
+
+    combined = tag(stdout_text, 0) + tag(stderr_text, 1)
+    # None (no timestamp seen yet on that stream) sorts before everything
+    # else by using "" -- these are a handful of banner lines before the
+    # first timestamped line and their exact position doesn't matter.
+    combined.sort(key=lambda row: (row[0] or "", row[1]))
+    return "\n".join(row[2] for row in combined)
 
 
 def _inspect_image_provenance(ip: str, user: Optional[str], container: str) -> dict:
@@ -251,7 +297,7 @@ def archive_run_log(
         # returncode first and archive nothing rather than something false.
         if log_res.returncode != 0:
             return None
-        raw = (log_res.stdout or "") + (log_res.stderr or "")
+        raw = _merge_streams_by_timestamp(log_res.stdout or "", log_res.stderr or "")
         if not raw.strip():
             return None
 
@@ -288,6 +334,26 @@ def archive_run_log(
             "truncated": line_count >= MAX_LOG_LINES,
         }
         entry.update(_inspect_image_provenance(ip, user, container))
+
+        # Phase extraction runs against the SAME merge-sorted, redacted
+        # text that gets archived -- one source of truth, not a second
+        # decompress-and-reparse pass. Best-effort like everything else
+        # here: a parse failure must not cost the archive itself, which is
+        # why this is wrapped separately from the archive-write above and
+        # degrades to phases=None rather than propagating. Distinguish the
+        # two None cases explicitly in the manifest -- "genuinely didn't
+        # recognize this log's shape" vs. "some other extractor bug" --
+        # since the first is expected on a new stack and the second isn't.
+        try:
+            entry["phases"] = extract_phases(cleaned).to_ledger_dict()
+            entry["phase_extraction_error"] = None
+        except UnrecognizedLogShape as exc:
+            entry["phases"] = None
+            entry["phase_extraction_error"] = f"unrecognized_shape: {exc}"
+        except Exception as exc:
+            entry["phases"] = None
+            entry["phase_extraction_error"] = f"{type(exc).__name__}: {exc}"
+
         _append_index(entry)
         return entry
     except Exception:
