@@ -113,8 +113,25 @@ class UnrecognizedLogShape(Exception):
 _RANK_TAG = re.compile(r'\(Worker_(TP\d+)[^)]*\)')
 _RAY_PID_TAG = re.compile(r'\(RayWorkerProc pid=(\d+)')
 
+# Confirmed TWO distinct phrasings for "weight loading is about to begin",
+# from two different real vLLM builds:
+#   "Starting to load model X..."     [gpu_model_runner.py] -- gemma4/dspark
+#       archives, build ad848fc41 (older recipe set)
+#   "Loading model from scratch..."   [model_runner.py]     -- gemma-4-31b
+#       archive, build gad848fc41.d20260815 -- a DIFFERENT build than the
+#       one above despite the similar-looking hash, confirmed by the
+#       distinct log-line phrasing and file (model_runner.py, not
+#       gpu_model_runner.py)
+# This was caught the hard way: the first version of this pattern matched
+# ONLY "Starting to load model", so on the gemma-4-31b archive it silently
+# found nothing while "Loading weights took" (a different regex) still
+# matched fine -- saw_any_marker stayed True, UnrecognizedLogShape never
+# fired, and pre_load_sec silently fell back to ready_at (100% of total,
+# visibly wrong once someone looked, not caught by any guard). See
+# _no_loader_start_found handling below for the fix to the guard itself,
+# not just this pattern list.
 _LOADER_START = re.compile(
-    r'Starting to load model (\S+)'
+    r'Starting to load model (\S+)|Loading model from scratch'
 )
 _LOADER_DONE = re.compile(
     r'\[default_loader\.py:\d+\]\s*Loading weights took ([\d.]+) seconds?'
@@ -179,6 +196,18 @@ class PhaseResult:
     pre_load_is_derived: bool            # always True today; field exists so a future
                                           # self-reported version of this phase doesn't
                                           # need a schema change, just a flip to False
+    pre_load_confidence: str             # "measured" | "no_start_marker_found" -- see
+                                          # extract_phases(): if NO rank's loader-start
+                                          # marker matched, pre_load_sec silently falls
+                                          # back to the full run length, which looks like
+                                          # a real (if unusually large) measurement unless
+                                          # this field says otherwise. Found on a real
+                                          # archive from a vLLM build using a start-marker
+                                          # phrasing this module didn't yet know -- the
+                                          # other markers (weight-load-done, engine-init)
+                                          # still matched, so UnrecognizedLogShape never
+                                          # fired; this field exists because that guard
+                                          # alone wasn't enough.
     weight_load_sec: Optional[float]     # AUTHORITATIVE (self-reported), max across ranks
     compile_sec: Optional[float]         # AUTHORITATIVE where present; None means the
                                           # stack doesn't self-report it, NOT zero compile time
@@ -203,6 +232,7 @@ class PhaseResult:
             "total_sec": self.total_sec,
             "pre_load_sec": self.pre_load_sec,
             "pre_load_is_derived": self.pre_load_is_derived,
+            "pre_load_confidence": self.pre_load_confidence,
             "weight_load_sec": self.weight_load_sec,
             "compile_sec": self.compile_sec,
             "compile_stage_confidence": self.compile_stage_confidence,
@@ -303,7 +333,21 @@ def extract_phases(log_text: str) -> PhaseResult:
         ready_at = max(offsets) if offsets else 0.0
 
     load_starts = [rt.load_started_at for rt in ranks.values() if rt.load_started_at is not None]
-    pre_load_sec = min(load_starts) if load_starts else ready_at
+    if load_starts:
+        pre_load_sec = min(load_starts)
+        pre_load_confidence = "measured"
+    else:
+        # No rank's loader-start marker matched anything this module knows
+        # about. Falling back to ready_at makes pre_load_sec equal the
+        # ENTIRE run -- not a measurement, a "we genuinely don't know"
+        # placeholder that happens to be numerically plausible-looking.
+        # Confirmed necessary on a real archive (a vLLM build phrasing the
+        # start marker differently than every pattern this module knew):
+        # "Loading weights took Ns" still matched, saw_any_marker stayed
+        # True, and this silently returned pre_load_sec == total_sec with
+        # nothing to flag it short of a human eyeballing the percentage.
+        pre_load_sec = ready_at
+        pre_load_confidence = "no_start_marker_found"
 
     def rank_weight_total(rt: RankTiming) -> Optional[float]:
         return sum(rt.weight_load_durations) if rt.weight_load_durations else None
@@ -340,6 +384,7 @@ def extract_phases(log_text: str) -> PhaseResult:
         total_sec=ready_at,
         pre_load_sec=pre_load_sec,
         pre_load_is_derived=True,
+        pre_load_confidence=pre_load_confidence,
         weight_load_sec=weight_load_sec,
         compile_sec=compile_sec,
         compile_stage_confidence=confidence,

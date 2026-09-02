@@ -36,6 +36,46 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 100. `UnrecognizedLogShape` catches total vocabulary mismatch but not partial mismatch — one marker silently failing while others matched produced a pre-load phase reported as 100% of total run time (V?.?.?)
+
+* **The Trap:** `extract_phases()`'s only safety net was
+  `UnrecognizedLogShape`, raised when NO known marker matched anywhere in
+  the log. That guard assumes a log either belongs to a recognized
+  vocabulary (most markers match) or doesn't (none do) -- it has no
+  concept of a THIRD case: a log where most markers match fine but one
+  specific one doesn't, because that one line is phrased differently on
+  a build this module hadn't seen. Found on the very first real archive
+  captured after deploying Tasks C/D: a `gemma-4-31b::2_node` run on
+  vLLM build `v0.1.dev20003+gad848fc41.d20260815`, which logs
+  `[model_runner.py:443] Loading model from scratch...` where every
+  prior sample logged `[gpu_model_runner.py:...] Starting to load model
+  X...`. `_LOADER_START` matched nothing, but `_LOADER_DONE` ("Loading
+  weights took Ns") matched fine on the same log, so `saw_any_marker`
+  stayed `True` and `UnrecognizedLogShape` never fired. `pre_load_sec`'s
+  fallback (`ready_at` when no rank has a `load_started_at`) silently
+  returned the run's ENTIRE duration as "pre-load time" -- 451.9s of
+  451.9s, 100%, a number that looks like a measurement and isn't one.
+  Nothing short of a human computing the percentage and noticing it was
+  implausible would have caught this; the field itself carried no
+  indication it was degenerate.
+* **The Fix:** Two changes, not one -- adding the missing pattern alone
+  would have fixed this specific log without fixing the failure mode.
+  (1) `_LOADER_START` now accepts both confirmed phrasings. (2) New
+  field `pre_load_confidence`: `"measured"` when at least one rank's
+  start marker actually matched, `"no_start_marker_found"` when the
+  fallback fired -- so a future THIRD phrasing this module doesn't know
+  about yet produces a value a caller can distinguish from real data,
+  rather than a plausible-looking number with no marker at all. Verified
+  against the real triggering archive (138.1s / 31%, matching a
+  hand-computed check against the raw timestamps, `confidence:
+  "measured"`) and against a synthetic reproduction of the exact original
+  failure (fallback correctly returns `"no_start_marker_found"`). All
+  three prior real archives re-verified unchanged. General lesson, same
+  shape as #97: a guard designed around "did anything match" is not the
+  same guard as "did the SPECIFIC thing this value depends on match" --
+  a multi-marker extractor needs per-field confidence, not one shape-level
+  gate for the whole result.
+
 ### 99. Rank identity keyed on `Worker_TPn`, which isn't present on a worker's earliest log lines — one 2-node worker fragmented into two ledger-visible ranks (V?.?.?)
 
 * **The Trap:** `phase_extract.py`'s rank grouping tried `Worker_TPn`
