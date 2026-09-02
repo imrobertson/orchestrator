@@ -441,11 +441,14 @@
         "outcome": "ready",
         "config_hash": "e2a4330f5e862209",
         "total_sec": 451.915275,
-        "pre_load_sec": 451.915275,
+        "pre_load_sec": 138.08404,
         "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
         "weight_load_sec": 123.74,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
         "compile_sec": 78.32,
-        "compile_stage_confidence": "reported",
+        "compile_stage_confidence": "reported_no_cache",
         "engine_init_sec": 137.76,
         "rank_count": 3,
         "unaccounted_sec": 0.0
@@ -646,11 +649,13 @@
         "pre_load_is_derived": true,
         "pre_load_confidence": "measured",
         "weight_load_sec": 98.75,
+        "download_sec": 319.087079,
+        "download_confidence": "reported",
         "compile_sec": null,
         "compile_stage_confidence": "absent_known_stack",
         "engine_init_sec": 29.67,
         "rank_count": 1,
-        "unaccounted_sec": 376.45474
+        "unaccounted_sec": 57.367661
       }
     ]
   },
@@ -698,8 +703,10 @@
         "pre_load_is_derived": true,
         "pre_load_confidence": "measured",
         "weight_load_sec": 71.99,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
         "compile_sec": 31.78,
-        "compile_stage_confidence": "reported",
+        "compile_stage_confidence": "reported_no_cache",
         "engine_init_sec": 51.64,
         "rank_count": 3,
         "unaccounted_sec": 22.289895

@@ -62,6 +62,34 @@ not something demonstrated against real data. Treat any phase output
 with compile_sec in the hundreds+ range as a first real data point for
 that assumption, not as confirmation of it.
 
+DOWNLOAD PHASE: FIRST REAL SAMPLE, ONE STACK CONFIRMED
+
+The gap flagged above (no download-phase marker existed) is now closed
+for at least one stack. A genuine cold weight-download archive
+(llama-4-fp4::1_node, config_hash 294fa3791e3d7635) surfaced this
+self-reported line, structurally parallel to the existing
+weight-load-done marker and from the same source file:
+
+    [weight_utils.py:540] Time spent downloading weights for
+        <model>: 319.087079 seconds
+
+This is AUTHORITATIVE by the same reasoning as the other self-reported
+durations above -- it's vLLM's own timer around the huggingface_hub
+fetch, not something this module infers from timestamps. It precedes
+the "Loading safetensors checkpoint shards" progress lines, which
+already fall inside weight_load_sec's existing measurement window, so
+download_sec is additive to weight_load_sec, not a replacement for or
+overlap with it. Before this fix, the entire download window fell into
+unaccounted_sec undifferentiated from genuine slop -- confirmed on this
+exact archive: total_sec 558.47s against a previous unaccounted_sec of
+376.45s, of which ~319s was this one download call.
+
+Only ONE archive, ONE stack (eugr/spark-vllm-b12x:latest, build
+gad848fc41.d20260815 -- the same build as the gemma-4-31b archive).
+Whether other stacks phrase or even self-report this line at all is
+unconfirmed; absence is handled the same way compile_sec's absence is
+-- a `download_confidence` field, not a silent zero.
+
 MULTI-RANK AGGREGATION (2-NODE / TP>1)
 
 On a 2-node deploy, "Loading weights took Ns" and "Starting to load
@@ -136,6 +164,16 @@ _LOADER_START = re.compile(
 _LOADER_DONE = re.compile(
     r'\[default_loader\.py:\d+\]\s*Loading weights took ([\d.]+) seconds?'
 )
+# Confirmed on one real cold-download archive (llama-4-fp4::1_node,
+# config_hash 294fa3791e3d7635, eugr/spark-vllm-b12x:latest build
+# gad848fc41.d20260815). Precedes _LOADER_DONE's checkpoint-shard window
+# in every sample seen -- additive, not overlapping. See module docstring
+# "DOWNLOAD PHASE" section before assuming this line exists on other
+# stacks; only one has been observed so far.
+_DOWNLOAD_DONE = re.compile(
+    r'\[weight_utils\.py:\d+\]\s*Time spent downloading weights '
+    r'for \S+:\s*([\d.]+) seconds?'
+)
 _TORCH_COMPILE = re.compile(
     r'\[monitor\.py:\d+\]\s*torch\.compile took ([\d.]+) s'
 )
@@ -183,6 +221,7 @@ class RankTiming:
     label: str = ""                               # best display name (e.g. "TP0"), see _rank_label
     load_started_at: Optional[float] = None      # seconds from archive start
     weight_load_durations: list = field(default_factory=list)  # self-reported, may be >1
+    download_durations: list = field(default_factory=list)     # self-reported, may be >1 -- see _DOWNLOAD_DONE
     compile_sec: Optional[float] = None
     warmup_sec: Optional[float] = None
     engine_init_sec: Optional[float] = None
@@ -209,6 +248,12 @@ class PhaseResult:
                                           # fired; this field exists because that guard
                                           # alone wasn't enough.
     weight_load_sec: Optional[float]     # AUTHORITATIVE (self-reported), max across ranks
+    download_sec: Optional[float]        # AUTHORITATIVE where present; None means either this
+                                          # stack doesn't self-report it (unconfirmed either way
+                                          # beyond the one sample so far) or weights were already
+                                          # cached -- NOT zero download time. See
+                                          # download_confidence to tell those apart.
+    download_confidence: str             # "reported" | "absent_known_stack" | "absent_unknown"
     compile_sec: Optional[float]         # AUTHORITATIVE where present; None means the
                                           # stack doesn't self-report it, NOT zero compile time
     compile_stage_confidence: str        # "reported" | "absent_known_stack" | "absent_unknown"
@@ -234,6 +279,8 @@ class PhaseResult:
             "pre_load_is_derived": self.pre_load_is_derived,
             "pre_load_confidence": self.pre_load_confidence,
             "weight_load_sec": self.weight_load_sec,
+            "download_sec": self.download_sec,
+            "download_confidence": self.download_confidence,
             "compile_sec": self.compile_sec,
             "compile_stage_confidence": self.compile_stage_confidence,
             "engine_init_sec": self.engine_init_sec,
@@ -288,6 +335,12 @@ def extract_phases(log_text: str) -> PhaseResult:
         if m:
             saw_any_marker = True
             rt.weight_load_durations.append(float(m.group(1)))
+            continue
+
+        m = _DOWNLOAD_DONE.search(line)
+        if m:
+            saw_any_marker = True
+            rt.download_durations.append(float(m.group(1)))
             continue
 
         m = _TORCH_COMPILE.search(line)
@@ -356,6 +409,24 @@ def extract_phases(log_text: str) -> PhaseResult:
     per_rank_weight = [w for w in per_rank_weight if w is not None]
     weight_load_sec = max(per_rank_weight) if per_rank_weight else None
 
+    def rank_download_total(rt: RankTiming) -> Optional[float]:
+        return sum(rt.download_durations) if rt.download_durations else None
+
+    per_rank_download = [rank_download_total(rt) for rt in ranks.values()]
+    per_rank_download = [d for d in per_rank_download if d is not None]
+    if per_rank_download:
+        download_sec = max(per_rank_download)
+        download_confidence = "reported"
+    else:
+        # Same reasoning as compile_stage_confidence's absent branch below:
+        # only one stack has ever been confirmed to emit this line, so
+        # absence here means either "weights were cached, nothing to
+        # report" or "this stack doesn't self-report it at all" -- this
+        # module can't yet tell those apart, hence "absent_known_stack"
+        # rather than a bare None with no explanation attached.
+        download_sec = None
+        download_confidence = "absent_known_stack"
+
     per_rank_compile = [rt.compile_sec for rt in ranks.values() if rt.compile_sec is not None]
     per_rank_engine_compile = [rt.engine_init_compile_sec for rt in ranks.values()
                                if rt.engine_init_compile_sec is not None]
@@ -375,7 +446,7 @@ def extract_phases(log_text: str) -> PhaseResult:
     engine_init_sec = max(per_rank_engine_init) if per_rank_engine_init else None
 
     known = pre_load_sec
-    for v in (weight_load_sec, compile_sec, engine_init_sec):
+    for v in (weight_load_sec, download_sec, compile_sec, engine_init_sec):
         if v is not None:
             known += v
     unaccounted = max(0.0, ready_at - known)
@@ -386,6 +457,8 @@ def extract_phases(log_text: str) -> PhaseResult:
         pre_load_is_derived=True,
         pre_load_confidence=pre_load_confidence,
         weight_load_sec=weight_load_sec,
+        download_sec=download_sec,
+        download_confidence=download_confidence,
         compile_sec=compile_sec,
         compile_stage_confidence=confidence,
         engine_init_sec=engine_init_sec,
