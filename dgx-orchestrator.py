@@ -1250,6 +1250,25 @@ def _runs_slice_for_load_type(runs: list, load_type: str) -> list:
     non-dict run) are excluded rather than raising -- runs[] is written
     by record_run_phases() but read here on every call, and a status-poll
     path must degrade rather than crash on unexpected shape.
+
+    KNOWN GAP, found during integration testing rather than assumed away:
+    this is a PRESENCE check, not a MAGNITUDE check. The real gemma4
+    archive used to validate this module is a warm run (weights already
+    on disk, 280.7s total) and still reports "torch.compile took 0.74 s"
+    on every single launch -- so compile_stage_confidence=="reported"
+    does NOT mean "this was an expensive first-time JIT compile", it can
+    just as easily mean "the trivial per-launch compile pass this stack
+    always runs, warm or cold". For gemma4-style stacks specifically, a
+    genuinely warm run may NEVER populate the "cached" slice, because it
+    always self-reports some nonzero compile_sec -- "cached" queries for
+    such a model fall through to tier 2/3 more often than the naming
+    suggests they should. This is safe (falls through rather than
+    returning a wrong number) but is real lost tier-1 coverage. The
+    correct fix is a magnitude threshold distinguishing "trivial
+    per-launch compile" from "genuine cold JIT", but no real cold-compile
+    archive exists yet to calibrate that threshold against -- picking a
+    number now would be guessing. Revisit once one exists (the DSpark/
+    SM120 pull is the natural source).
     """
     if load_type == "downloaded":
         return []

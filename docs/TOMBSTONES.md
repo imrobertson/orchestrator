@@ -36,6 +36,68 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 99. Rank identity keyed on `Worker_TPn`, which isn't present on a worker's earliest log lines — one 2-node worker fragmented into two ledger-visible ranks (V?.?.?)
+
+* **The Trap:** `phase_extract.py`'s rank grouping tried `Worker_TPn`
+  first, falling back to the stable `RayWorkerProc pid=N` tag only when
+  no `Worker_TPn` was present on a given line. Against the real dspark
+  2-node archive this produced `rank_count: 5` for what is actually a
+  2-worker deploy: `(RayWorkerProc pid=3575)` and `(Worker_TP0
+  pid=3575)` are the SAME physical process, but `Worker_TP0` is only
+  added to a worker's log lines once it has resolved its tensor-parallel
+  rank -- its earliest lines (NCCL init, CUDA setup) carry only the
+  `RayWorkerProc pid=` tag. Keying per-line on whichever tag happened to
+  be present split one worker's timeline across two dict entries
+  (`pid3575` and `TP0`), each holding a partial view -- `load_started_at`
+  attributed to one entry, `weight_load_durations` to the other,
+  neither individually correct.
+* **The Fix:** Key rank identity on the `RayWorkerProc` pid unconditionally
+  when present -- it's on every line from that worker for the whole run,
+  unlike `Worker_TPn`. `Worker_TPn` is kept only as a display label,
+  resolved after parsing by scanning that rank's lines for any occurrence
+  of the tag. `rank_count` corrected to 3 on the real dspark archive (head
+  + TP0 + TP1 -- the head's own local `EngineCore` lines, which carry
+  neither tag since they aren't Ray-forwarded, legitimately form a third
+  "single" rank and are not a fragmentation artifact). General lesson: a
+  process's identity tag in log output is not guaranteed present on that
+  process's EARLIEST lines just because it's present on its later ones --
+  grouping keys need to be chosen for what's stable across a process's
+  whole lifetime, not for what's most specific on any one line.
+
+### 98. `docker logs`'s stdout and stderr are two separate streams concatenated end-to-end, not one chronological one — reading archive order as time order silently misordered every phase boundary past the seam (V?.?.?)
+
+* **The Trap:** `common/runlog.py`'s original archive write was
+  `raw = (log_res.stdout or "") + (log_res.stderr or "")`. Correct for
+  content (a container's own stderr output belongs in the archive, and
+  every existing reader in this codebase does the same concatenation),
+  but `--timestamps` prefixes each line with its own real time, and
+  stdout runs to completion before stderr is appended -- so a line's
+  position in the file has no relationship to when it was actually
+  emitted once both streams have real content. Confirmed on the real
+  gemma4 archive: line 143 (`APIServer`, stdout, near the true end of the
+  run) is timestamped 14:54:23.940; line 144 (a Python `warnings.warn`,
+  stderr, near the true START of the run) is timestamped 14:49:57.450 --
+  a 266-second jump backwards sitting in the middle of the file with
+  nothing to flag it. Any reader assuming file order is chronological
+  order -- which is exactly what a phase-boundary detector needs to
+  assume to be simple -- gets every boundary after the seam wrong by
+  however far the two streams diverge, silently, since the file looks
+  perfectly well-formed.
+* **The Fix:** `_merge_streams_by_timestamp()` -- tags every line with its
+  stream and nearest-preceding timestamp, then stable-sorts by
+  (timestamp, stream) so untimestamped lines (tqdm `\r`-updated progress
+  fragments, ~28% of lines in real archives) stay attached to whichever
+  timestamped line precedes them rather than being dropped or
+  reordered. Verified against the real bug rather than synthetic data:
+  fed the actual pre-seam/post-seam split of the gemma4 archive back
+  through the merge function and confirmed 0 backward jumps (was 1),
+  0 lines dropped, and the misplaced `warnings.warn` line moves from
+  position 143 (wrong, near the end) to position 16 (correct, near the
+  true start). Landed as a prerequisite for `phase_extract.py`
+  specifically because a boundary detector has no way to notice this
+  kind of corruption on its own -- it just silently computes wrong
+  durations from correctly-parsed, wrongly-ordered input.
+
 ### 97. `"fetching" in logs_lower` matched the middle of "prefetching", so every load on an EXT4 host was filed as `downloaded` — and because that branch is checked first, it masked every compile too (V?.?.?)
 
 * **The Trap:** `_finalize_host_status()`'s READY-time bucket classifier
