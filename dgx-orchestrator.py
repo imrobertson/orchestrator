@@ -2182,6 +2182,32 @@ def _resolve_active_recipe(host: str, catalog_models: dict, loaded_model: str,
         return deployment["catalog_key"], deployment.get("config_hash"), True
     return _resolve_catalog_key(loaded_model, catalog_models), None, False
 
+# Load-phase classification keywords for record_load_time()'s READY-time
+# bucket assignment. Word-bounded deliberately: the original bare-substring
+# test matched "fetching" inside "prefetching" and misclassified every load
+# on images that log vLLM's auto-prefetch notice. \b prevents that -- the
+# position before "fetching" in "prefetching" sits between two word
+# characters, so it is not a boundary and does not match, while a genuine
+# "Fetching 17 files" still does.
+#
+# This makes the classifier less wrong, not right. It still assigns ONE
+# bucket per run based on whichever keyword appears anywhere in the log, so
+# a run that downloads AND compiles is filed as `downloaded` and the whole
+# elapsed time -- download plus compile plus load -- lands in that single
+# bucket. Only discrete per-phase timestamps fix that; see common/runlog.py
+# and TOMBSTONES #95/#97.
+#
+# The optional (?:re) prefix is load-bearing in the other direction: a bare
+# \bcompiling\b misses "Recompiling function ..." (torch dynamo emits this,
+# and it IS a genuine compile), so the boundary fix alone would have traded
+# a false positive for a false negative. "(?:re)?" restores those without
+# reopening the prefetching hole -- "prefetching" still fails to match,
+# since "pr" is not "re" and the position before "fetching" is not a word
+# boundary either way. Caught by the fix's own test, not by review.
+_RE_DOWNLOADING = re.compile(r'\b(?:re)?(?:downloading|fetching)\b')
+_RE_COMPILING = re.compile(r'\b(?:re)?(?:tilelang completes|jit compilation|compiling)\b')
+
+
 def _config_hash_for(model: str, topo_key: str) -> Optional[str]:
     """
     Best-effort config_hash for a running model, for attaching to a run-log
@@ -2287,9 +2313,22 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                     elapsed = int(time.time() - start_ts)
                     log_res = run_ssh(ip, user, ["docker", "logs", "--tail", "5000", active_container], timeout=15)
                     logs_lower = (log_res.stdout + log_res.stderr).lower()
-                    if "downloading" in logs_lower or "fetching" in logs_lower:
+                    # Word-BOUNDED, not bare substring. The unbounded
+                    # version matched "fetching" inside "prefetching" and
+                    # filed every load on this image as `downloaded` --
+                    # vLLM's weight_utils.py logs "Auto-prefetch is
+                    # disabled ... If you want to force prefetching, start
+                    # vLLM with --safetensors-load-strategy=prefetch" on
+                    # every load whose filesystem isn't a recognized
+                    # network FS, which on EXT4 is always. A line stating
+                    # prefetch is DISABLED was being read as evidence of a
+                    # download, and since this branch is checked first it
+                    # also masked every compile. Confirmed on a real
+                    # capture: gemma4-26b-a4b-nvfp4::1_node, 283s warm
+                    # start, sole keyword match was that one line.
+                    if _RE_DOWNLOADING.search(logs_lower):
                         load_type = "downloaded"
-                    elif "tilelang completes" in logs_lower or "jit compilation" in logs_lower or "compiling" in logs_lower:
+                    elif _RE_COMPILING.search(logs_lower):
                         load_type = "compiled"
                     else:
                         load_type = "cached"

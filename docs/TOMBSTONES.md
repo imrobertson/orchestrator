@@ -36,6 +36,54 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 97. `"fetching" in logs_lower` matched the middle of "prefetching", so every load on an EXT4 host was filed as `downloaded` — and because that branch is checked first, it masked every compile too (V?.?.?)
+
+* **The Trap:** `_finalize_host_status()`'s READY-time bucket classifier
+  tested bare substrings against the whole log:
+  `if "downloading" in logs_lower or "fetching" in logs_lower`. vLLM's
+  `weight_utils.py:881` emits, on every load whose filesystem is not a
+  recognized network FS, a line reading roughly "Auto-prefetch is
+  disabled because the filesystem (EXT4) is not a recognized network FS
+  (NFS/Lustre). If you want to force prefetching, start vLLM with
+  `--safetensors-load-strategy=prefetch`." The substring `fetching`
+  appears inside `prefetching`, so a line stating that prefetch is
+  DISABLED was read as positive evidence of a download. On EXT4 that line
+  is unconditional, so the match was unconditional. And since the
+  download test is the first arm of the `if/elif` chain, it also
+  short-circuited compile detection: on any image emitting this notice,
+  every load was `downloaded` and no load could ever be classified
+  `compiled` or `cached`. The three-bucket taxonomy collapsed to one
+  without anything failing, erroring, or looking wrong. Invisible for as
+  long as it was because the only symptom is a plausible-looking number
+  in a plausible-looking bucket, and the evidence needed to question it
+  (the log) was read once and discarded — see #93 for the archive built
+  precisely because nothing retained it.
+* **The Fix:** Word-bounded compiled patterns hoisted to module level:
+  `_RE_DOWNLOADING = \b(?:re)?(?:downloading|fetching)\b` and
+  `_RE_COMPILING = \b(?:re)?(?:tilelang completes|jit compilation|compiling)\b`.
+  `\b` kills the prefetching match — the position before `fetching` in
+  `prefetching` sits between two word characters and is not a boundary —
+  while a genuine "Fetching 17 files" still matches. The optional
+  `(?:re)` prefix is load-bearing in the OTHER direction and was added
+  only after the fix's own test caught it: a bare `\bcompiling\b` misses
+  "Recompiling function ..." which torch dynamo emits and which is a
+  genuine compile, so the boundary fix alone would have traded a false
+  positive for a false negative. 12/12 assertions, including the real
+  offending line verbatim. Two things this does NOT fix, stated so nobody
+  reads the entry as closing them. Every `downloaded` sample recorded on
+  an affected image is suspect: `_scratch-gemma4-nvfp4-mtp::1_node`'s 16
+  samples at 248-309s, `_scratch-gemma4-nvfp4-baseline`'s 370/262/267,
+  and `Active Container::1_node`'s 281-484 are all far too fast to be
+  real 26B downloads and are almost certainly warm starts misfiled by
+  this. And the classifier still assigns ONE bucket per run from a
+  keyword appearing anywhere in the log, so a run that downloads AND
+  compiles files its entire elapsed time under `downloaded`. Only
+  discrete per-phase timestamps fix that -- see #95. Found by the run-log
+  archive (#93) on its very first real capture:
+  `gemma4-26b-a4b-nvfp4::1_node`, a 283s warm start filed as
+  `downloaded`, whose sole keyword match in 237 log lines was that one
+  prefetch-disabled notice.
+
 ### 96. `eta_seconds` was computed, latched, shipped in every `/api/status` payload, and never rendered — the dashboard had been showing the raw re-derived string all along (V?.?.?)
 
 * **The Trap:** The reported symptom was an ETA that "violently snaps
