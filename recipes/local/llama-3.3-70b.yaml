@@ -1,5 +1,6 @@
 recipe_version: '1'
 hf_path: meta-llama/Llama-3.3-70B-Instruct
+image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.7
 capability:
   task: null

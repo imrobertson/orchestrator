@@ -1,5 +1,6 @@
 recipe_version: '1'
 hf_path: nvidia/Llama-4-Scout-17B-16E-Instruct-FP8
+image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.7
 capability:
   task: null
