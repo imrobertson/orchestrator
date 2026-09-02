@@ -380,8 +380,8 @@
       383
     ],
     "lifetime": {
-      "in": 140,
-      "out": 2282,
+      "in": 180,
+      "out": 3043,
       "draft": 0,
       "accepted": 0
     },
@@ -494,7 +494,25 @@
       "out": 0,
       "draft": 0,
       "accepted": 0
-    }
+    },
+    "runs": [
+      {
+        "run_id": "1788377902-spark-4-488a8502cc9c",
+        "ts": 1788377902.0,
+        "outcome": "ready",
+        "config_hash": "d81effec0251f82d",
+        "total_sec": 552.671599,
+        "pre_load_sec": 31.372008,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 394.72,
+        "compile_sec": 0.31,
+        "compile_stage_confidence": "reported",
+        "engine_init_sec": 104.5,
+        "rank_count": 1,
+        "unaccounted_sec": 21.76959099999999
+      }
+    ]
   },
   "muse-glimmer-30b-nvfp4::1_node": {
     "cached": [],
@@ -604,5 +622,53 @@
         "unaccounted_sec": 41.118469000000005
       }
     ]
+  },
+  "llama-4-fp4::1_node": {
+    "cached": [
+      581
+    ],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    },
+    "runs": [
+      {
+        "run_id": "1788378882-spark-4-8440987431f4",
+        "ts": 1788378882.0,
+        "outcome": "ready",
+        "config_hash": "294fa3791e3d7635",
+        "total_sec": 558.467206,
+        "pre_load_sec": 53.592466,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 98.75,
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 29.67,
+        "rank_count": 1,
+        "unaccounted_sec": 376.45474
+      }
+    ]
+  },
+  "llama-4-fp4::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 110,
+      "out": 1435,
+      "draft": 0,
+      "accepted": 0
+    },
+    "last_seen_raw": {
+      "p": 132.0,
+      "g": 1464.0,
+      "d": 0.0,
+      "a": 0.0
+    }
   }
 }
