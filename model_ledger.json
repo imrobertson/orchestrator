@@ -233,8 +233,8 @@
         "count": 11
       },
       "6dac0d37cd5c9096": {
-        "last_success_ts": 1788362746.618812,
-        "count": 1
+        "last_success_ts": 1788375582.2691207,
+        "count": 2
       }
     },
     "last_seen_raw": {
@@ -242,7 +242,25 @@
       "g": 768.0,
       "d": 1320.0,
       "a": 508.0
-    }
+    },
+    "runs": [
+      {
+        "run_id": "1788375202-spark-4-5a13298672dc",
+        "ts": 1788375202.0,
+        "outcome": "ready",
+        "config_hash": "6dac0d37cd5c9096",
+        "total_sec": 378.677886,
+        "pre_load_sec": 127.092737,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 163.95,
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 31.48,
+        "rank_count": 3,
+        "unaccounted_sec": 56.155148999999994
+      }
+    ]
   },
   "qwen-3.5-122b::2_node": {
     "cached": [],
