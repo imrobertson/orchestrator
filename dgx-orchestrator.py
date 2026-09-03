@@ -117,7 +117,6 @@ def _compute_source_hash_suffix() -> str:
 # _compute_source_hash_suffix()'s docstring for why the hash half of this
 # is the load-bearing part.
 ORCHESTRATOR_VERSION = f"{ORCHESTRATOR_VERSION_SLUG}+{_compute_source_hash_suffix()}"
-MODELS_YAML_PATH = BASE_DIR / "models.yaml"
 LEDGER_PATH = BASE_DIR / "model_ledger.json"
 CONFIG_REGISTRY_PATH = BASE_DIR / "config_registry.json"
 BENCHMARK_LEDGER_PATH = BASE_DIR / "benchmark_ledger.csv"
@@ -2929,31 +2928,6 @@ def enrich_catalog(catalog_dict: dict) -> dict:
 
     return catalog_dict
 
-def _load_model_catalog_legacy() -> dict:
-    if not MODELS_YAML_PATH.exists(): return {"catalog": {"models": {}}}
-    try:
-        with open(MODELS_YAML_PATH, "r") as f: config = yaml.safe_load(f) or {}
-        global_hf = config.get('GLOBAL_HF_HUB_OFFLINE', 0)
-        global_tf = config.get('GLOBAL_TRANSFORMERS_OFFLINE', 0)
-        models = config.get('models', {})
-        if isinstance(models, dict):
-            for model_name, model_data in models.items():
-                if not isinstance(model_data, dict): continue
-                topologies = model_data.get('topologies', {})
-                if isinstance(topologies, dict):
-                    for topo_name, topo_data in topologies.items():
-                        if not isinstance(topo_data, dict): continue
-                        if 'env_vars' not in topo_data: topo_data['env_vars'] = []
-                        if global_hf == 1:
-                            topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('HF_HUB_OFFLINE=')]
-                            topo_data['env_vars'].append('HF_HUB_OFFLINE=1')
-                        if global_tf == 1:
-                            topo_data['env_vars'] = [env for env in topo_data['env_vars'] if not env.startswith('TRANSFORMERS_OFFLINE=')]
-                            topo_data['env_vars'].append('TRANSFORMERS_OFFLINE=1')
-        return {"catalog": config}
-    except Exception as e:
-        return {"error": str(e), "catalog": {"models": {}}}
-
 def _sync_config_registry() -> None:
     """
     Maintain config_registry.json: an append-only decoder ring mapping every
@@ -3031,8 +3005,13 @@ def _sync_config_registry() -> None:
 
 
 def load_model_catalog() -> dict:
-    if os.environ.get("USE_LEGACY_CATALOG") == "1": raw_cat = _load_model_catalog_legacy()
-    else: raw_cat = build_catalog_response()
+    # Recipes are the only catalog source. The models.yaml fallback and its
+    # env-var escape hatch were removed once Phase 2 completed:
+    # build_catalog_response() applies the same GLOBAL_HF_HUB_OFFLINE /
+    # GLOBAL_TRANSFORMERS_OFFLINE env_var injection the legacy loader did,
+    # sourcing both from cluster_config.yaml rather than from a catalog
+    # file's own top-level keys. See common/recipes.py.
+    raw_cat = build_catalog_response()
     # Registry sync rides the catalog path so every config that exists gets
     # recorded, not just ones that have launched -- an unlaunched config is
     # exactly the one whose payload you want when working out why it never
@@ -3521,14 +3500,13 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     # does not surface `mods` in the catalog dict yet (see common/recipes.py
     # -- still execution-inert as of Task MA/MB), so mod_names is read
     # straight from the raw RecipeConfig via load_recipes(), not from
-    # model_config. Under USE_LEGACY_CATALOG=1, or for any model not backed
-    # by a recipes/{local,eugr}/*.yaml file, there is no RecipeConfig at
-    # all -- mod_names stays [] (strict no-op), exactly as if the recipe
-    # had an explicit mods: []. A recipe-loading error here (e.g. an
-    # unrelated malformed recipe file elsewhere in recipes/) must not block
-    # this deploy, since this model's own recipe may be perfectly fine (or
-    # may not even come from recipes/ at all under legacy mode) -- so it is
-    # caught and logged, not raised, falling back to mod_names = [].
+    # model_config. For any model not backed by a recipes/{local,eugr}/*.yaml
+    # file there is no RecipeConfig at all -- mod_names stays [] (strict
+    # no-op), exactly as if the recipe had an explicit mods: []. A
+    # recipe-loading error here (e.g. an unrelated malformed recipe file
+    # elsewhere in recipes/) must not block this deploy, since this model's
+    # own recipe may be perfectly fine -- so it is caught and logged, not
+    # raised, falling back to mod_names = [].
     mod_names: list = []
     try:
         recipe_obj = load_recipes().get(model)
@@ -3775,11 +3753,11 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     # run_benchmark -- this is what lets a plain "Deploy" click (which
     # doesn't pass wait=True) still eventually get marked as launched
     # successfully, via the status-polling loop rather than blocking this
-    # request on a full health-check wait. Silently skipped under the
-    # legacy models.yaml catalog, which has no per-recipe config_hash to
-    # key against, and silently skipped (not fatal) if hashing fails for
-    # any other reason -- this is a QoL marker, not load-bearing for deploy
-    # itself.
+    # request on a full health-check wait. Silently skipped (not fatal) if
+    # hashing fails -- this is a QoL marker, not load-bearing for deploy
+    # itself. This used to be gated behind a legacy-catalog check, since the
+    # old models.yaml path had no per-recipe config_hash to key against;
+    # with recipes as the only source, it now runs on every deploy.
     #
     # The same recipe/config_hash resolution also feeds ACTIVE_DEPLOYMENT_STATE
     # (unlike PENDING_LAUNCH_STATE, this one IS load-bearing -- it's what the
@@ -3787,33 +3765,32 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     # for every host in target_hosts here, at the point we know each of them
     # has a container confirmed running post-launch, not gated on a later
     # health check the way launch-success recording is).
-    if os.environ.get("USE_LEGACY_CATALOG") != "1":
-        try:
-            recipe = load_recipes().get(model)
-            if recipe is not None:
-                cfg_hash = compute_config_hash(recipe, topo_key)
-                with PENDING_LAUNCH_LOCK:
-                    PENDING_LAUNCH_STATE["pending"] = {
-                        "model": model,
-                        "topo_key": topo_key,
-                        "config_hash": cfg_hash,
-                        "started_ts": time.time(),
-                    }
-                for h in target_hosts:
-                    _set_active_deployment(h, model, topo_key, cfg_hash)
-        except Exception as exc:
-            # PENDING_LAUNCH_STATE staying unset here is genuinely fine
-            # (it's just a launch-success telemetry marker, as noted
-            # above) -- but ACTIVE_DEPLOYMENT_STATE staying unset is NOT
-            # fine. It's what lets the dashboard show the correct recipe
-            # instead of falling back to the ambiguous fuzzy served-name
-            # match (see ACTIVE_DEPLOYMENT_STATE's module comment -- this
-            # whole mechanism exists specifically to fix that ambiguity).
-            # A silent failure here would silently reintroduce it. Print
-            # so a broken load_recipes()/compute_config_hash() call after
-            # this deploy shows up in the daemon log immediately, not as
-            # a confusing "why did the dropdown revert again" report.
-            print(f"[!] _execute_deployment_impl({model}): failed to record ACTIVE_DEPLOYMENT_STATE - {exc}")
+    try:
+        recipe = load_recipes().get(model)
+        if recipe is not None:
+            cfg_hash = compute_config_hash(recipe, topo_key)
+            with PENDING_LAUNCH_LOCK:
+                PENDING_LAUNCH_STATE["pending"] = {
+                    "model": model,
+                    "topo_key": topo_key,
+                    "config_hash": cfg_hash,
+                    "started_ts": time.time(),
+                }
+            for h in target_hosts:
+                _set_active_deployment(h, model, topo_key, cfg_hash)
+    except Exception as exc:
+        # PENDING_LAUNCH_STATE staying unset here is genuinely fine
+        # (it's just a launch-success telemetry marker, as noted
+        # above) -- but ACTIVE_DEPLOYMENT_STATE staying unset is NOT
+        # fine. It's what lets the dashboard show the correct recipe
+        # instead of falling back to the ambiguous fuzzy served-name
+        # match (see ACTIVE_DEPLOYMENT_STATE's module comment -- this
+        # whole mechanism exists specifically to fix that ambiguity).
+        # A silent failure here would silently reintroduce it. Print
+        # so a broken load_recipes()/compute_config_hash() call after
+        # this deploy shows up in the daemon log immediately, not as
+        # a confusing "why did the dropdown revert again" report.
+        print(f"[!] _execute_deployment_impl({model}): failed to record ACTIVE_DEPLOYMENT_STATE - {exc}")
 
     if wait or run_benchmark:
         head_ip = HOSTS[head]["ip"]

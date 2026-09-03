@@ -713,6 +713,63 @@ similar -- by edit distance, by shared `hf_path`, or both.
 **Depends on:** nothing. Could land alongside the flag-combination linter
 above, since both hook into the same `load_recipes()` pass.
 
+**Second real incident, 2026-09-03, different shape -- broadens the
+scope of this entry.** `TOMBSTONES.md` #110: `nemotron-3.5-lightning-
+bf16` picked up two ledger keys (`nemotron-3.5-lightning-bf16::2_node`
+vs. `nemotron-3_5-lightning-bf16::2_node`, dot vs. underscore), splitting
+real launch/telemetry data across both. Different failure mode than the
+`deepseek-v4-flash` incident above (that was two *legitimately separate*
+recipe files with confusingly similar names; this is *one* model, two
+different subsystems computing its key differently) -- but same root
+category: nothing today can look at two similar-looking ledger keys and
+say whether they're the same thing, a genuine rename, a real content
+change, or one of them was never a committed recipe at all.
+
+**Directly requested, 2026-09-03: a real way to tell these apart.**
+Given a pair of suspiciously-similar catalog/ledger keys, need to
+answer: same underlying config (naming bug, like #110)? Genuinely
+renamed (old key retired, new key is its successor)? Genuinely changed
+(same key, different config over time)? Or never a real catalog file at
+all -- a live/scratch variant (`ab_test.py`'s ad-hoc/override path) that
+only ever existed as a deploy, not a commit? Building blocks that
+already exist for this, not yet wired together:
+- **`config_hash`/`config_registry.json`** (this session's Task B, see
+  `SESSION-CLOSEOUT-2026-09-02-FINAL.md`) decodes a hash back to its
+  exact payload. Two keys sharing an identical `config_hash` are
+  provably the same config regardless of what name each was launched
+  under -- the single strongest signal available, and already built.
+- **`git log --follow` on the recipe file** distinguishes a real rename
+  (file history continues under a new name) from a deletion-and-new-file
+  (two unrelated files that happen to look similar) -- git already knows
+  this, nothing currently asks it.
+- **`ab_test.py`'s scratch-recipe naming convention** (`write_scratch_recipe()`'s
+  generated names, generally `f"{label}-scratch"`) already marks a
+  live/ad-hoc variant as distinguishable from a committed catalog recipe
+  *if consistently followed* -- worth auditing whether every live-variant
+  code path actually tags its ledger key this way, or whether some
+  (like whatever wrote `nemotron-3.5-lightning-bf16`'s dot-form key)
+  bypass it.
+- **Missing entirely:** nothing today cross-references the live
+  `recipes/local/*.yaml` + `recipes/eugr/*.yaml` file listing against
+  `model_ledger.json`'s key set to flag "this ledger key has real launch
+  history but no corresponding file today" -- the specific question that
+  would have made tonight's nemotron `git log` check (TOMBSTONES #108)
+  a five-second automated answer instead of a manual one.
+
+**Shape of a real fix, this broader piece:** a standalone reconciliation
+pass (`tools/reconcile_ledger.py`, read-only, matching the verification-
+harness pattern already used elsewhere in this repo) that, for every
+ledger key: (1) checks whether a live recipe file with that exact stem
+exists; if not, (2) checks `git log --follow` across all `recipes/`
+history for a file that once had this stem, to distinguish "renamed/
+retired" from "never committed"; (3) for any two ledger keys within a
+small edit distance of each other, compares their most recent
+`config_hash` -- identical means likely a key-derivation bug like #110,
+different means likely two genuinely different things sharing a
+similar-looking name. Output is a report, not an automatic merge or
+deletion -- per this session's own experience, guessing at which side of
+a near-duplicate is authoritative is exactly the mistake to avoid.
+
 ---
 
 ### `benchmark_ledger.csv` key can silently mismatch the recipe actually benchmarked
@@ -1114,6 +1171,67 @@ from a process that died before its rename-into-place step.
 teardown work above. Worth doing after a few more `cache-inventory` runs
 across normal operation, so the heuristic is tuned against what a *healthy*
 cache actually looks like, not just the one incident.
+
+---
+
+### ETA/telemetry rework (Tasks A-D): status and remaining backlog
+
+**Ported here, 2026-09-03, from `SESSION-CLOSEOUT-2026-09-02-FINAL.md`,
+which this entry supersedes for backlog-tracking purposes** -- that
+document is being retired as a standalone file; this section plus
+`TOMBSTONES.md` #95-#100 (the individual fixes that make up Tasks A-D)
+are now the canonical record instead. Ported verbatim in substance, not
+re-summarized, so nothing is lost in the move.
+
+**Shipped and verified, 2026-09-02 (not backlog, stated for context):**
+run-log archive capture, a `config_hash` → `config_registry.json`
+decoder (28 hashes, 0 collisions at the time), phase-based run recording
+replacing keyword-guessed buckets, and a tiered ETA reader preferring
+real phase history once enough exists. See `TOMBSTONES.md` #95-#100 for
+the individual bugs found and fixed while shipping these. Two of the
+three real backlog items from that session (compile-magnitude framing,
+download-phase marker) have since progressed substantially -- see the
+"Recipe catalog integrity" section above and `TOMBSTONES.md` #108/#109
+for tonight's new real samples on both.
+
+**Still genuinely open, carried forward as-is:**
+
+1. **Two unresolved design questions, never investigated:**
+   - Does `resolve_mod_tag()`'s digest hash mod *names* or mod
+     *contents*? If names, editing `mods/<name>/run.sh` leaves the tag
+     unchanged, `ensure_mods_baked()` treats it as a cache hit, and the
+     edit silently never reaches the container. Settle via two dry-runs
+     either side of a real edit -- **don't paste raw dry-run output**,
+     it has leaked `HF_TOKEN` in plaintext before.
+   - Is `capability` still genuinely inert and safe to exclude from
+     `config_hash`? Excluded on the same "inert metadata" assumption
+     that went stale for `mods` (`TOMBSTONES.md` #91) -- never
+     re-verified. Note: as of a recent memory update, `capability` is
+     confirmed intentionally unused today, scoped for a future Phase 4
+     feature (an agent querying the orchestrator for task-suited
+     models) -- doesn't resolve the `config_hash`-exclusion safety
+     question on its own, but rules out "dead code, just delete it" as
+     the fix.
+
+2. **The live in-progress countdown is unchanged.**
+   `detect_model_stage()`'s log-keyword phase guess, used while a
+   container is still loading, is untouched by Tasks C/D and can still
+   flip mid-load for the reason the `index.html` ETA clamp exists in the
+   first place. A real fix here is a bigger, unscoped piece of work --
+   plausibly reading toward the same self-reported-duration lines
+   `phase_extract.py` already knows how to parse, live rather than
+   post-hoc, but that's a design question, not a quick patch. No
+   progress on this since the closeout doc was written.
+
+3. **The tainted pre-fix `gemma-4-31b::2_node` ledger entry** -- no
+   action needed, carried forward for completeness only. `pre_load_sec`
+   is wrong in that one entry, `total_sec` is fine, nothing currently
+   reads the wrong field for anything that matters, and it'll dilute out
+   of any median or age out past the 20-run cap on its own.
+
+**Depends on:** nothing structurally for any of the three. #1's two
+sub-questions are cheap, standalone verification tasks. #2 is a real
+design effort, not scoped to a specific fix yet.
 
 ---
 
