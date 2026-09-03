@@ -673,7 +673,18 @@ def resolve_variant(side: str, args, cfg) -> dict | None:
         "serve_args": getattr(args, f"{side}_serve_args"),
         "docker_env": getattr(args, f"{side}_docker_env"),
     }
-     any_override = any(v is not None for k, v in ov.items() if k not in ("docker_env", "nodes")) or bool(ov["docker_env"])
+    # "nodes" is deliberately excluded here: --{side}-nodes alone (no other
+    # --{side}-* override) must still qualify as a pure named-recipe
+    # passthrough, or a 2-node-only catalog recipe (e.g. one with no
+    # 1_node topology) can never be resolved at all -- catalog_nodes would
+    # default to 1, topo_key would resolve to "1_node", and the recipe
+    # lookup would fail outright before nodes is ever consulted again.
+    # Combining --{side}-nodes with any REAL override (vllm_args, etc.)
+    # still correctly falls through to the ad-hoc branch below, which
+    # rejects nodes > 1 there on its own terms. TOMBSTONES.md #91.
+    any_override = (any(v is not None for k, v in ov.items() if k not in ("docker_env", "nodes"))
+                     or bool(ov["docker_env"]))
+
     if name is None and not any_override:
         return None  # side not requested
 
