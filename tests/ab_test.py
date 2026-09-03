@@ -135,6 +135,13 @@ from common.ssh import run_ssh
 
 HOSTS = legacy_hosts_dict()
 PRIMARY_HOST = next(iter(HOSTS), None)
+# Mirrors dgx-orchestrator.py's own SECONDARY_HOST resolution exactly
+# (same "second dict key, or fall back to primary if there's only one
+# host" logic) -- kept in sync deliberately, since a 2-node deploy's
+# target_hosts there is [PRIMARY_HOST, SECONDARY_HOST], and the pre-pull
+# fix below needs to touch the same hosts the deploy step will actually
+# use, not redefine that set independently. TOMBSTONES.md #106.
+SECONDARY_HOST = list(HOSTS.keys())[1] if len(HOSTS) > 1 else PRIMARY_HOST
 
 # Legacy constants -- only referenced by KNOWN_PRESETS now. A from-scratch
 # ad-hoc or raw-docker variant sources every one of these from --a-*/--b-*
@@ -681,7 +688,7 @@ def resolve_variant(side: str, args, cfg) -> dict | None:
     # lookup would fail outright before nodes is ever consulted again.
     # Combining --{side}-nodes with any REAL override (vllm_args, etc.)
     # still correctly falls through to the ad-hoc branch below, which
-    # rejects nodes > 1 there on its own terms. TOMBSTONES.md #91.
+    # rejects nodes > 1 there on its own terms. TOMBSTONES.md #105.
     any_override = (any(v is not None for k, v in ov.items() if k not in ("docker_env", "nodes"))
                      or bool(ov["docker_env"]))
 
@@ -852,12 +859,27 @@ def run_stage(side: str, spec: dict, args, cfg, host: str, ip: str, user: str) -
     # container" is not sized for "first-time pull of a multi-GB image,
     # then launch." This has bitten for real, more than once, exactly when
     # a never-before-pulled image was involved.
-    print(f"    pulling {image} on {host} if not already cached (first pull can take a while)...")
-    pull_res = run_ssh(ip, user, ["docker", "pull", image], timeout=1800)
-    pulled_ok = record(f"[{composed}] docker pull succeeds", pull_res.returncode == 0,
-                        "" if pull_res.returncode == 0 else pull_res.stderr.strip()[:400])
-    if not pulled_ok:
-        return False
+    #
+    # Pulls on EVERY host a 2-node deploy will actually use, not just the
+    # head -- previously only pulled on `host` (the head), which let
+    # spark-3 and spark-4 silently drift to different cached versions of
+    # a `:latest` tag (spark-4 gets refreshed here every run; spark-3
+    # never does). Ray's own head/worker version check then fails hard
+    # the moment the worker tries to join -- confirmed live, 2026-09-03,
+    # `RuntimeError: Version mismatch: ... Ray: 2.58.0 ... Ray: 2.57.0`
+    # crashing `vllm-worker` on spark-3 immediately after startup, on
+    # every single attempt (deterministic, not flaky -- both hosts just
+    # had genuinely different bits on disk under the same tag). See
+    # TOMBSTONES.md #106.
+    pull_hosts = [PRIMARY_HOST, SECONDARY_HOST] if spec.get("nodes", 1) == 2 else [host]
+    for pull_host in dict.fromkeys(pull_hosts):  # de-dupe, preserve order (matters if PRIMARY_HOST == SECONDARY_HOST on a single-host dev setup)
+        pull_ip = HOSTS[pull_host]["ip"]
+        print(f"    pulling {image} on {pull_host} if not already cached (first pull can take a while)...")
+        pull_res = run_ssh(pull_ip, user, ["docker", "pull", image], timeout=1800)
+        pulled_ok = record(f"[{composed}] docker pull succeeds on {pull_host}", pull_res.returncode == 0,
+                            "" if pull_res.returncode == 0 else pull_res.stderr.strip()[:400])
+        if not pulled_ok:
+            return False
 
     recipe_path: Path | None = None
     try:

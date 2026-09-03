@@ -36,6 +36,89 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 106. `ab_test.py`'s pre-pull only ever targeted the head node -- `spark-3` and `spark-4` silently drifted to different cached builds of the same `:latest` tag (V?.?.?)
+
+* **The Trap:** The pre-pull step ahead of every deploy (`docker pull
+  {image}` before `docker run`/`cli deploy`) only ever ran against
+  `host` -- the single head/target host passed into `run_stage()`. For a
+  2-node deploy this never touched the second physical host at all.
+  `eugr/spark-vllm-b12x:latest` moved upstream at some point; `spark-4`
+  (always the head in every deploy this pre-pull step ever ran) picked
+  up the new build every time it ran, `spark-3` (only ever a worker,
+  never targeted by this step) never did. Docker's own pull semantics
+  made this invisible until it actually broke something: `docker run`
+  only auto-pulls when a tag is completely absent locally, not when a
+  stale image already exists under that same tag -- so `spark-3` kept
+  silently launching an old cached build indefinitely. The two hosts'
+  Ray versions diverged (2.58.0 vs 2.57.0), and Ray's own head/worker
+  version check refuses to let a mismatched worker join, crashing
+  `vllm-worker` immediately on every single 2-node deploy attempt --
+  confirmed via `RuntimeError: Version mismatch: ... Ray: 2.58.0 ...
+  Ray: 2.57.0`. Deterministic, not flaky: reproduced identically across
+  6/6 attempts spanning two unrelated recipes (`qwen-2_5-coder-32b`
+  PP and its `-tp` TP sibling), ruling out either recipe as the cause.
+  Found live, 2026-09-03.
+* **The Fix:** Pre-pull now loops over every host a 2-node deploy will
+  actually use (`[PRIMARY_HOST, SECONDARY_HOST]`, mirroring
+  `dgx-orchestrator.py`'s own `target_hosts` resolution for `nodes == 2`
+  exactly, rather than redefining that set independently) instead of
+  just `host`. 1-node deploys unchanged -- still pull only the single
+  target host. `py_compile`-clean; not yet confirmed against a real live
+  2-node deploy as of this writing. Immediate unblock for the specific
+  incident (no code deploy needed): `docker pull
+  eugr/spark-vllm-b12x:latest` run by hand directly on `spark-3`.
+
+### 105. `ab_test.py`'s `any_override` treated `--{side}-nodes` itself as an override, making it structurally impossible to select a 2-node topology through the catalog-recipe path at all (V?.?.?)
+
+* **The Trap:** `resolve_variant()`'s pure-named-recipe-passthrough branch
+  (the only branch that can ever set `nodes=2`) requires `not any_override`
+  to be reached. `any_override` was computed by checking every `ov` field
+  including `nodes` itself -- so passing `--{side}-nodes 2` alone, with
+  zero other `--{side}-*` flags, was enough to disqualify passthrough and
+  fall into the ad-hoc branch instead, which then unconditionally rejects
+  `nodes > 1` at its own guard (`"--{side}-nodes > 1 is only supported for
+  a pure named-recipe passthrough (no --{side}-* overrides)"` -- an error
+  message whose own wording implies nodes-only should qualify, which it
+  didn't). Net effect: no flag combination could ever resolve a 2-node
+  catalog topology through this script, for any recipe, including a
+  recipe with *only* a `2_node` topology and no `1_node` fallback to
+  silently mis-resolve to instead (that case failed loudly with "Recipe
+  has no '1_node' topology"; recipes carrying both topologies failed
+  silently onto the wrong one -- see `ROADMAP.md`'s TP-vs-PP entry, whose
+  own suggested command was written before this was caught and doesn't
+  work as written). Found live, 2026-09-03, while trying to run the
+  `qwen-2_5-coder-32b` vs `qwen-2_5-coder-32b-tp` A/B.
+* **The Fix:** Excluded `"nodes"` from the `any_override` field check.
+  `--{side}-nodes` alone now correctly reaches the passthrough branch;
+  combined with any *real* override (`--{side}-vllm-args`, etc.) it still
+  correctly falls through to the ad-hoc branch's existing `nodes > 1`
+  rejection, unchanged. One-line fix, `py_compile`-clean, not yet
+  confirmed against a real live 2-node deploy as of this writing --
+  confirm the actual A/B run completes before trusting this as fully
+  validated, not just syntactically correct.
+
+### 104. `qwen3_next_mtp` (MTP) speculative decoding is incompatible with `pp_size > 1` -- hard vLLM `NotImplementedError`, not a recipe misconfiguration (V?.?.?)
+
+* **The Trap:** `qwen-3.6-27b-nvfp4.yaml`'s `2_node` topology
+  (`pp_size: 2`, `--speculative-config
+  '{"method":"qwen3_next_mtp","num_speculative_tokens":3}'`) crashed at
+  engine-config-creation time, before any weight load or GPU work:
+  `NotImplementedError: Pipeline parallelism is not supported for this
+  model. Supported models implement the SupportsPP interface.` Traced to
+  `self.draft_model_config.verify_with_parallel_config(...)` -- this is
+  the MTP draft model class (`Qwen3_5MTP`) failing its own PP check, not
+  the target model. The failure is therefore about the *method*
+  (`qwen3_next_mtp`/MTP-family speculative decoding), not this specific
+  checkpoint -- expect the identical crash on any recipe pairing an MTP
+  draft head with `pp_size > 1`, e.g. `qwen-3.5-122b.yaml`'s PP-side MTP
+  addition this same session, untested as of this writing.
+* **The Fix:** No fix -- this is a real upstream vLLM limitation, not a
+  flag ordering or config mistake to correct. MTP-family speculative
+  decoding on this cluster requires `tp_size` (or single-node), never
+  `pp_size > 1`. Caught cheaply: fails at config validation, before any
+  compile/weight-load/GPU cost. Candidate for the known-bad-flag-
+  combination linter in `ROADMAP.md` -- see that entry's guardrails list.
+
 ### 103. Three recipes stuck on the `default_image`-has-no-Ray / TOMBSTONES #43 trap now confirmed fixed by an image swap plus the standard Ray fix -- `llama-3.3-70b`, `llama-4-fp4`, `llama-4-fp8` all now live-verified (V4.8.6+)
 
 * **The Trap:** covered live in `docs/TROUBLESHOOTING.md` Incident #11

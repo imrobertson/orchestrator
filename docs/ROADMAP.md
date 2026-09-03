@@ -452,11 +452,20 @@ been validated against a real deploy before being committed:
    in their recipe files but are **not yet individually confirmed by a
    live deploy** -- treat as drafted, not validated, until one actually
    runs.
+4. **Added 2026-09-03.** Any MTP-family `speculative-config`
+   (`qwen3_next_mtp`, and presumably any other MTP method) combined with
+   `pp_size > 1`. Hard vLLM `NotImplementedError` at engine-config
+   creation time -- the MTP draft-model class doesn't implement
+   `SupportsPP`, independent of whether the target model does. Confirmed
+   live on `qwen-3.6-27b-nvfp4::2_node`. Cheap to catch (fails before any
+   compile/weight-load cost), but currently only discoverable by actually
+   deploying and watching it crash. See `TOMBSTONES.md` #104 and
+   `docs/TROUBLESHOOTING.md` #13.
 
-Both are documented in `docs/TROUBLESHOOTING.md` now, but only as
-after-the-fact incident write-ups -- nothing stops a third recipe from
-reintroducing either pattern, and a recipe carrying one can sit in git
-looking fine (valid YAML, passes schema validation) until the moment
+All four are documented in `docs/TROUBLESHOOTING.md` now, but only as
+after-the-fact incident write-ups -- nothing stops a fifth recipe from
+reintroducing any of these patterns, and a recipe carrying one can sit in
+git looking fine (valid YAML, passes schema validation) until the moment
 someone actually deploys it.
 
 **Shape of a real fix:**
@@ -464,7 +473,7 @@ someone actually deploys it.
   itself (warn at load time, don't hard-fail the whole catalog per the
   existing fail-closed behavior) or a standalone `tools/lint_recipes.py`
   run in CI -- checking `vllm_args` for a small, explicit list of known-bad
-  flag combinations as they're discovered. Start with the three above;
+  flag combinations as they're discovered. Start with the four above;
   this list only grows by adding real incidents, not by trying to
   anticipate hypothetical ones.
 - Cheap enough to start: a dict of `{flag_or_value: incompatible_with}`
@@ -473,7 +482,7 @@ someone actually deploys it.
   warns today (soft warning, not a hard failure, unless confidence is
   high).
 
-**Depends on:** nothing. Small, and the three known cases above are already
+**Depends on:** nothing. Small, and the four known cases above are already
 fully specified.
 
 ---
@@ -762,44 +771,95 @@ real proof PP=2 + explicit Ray + `eugr/spark-vllm-b12x` works on this
 stack -- but it's one model, not these two, and nobody has ever put PP
 and TP head-to-head on the same model here.
 
-**Real tool gap found while scoping this, not just a data gap.**
-`tests/ab_test.py`'s override mechanism cannot express this comparison
-as a single command. `resolve_variant()` explicitly rejects it:
-`--{side}-nodes > 1 is only supported for a pure named-recipe passthrough
-(no --{side}-* overrides); ad-hoc scratch recipes here are always
-1-node.` There is also no `--{side}-tp-size`/`--{side}-pp-size` override
-flag at all -- `tp_size`/`pp_size` only ever come from a real topology
-block already on disk. Running this A/B means creating a second real
-catalog recipe (or a second `2_node`-shaped topology) with `tp_size: 2,
-pp_size: 1` for whichever model gets tested first, then a plain two-sided
-passthrough:
+**Real tool gap found while scoping this -- worse than first thought, now
+fixed.** `tests/ab_test.py`'s override mechanism cannot express this
+comparison via `--{side}-*` overrides on top of a catalog base --
+`resolve_variant()` forces any override onto a 1-node ad-hoc path. The
+originally-suggested workaround (a plain two-sided passthrough with no
+override flags at all, shown below in the version of this entry written
+2026-09-03 earlier the same day) turned out to be wrong too: with no
+`--{side}-nodes` flag, `catalog_nodes` silently defaults to `1`, so a
+"plain passthrough" command *silently deploys and compares the 1-node
+topology on both sides* -- for `qwen-3.6-27b-nvfp4` and
+`qwen-2.5-coder-32b`, whose `1_node` blocks are TP=1/PP=1 either way,
+that's comparing two byte-identical configs and would have reported "no
+difference" for a completely uninteresting reason, without erroring.
+Adding `--{side}-nodes 2` to fix *that* then hit a second, separate bug:
+passing `--{side}-nodes` at all (regardless of value) counted as an
+override in its own right, which disqualified the passthrough branch and
+hit the ad-hoc branch's own `nodes > 1` rejection -- i.e. explicitly
+asking for the 2-node topology was structurally impossible too, for any
+recipe, under any flag combination. Root-caused and fixed same session --
+see `TOMBSTONES.md` #105. The corrected, actually-working command:
 
-    docker exec -it dgx-orchestrator-api python3 tests/ab_test.py \
-        --variant-a qwen-3.6-27b-nvfp4 \
-        --variant-b qwen-3.6-27b-nvfp4-tp \
+    docker exec dgx-orchestrator-api python3 tests/ab_test.py \
+        --variant-a qwen-2_5-coder-32b \
+        --variant-b qwen-2_5-coder-32b-tp \
+        --a-nodes 2 --b-nodes 2 \
+        --prompts all \
         --repeats 3
 
+Note the model switched from `qwen-3.6-27b-nvfp4` to `qwen-2.5-coder-32b`
+-- see below.
+
+**`qwen-3.6-27b-nvfp4` pair is not a valid TP-vs-PP comparison anymore.**
+Both files carry MTP (`qwen3_next_mtp`) speculative decoding, and MTP is
+hard-incompatible with `pp_size > 1` -- confirmed live, `NotImplementedError:
+Pipeline parallelism is not supported for this model.` The PP side cannot
+boot at all; TP "winning" would be by forfeit, not measurement. See
+`TOMBSTONES.md` #104, `docs/TROUBLESHOOTING.md` #13, and the new
+guardrails case #4 above. **`qwen-2.5-coder-32b` is the live pair now**
+-- no speculative-config on either side, clean of this problem. Both its
+files also needed an unrelated fix this session: `max_model_len: 262144`
+exceeded the model's real 32768 context (YaRN would allow 131072, not
+262144, and wasn't configured either way) -- both files corrected to
+`32768`. Both sides have confirmed successful manual dashboard loads as
+of 2026-09-03; the actual `ab_test.py` A/B run itself has still not
+completed successfully as of this writing -- blocked in sequence by the
+catalog-key naming mismatch (filenames use `qwen-2_5-coder-32b` with
+underscores, not `qwen-2.5-coder-32b` with a dot), then the two tool
+bugs above, then a third, unrelated tool bug: `ab_test.py`'s pre-pull
+only ever refreshed the head's image cache, letting `spark-3` silently
+drift to a stale build under the same `:latest` tag -- 6/6 deploy
+attempts crashed identically on a Ray head/worker version mismatch as a
+result. Root-caused and fixed same session, see `TOMBSTONES.md` #106 --
+the actual A/B run has not been retried since that fix landed.
+
+**Separately, `qwen-3.5-122b.yaml` picked up MTP this same session**
+(previously had no speculative-config at all, `--enforce-eager`, `pp_size:
+2`) -- three new sibling files exist
+(`qwen-3.5-122b-mtp2.yaml`/`-mtp4.yaml` for a token-depth sweep,
+`qwen-3.5-122b-tp.yaml` for its own TP-vs-PP pairing at the settled
+`num_speculative_tokens: 3`), none deployed yet. Given the MTP+PP
+incompatibility above, **`qwen-3.5-122b.yaml`'s `pp_size: 2` + MTP combo
+is untested and may simply crash the same way `qwen-3.6-27b-nvfp4` did**
+-- confirm `qwen-3.5-122b-tp` (the TP side) boots before assuming the PP
+side is a live comparison target at all, not an assumption to carry into
+a scheduled overnight run.
+
 **Shape of a real fix/follow-up:**
-- Pick one of the two recipes (whichever is used more) and author the
-  `tp_size: 2` sibling topology/recipe, mirroring the existing `2_node`
-  block's `env_vars`/`vllm_args` except the parallelism split.
-- Run the A/B via the command shape above once `ab_test.py` supports it
-  as-is (it already does, for two named recipes with no overrides -- the
-  gap is only in having a second recipe to point at, not in the tool).
-- If TP wins or ties, consider converting these two recipes' `2_node`
-  topology to match -- but only after a real measurement, not on
+- Get one clean completed `ab_test.py` run on the `qwen-2.5-coder-32b`
+  pair using the corrected command above -- this hasn't happened yet as
+  of this writing, despite the tooling now being fixed.
+- Confirm/refute the `qwen-3.5-122b` PP+MTP crash before scheduling its
+  overnight sweep -- likely dead on arrival per the guardrails case
+  above, in which case that recipe's TP-vs-PP comparison is moot and only
+  the MTP token-depth sweep (`-mtp2`/base/`-mtp4`, all TP or all 1-node)
+  remains meaningful.
+- If TP wins or ties on `qwen-2.5-coder-32b`, consider converting other
+  PP=2 recipes to match -- but only after a real measurement, not on
   community precedent alone, since `llama-4-fp8` is direct proof PP can
   be the right call on this exact image/stack for at least one model.
-- Separately, worth deciding whether `ab_test.py`'s `--{side}-nodes > 1`
-  restriction to pure-passthrough-only is worth lifting generally (a
-  `--{side}-tp-size`/`--{side}-pp-size` override pair on top of an
-  existing recipe base would make this kind of comparison a one-off
+- Separately, still worth deciding whether a `--{side}-tp-size`/
+  `--{side}-pp-size` override pair on top of an existing recipe base is
+  worth adding generally -- would make this kind of comparison a one-off
   command instead of requiring a permanent second catalog entry every
-  time) -- not scoped here, just noted as the thing that would have made
-  this cheaper.
+  time. Not scoped here, just noted as the thing that would make this
+  cheaper going forward.
 
-**Depends on:** nothing structurally. Cheap to start whenever there's
-cluster time free from whatever's actively being tested.
+**Depends on:** nothing structurally. `ab_test.py`'s node-selection bug
+(`TOMBSTONES.md` #105) is fixed; the actual live A/B run is the remaining
+open step.
 
 ---
 
