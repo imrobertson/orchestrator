@@ -36,6 +36,64 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 109. `nemotron-3-nano-30b-a3b-nvfp4`'s `2_node` topology, constructed from pattern (not recovered) -- confirmed live, near-zero cold TTFT worth a note (V?.?.?)
+
+* **Context:** Same situation and same fix approach as `nemotron-3.5-
+  lightning-bf16` (#108) -- `model_ledger.json` had real `launch_history`
+  for `nemotron-3-nano-30b-a3b-nvfp4::2_node`, the recipe file on disk
+  only had `1_node`, `git log` confirmed the `2_node` block was never
+  committed. This file already carried a correct top-level `image:`
+  (unlike the lightning file, no proactive fix needed here), so the
+  `2_node` block was added by the same pattern-matched construction
+  (`tp_size: 2`) with nothing else to fix.
+* **Confirmed, 2026-09-03:** live deploy succeeded, `benchmark.py` 3-pass
+  gave warm avg **87.0 tok/s decode** (86.3 cold), logged to
+  `benchmark_ledger.csv` under `nemotron-3-nano-30b-a3b-nvfp4`. **Notably
+  small cold TTFT (0.36s cold vs. 0.06s warm)** -- essentially no
+  cold-start penalty at all, unlike every other first-ever-topology
+  deploy this session (`nemotron-3.5-lightning-bf16` 18.26s,
+  `qwen-3.5-122b-tp` 49.25s). Speculative but plausible explanation, not
+  confirmed: since this exact `catalog_key::2_node`'s ledger history
+  predates what's recoverable from git, the hosts may still be holding
+  leftover JIT/compile cache on disk (`~/.cache/{tilelang,deepgemm,
+  triton}`, see #51) from whatever undocumented deploy originally
+  produced that `launch_history` entry -- would explain a near-warm-speed
+  cold run. Both nemotron constructions (#108, this entry) held up on
+  live hardware; treat as two data points in favor of the pattern-
+  matching approach generally, not as proof any future construction of
+  this kind will succeed without its own real test.
+
+### 108. `nemotron-3.5-lightning-bf16`'s `2_node` topology, constructed from pattern (not recovered) -- confirmed live with real throughput (V?.?.?)
+
+* **Context:** `model_ledger.json` carried real `launch_history` for
+  `nemotron-3.5-lightning-bf16::2_node`, but the recipe file on disk only
+  ever had a `1_node` block -- confirmed via `git log`, the `2_node`
+  topology was never actually committed; whatever produced that ledger
+  entry did so without leaving a recoverable trace. Rather than guess at
+  reconstructing lost content, a fresh `2_node` block was built by
+  mirroring this repo's own established 2-node pattern (`tp_size: 2`,
+  matching `qwen-3.8-27b-nvfp4`/`deepseek-r1-distill-qwen-32b`/
+  `gemma-4-31b`'s convention) -- explicitly flagged as constructed, not
+  recovered, and untested at time of writing. Same pass also caught a
+  separate, real gap on this file: no top-level `image:` field at all,
+  which would have fallen back to `default_image` (no Ray) and hit the
+  #43/#103 trap on first 2-node deploy -- fixed proactively
+  (`image: eugr/spark-vllm-b12x:latest` added) before it could recur a
+  third time.
+* **Confirmed, 2026-09-03:** live deploy succeeded, `benchmark.py` 3-pass
+  gave warm avg **48.4 tok/s decode** (48.2 cold -- notably flat
+  cold-vs-warm compared to the MTP recipes deployed the same session,
+  consistent with this recipe carrying no speculative-config to pay a
+  JIT-warmup tax for; TTFT 18.26s cold / ~0.12s warm). Logged to
+  `benchmark_ledger.csv` under `nemotron-3_5-lightning-bf16`. The
+  pattern-matched construction held up on live hardware -- worth noting
+  as a general data point (a plausible-looking 2-node topology built from
+  this repo's own conventions isn't guaranteed to work, but did here),
+  not proof the same approach will hold for
+  `nemotron-3-nano-30b-a3b-nvfp4`'s still-pending `2_node` construction,
+  which was built the same way but is a different model/quant and has
+  not yet been deployed as of this writing.
+
 ### 107. `qwen-3.5-122b.yaml` retired (PP+MTP dead per #104); token-depth sweep siblings rebuilt as TP (V?.?.?)
 
 * **Context:** `qwen-3.5-122b.yaml`'s `pp_size: 2` + `qwen3_next_mtp`
