@@ -927,5 +927,22 @@
       "d": 0.0,
       "a": 0.0
     }
+  },
+  "qwen-2_5-coder-32b::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 802,
+      "out": 1359,
+      "draft": 0,
+      "accepted": 0
+    },
+    "last_seen_raw": {
+      "p": 990.0,
+      "g": 2298.0,
+      "d": 0.0,
+      "a": 0.0
+    }
   }
 }

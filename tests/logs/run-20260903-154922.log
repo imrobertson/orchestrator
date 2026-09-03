@@ -1,0 +1,279 @@
+[transcript] full output of this run is being saved to /app/tests/logs/run-20260903-154922.log
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ a:qwen-2_5-coder-32b -- repeat 1/3
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+######################################################################
+# variant: a:qwen-2_5-coder-32b  [catalog passthrough]
+# hf_path=Qwen/Qwen2.5-Coder-32B-Instruct image=eugr/spark-vllm-b12x:latest gpu_util=0.7 nodes=2
+######################################################################
+    pulling eugr/spark-vllm-b12x:latest on spark-4 if not already cached (first pull can take a while)...
+[PASS] [a:qwen-2_5-coder-32b] docker pull succeeds on spark-4
+    pulling eugr/spark-vllm-b12x:latest on spark-3 if not already cached (first pull can take a while)...
+[PASS] [a:qwen-2_5-coder-32b] docker pull succeeds on spark-3
+
+=== [a:qwen-2_5-coder-32b] deploy (recipe qwen-2_5-coder-32b, nodes=2) ===
+[PASS] [a:qwen-2_5-coder-32b] deploy command reports success (no immediate crash) -- 130s
+    deploy command returned; independently polling /health (up to 900s)...
+[PASS] [a:qwen-2_5-coder-32b] /health confirmed ready (independent poll)
+    [a:qwen-2_5-coder-32b] full container log saved to /app/tests/logs/a-qwen-2_5-coder-32b-spark-4-20260903-155759.log (124632 bytes)
+
+--- [a:qwen-2_5-coder-32b] boot log scan (spark-4) ---
+[FAIL] [a:qwen-2_5-coder-32b] boot log contains a relevant backend/decoding keyword (scan, not a confirmed exact-line match) -- no keyword matched -- read the excerpt below
+    matching lines:
+      (none -- run `dgx-config logs spark-4` by hand to see the full boot log)
+
+--- [a:qwen-2_5-coder-32b] benchmark suite (via benchmark.py) ---
+
+--- [a:qwen-2_5-coder-32b:default] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:default] benchmark.py succeeds -- warm 3.5 tok/s (TTFT 0.31s), cold 3.5 tok/s
+
+--- [a:qwen-2_5-coder-32b:coding] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:coding] benchmark.py succeeds -- warm 3.5 tok/s (TTFT 0.32s), cold 3.5 tok/s
+
+--- [a:qwen-2_5-coder-32b:extraction] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:extraction] benchmark.py succeeds -- warm 3.5 tok/s (TTFT 0.30s), cold 3.6 tok/s
+
+--- [a:qwen-2_5-coder-32b:creative] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:creative] benchmark.py succeeds -- warm 3.5 tok/s (TTFT 0.32s), cold 3.5 tok/s
+
+--- tearing down after 'a:qwen-2_5-coder-32b' ---
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ a:qwen-2_5-coder-32b -- repeat 2/3
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+######################################################################
+# variant: a:qwen-2_5-coder-32b  [catalog passthrough]
+# hf_path=Qwen/Qwen2.5-Coder-32B-Instruct image=eugr/spark-vllm-b12x:latest gpu_util=0.7 nodes=2
+######################################################################
+    pulling eugr/spark-vllm-b12x:latest on spark-4 if not already cached (first pull can take a while)...
+[PASS] [a:qwen-2_5-coder-32b] docker pull succeeds on spark-4
+    pulling eugr/spark-vllm-b12x:latest on spark-3 if not already cached (first pull can take a while)...
+[PASS] [a:qwen-2_5-coder-32b] docker pull succeeds on spark-3
+
+=== [a:qwen-2_5-coder-32b] deploy (recipe qwen-2_5-coder-32b, nodes=2) ===
+[PASS] [a:qwen-2_5-coder-32b] deploy command reports success (no immediate crash) -- 109s
+    deploy command returned; independently polling /health (up to 900s)...
+[PASS] [a:qwen-2_5-coder-32b] /health confirmed ready (independent poll)
+    [a:qwen-2_5-coder-32b] full container log saved to /app/tests/logs/a-qwen-2_5-coder-32b-spark-4-20260903-161736.log (125452 bytes)
+
+--- [a:qwen-2_5-coder-32b] boot log scan (spark-4) ---
+[FAIL] [a:qwen-2_5-coder-32b] boot log contains a relevant backend/decoding keyword (scan, not a confirmed exact-line match) -- no keyword matched -- read the excerpt below
+    matching lines:
+      (none -- run `dgx-config logs spark-4` by hand to see the full boot log)
+
+--- [a:qwen-2_5-coder-32b] benchmark suite (via benchmark.py) ---
+
+--- [a:qwen-2_5-coder-32b:default] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:default] benchmark.py succeeds -- warm 3.5 tok/s (TTFT 0.30s), cold 3.5 tok/s
+
+--- [a:qwen-2_5-coder-32b:coding] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:coding] benchmark.py succeeds -- warm 3.5 tok/s (TTFT 0.30s), cold 3.5 tok/s
+
+--- [a:qwen-2_5-coder-32b:extraction] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:extraction] benchmark.py succeeds -- warm 3.6 tok/s (TTFT 0.30s), cold 3.6 tok/s
+
+--- [a:qwen-2_5-coder-32b:creative] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:creative] benchmark.py succeeds -- warm 3.6 tok/s (TTFT 0.31s), cold 3.6 tok/s
+
+--- tearing down after 'a:qwen-2_5-coder-32b' ---
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ a:qwen-2_5-coder-32b -- repeat 3/3
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+######################################################################
+# variant: a:qwen-2_5-coder-32b  [catalog passthrough]
+# hf_path=Qwen/Qwen2.5-Coder-32B-Instruct image=eugr/spark-vllm-b12x:latest gpu_util=0.7 nodes=2
+######################################################################
+    pulling eugr/spark-vllm-b12x:latest on spark-4 if not already cached (first pull can take a while)...
+[PASS] [a:qwen-2_5-coder-32b] docker pull succeeds on spark-4
+    pulling eugr/spark-vllm-b12x:latest on spark-3 if not already cached (first pull can take a while)...
+[PASS] [a:qwen-2_5-coder-32b] docker pull succeeds on spark-3
+
+=== [a:qwen-2_5-coder-32b] deploy (recipe qwen-2_5-coder-32b, nodes=2) ===
+[PASS] [a:qwen-2_5-coder-32b] deploy command reports success (no immediate crash) -- 110s
+    deploy command returned; independently polling /health (up to 900s)...
+[PASS] [a:qwen-2_5-coder-32b] /health confirmed ready (independent poll)
+    [a:qwen-2_5-coder-32b] full container log saved to /app/tests/logs/a-qwen-2_5-coder-32b-spark-4-20260903-163701.log (127071 bytes)
+
+--- [a:qwen-2_5-coder-32b] boot log scan (spark-4) ---
+[FAIL] [a:qwen-2_5-coder-32b] boot log contains a relevant backend/decoding keyword (scan, not a confirmed exact-line match) -- no keyword matched -- read the excerpt below
+    matching lines:
+      (none -- run `dgx-config logs spark-4` by hand to see the full boot log)
+
+--- [a:qwen-2_5-coder-32b] benchmark suite (via benchmark.py) ---
+
+--- [a:qwen-2_5-coder-32b:default] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:default] benchmark.py succeeds -- warm 3.5 tok/s (TTFT 0.34s), cold 3.6 tok/s
+
+--- [a:qwen-2_5-coder-32b:coding] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:coding] benchmark.py succeeds -- warm 3.5 tok/s (TTFT 0.31s), cold 3.5 tok/s
+
+--- [a:qwen-2_5-coder-32b:extraction] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:extraction] benchmark.py succeeds -- warm 3.6 tok/s (TTFT 0.33s), cold 3.6 tok/s
+
+--- [a:qwen-2_5-coder-32b:creative] benchmark (3-pass, via benchmark.py) ---
+[PASS] [a:qwen-2_5-coder-32b:creative] benchmark.py succeeds -- warm 3.6 tok/s (TTFT 0.32s), cold 3.6 tok/s
+
+--- tearing down after 'a:qwen-2_5-coder-32b' ---
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ b:qwen-2_5-coder-32b-tp -- repeat 1/3
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+######################################################################
+# variant: b:qwen-2_5-coder-32b-tp  [catalog passthrough]
+# hf_path=Qwen/Qwen2.5-Coder-32B-Instruct image=eugr/spark-vllm-b12x:latest gpu_util=0.7 nodes=2
+######################################################################
+    pulling eugr/spark-vllm-b12x:latest on spark-4 if not already cached (first pull can take a while)...
+[PASS] [b:qwen-2_5-coder-32b-tp] docker pull succeeds on spark-4
+    pulling eugr/spark-vllm-b12x:latest on spark-3 if not already cached (first pull can take a while)...
+[PASS] [b:qwen-2_5-coder-32b-tp] docker pull succeeds on spark-3
+
+=== [b:qwen-2_5-coder-32b-tp] deploy (recipe qwen-2_5-coder-32b-tp, nodes=2) ===
+[PASS] [b:qwen-2_5-coder-32b-tp] deploy command reports success (no immediate crash) -- 110s
+    deploy command returned; independently polling /health (up to 900s)...
+[PASS] [b:qwen-2_5-coder-32b-tp] /health confirmed ready (independent poll)
+    [b:qwen-2_5-coder-32b-tp] full container log saved to /app/tests/logs/b-qwen-2_5-coder-32b-tp-spark-4-20260903-165535.log (81235 bytes)
+
+--- [b:qwen-2_5-coder-32b-tp] boot log scan (spark-4) ---
+[FAIL] [b:qwen-2_5-coder-32b-tp] boot log contains a relevant backend/decoding keyword (scan, not a confirmed exact-line match) -- no keyword matched -- read the excerpt below
+    matching lines:
+      (none -- run `dgx-config logs spark-4` by hand to see the full boot log)
+
+--- [b:qwen-2_5-coder-32b-tp] benchmark suite (via benchmark.py) ---
+
+--- [b:qwen-2_5-coder-32b-tp:default] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:default] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.17s), cold 6.8 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:coding] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:coding] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.20s), cold 6.8 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:extraction] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:extraction] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.20s), cold 6.7 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:creative] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:creative] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.17s), cold 6.7 tok/s
+
+--- tearing down after 'b:qwen-2_5-coder-32b-tp' ---
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ b:qwen-2_5-coder-32b-tp -- repeat 2/3
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+######################################################################
+# variant: b:qwen-2_5-coder-32b-tp  [catalog passthrough]
+# hf_path=Qwen/Qwen2.5-Coder-32B-Instruct image=eugr/spark-vllm-b12x:latest gpu_util=0.7 nodes=2
+######################################################################
+    pulling eugr/spark-vllm-b12x:latest on spark-4 if not already cached (first pull can take a while)...
+[PASS] [b:qwen-2_5-coder-32b-tp] docker pull succeeds on spark-4
+    pulling eugr/spark-vllm-b12x:latest on spark-3 if not already cached (first pull can take a while)...
+[PASS] [b:qwen-2_5-coder-32b-tp] docker pull succeeds on spark-3
+
+=== [b:qwen-2_5-coder-32b-tp] deploy (recipe qwen-2_5-coder-32b-tp, nodes=2) ===
+[PASS] [b:qwen-2_5-coder-32b-tp] deploy command reports success (no immediate crash) -- 110s
+    deploy command returned; independently polling /health (up to 900s)...
+[PASS] [b:qwen-2_5-coder-32b-tp] /health confirmed ready (independent poll)
+    [b:qwen-2_5-coder-32b-tp] full container log saved to /app/tests/logs/b-qwen-2_5-coder-32b-tp-spark-4-20260903-170833.log (71054 bytes)
+
+--- [b:qwen-2_5-coder-32b-tp] boot log scan (spark-4) ---
+[FAIL] [b:qwen-2_5-coder-32b-tp] boot log contains a relevant backend/decoding keyword (scan, not a confirmed exact-line match) -- no keyword matched -- read the excerpt below
+    matching lines:
+      (none -- run `dgx-config logs spark-4` by hand to see the full boot log)
+
+--- [b:qwen-2_5-coder-32b-tp] benchmark suite (via benchmark.py) ---
+
+--- [b:qwen-2_5-coder-32b-tp:default] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:default] benchmark.py succeeds -- warm 6.8 tok/s (TTFT 0.17s), cold 6.8 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:coding] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:coding] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.18s), cold 6.8 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:extraction] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:extraction] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.20s), cold 6.7 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:creative] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:creative] benchmark.py succeeds -- warm 6.6 tok/s (TTFT 0.17s), cold 6.7 tok/s
+
+--- tearing down after 'b:qwen-2_5-coder-32b-tp' ---
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ b:qwen-2_5-coder-32b-tp -- repeat 3/3
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+######################################################################
+# variant: b:qwen-2_5-coder-32b-tp  [catalog passthrough]
+# hf_path=Qwen/Qwen2.5-Coder-32B-Instruct image=eugr/spark-vllm-b12x:latest gpu_util=0.7 nodes=2
+######################################################################
+    pulling eugr/spark-vllm-b12x:latest on spark-4 if not already cached (first pull can take a while)...
+[PASS] [b:qwen-2_5-coder-32b-tp] docker pull succeeds on spark-4
+    pulling eugr/spark-vllm-b12x:latest on spark-3 if not already cached (first pull can take a while)...
+[PASS] [b:qwen-2_5-coder-32b-tp] docker pull succeeds on spark-3
+
+=== [b:qwen-2_5-coder-32b-tp] deploy (recipe qwen-2_5-coder-32b-tp, nodes=2) ===
+[PASS] [b:qwen-2_5-coder-32b-tp] deploy command reports success (no immediate crash) -- 110s
+    deploy command returned; independently polling /health (up to 900s)...
+[PASS] [b:qwen-2_5-coder-32b-tp] /health confirmed ready (independent poll)
+    [b:qwen-2_5-coder-32b-tp] full container log saved to /app/tests/logs/b-qwen-2_5-coder-32b-tp-spark-4-20260903-172152.log (79375 bytes)
+
+--- [b:qwen-2_5-coder-32b-tp] boot log scan (spark-4) ---
+[FAIL] [b:qwen-2_5-coder-32b-tp] boot log contains a relevant backend/decoding keyword (scan, not a confirmed exact-line match) -- no keyword matched -- read the excerpt below
+    matching lines:
+      (none -- run `dgx-config logs spark-4` by hand to see the full boot log)
+
+--- [b:qwen-2_5-coder-32b-tp] benchmark suite (via benchmark.py) ---
+
+--- [b:qwen-2_5-coder-32b-tp:default] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:default] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.21s), cold 6.8 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:coding] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:coding] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.23s), cold 6.8 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:extraction] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:extraction] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.23s), cold 6.7 tok/s
+
+--- [b:qwen-2_5-coder-32b-tp:creative] benchmark (3-pass, via benchmark.py) ---
+[PASS] [b:qwen-2_5-coder-32b-tp:creative] benchmark.py succeeds -- warm 6.7 tok/s (TTFT 0.18s), cold 6.7 tok/s
+
+--- tearing down after 'b:qwen-2_5-coder-32b-tp' ---
+
+======================================================================
+AGGREGATE ACROSS 3 REPEATS
+======================================================================
+  a:qwen-2_5-coder-32b: 3/3 repeats deployed successfully
+    default      n=3 mean=3.5 tok/s  range=3.5-3.5  values=[3.5, 3.5, 3.5]
+    coding       n=3 mean=3.5 tok/s  range=3.5-3.5  values=[3.5, 3.5, 3.5]
+    extraction   n=3 mean=3.6 tok/s  range=3.5-3.6  values=[3.5, 3.6, 3.6]
+    creative     n=3 mean=3.6 tok/s  range=3.5-3.6  values=[3.5, 3.6, 3.6]
+  b:qwen-2_5-coder-32b-tp: 3/3 repeats deployed successfully
+    default      n=3 mean=6.7 tok/s  range=6.7-6.8  values=[6.7, 6.8, 6.7]
+    coding       n=3 mean=6.7 tok/s  range=6.7-6.7  values=[6.7, 6.7, 6.7]
+    extraction   n=3 mean=6.7 tok/s  range=6.7-6.7  values=[6.7, 6.7, 6.7]
+    creative     n=3 mean=6.7 tok/s  range=6.6-6.7  values=[6.7, 6.6, 6.7]
+
+======================================================================
+SUMMARY (last repeat only -- see AGGREGATE above if --repeats > 1)
+======================================================================
+  a:qwen-2_5-coder-32b   deployed=True  boot_log_hit=False
+    default      warm=   3.5 tok/s cold=   3.6 tok/s
+    coding       warm=   3.5 tok/s cold=   3.5 tok/s
+    extraction   warm=   3.6 tok/s cold=   3.6 tok/s
+    creative     warm=   3.6 tok/s cold=   3.6 tok/s
+  b:qwen-2_5-coder-32b-tp deployed=True  boot_log_hit=False
+    default      warm=   6.7 tok/s cold=   6.8 tok/s
+    coding       warm=   6.7 tok/s cold=   6.8 tok/s
+    extraction   warm=   6.7 tok/s cold=   6.7 tok/s
+    creative     warm=   6.7 tok/s cold=   6.7 tok/s
+
+======================================================================
+A vs B: qwen-2_5-coder-32b  vs  qwen-2_5-coder-32b-tp
+======================================================================
+    default      a=   3.5 tok/s  b=   6.7 tok/s  (+3.2 tok/s, +91.4%)
+    coding       a=   3.5 tok/s  b=   6.7 tok/s  (+3.2 tok/s, +91.4%)
+    extraction   a=   3.6 tok/s  b=   6.7 tok/s  (+3.1 tok/s, +86.1%)
+    creative     a=   3.6 tok/s  b=   6.7 tok/s  (+3.1 tok/s, +86.1%)
+
+48/54 checks passed.
