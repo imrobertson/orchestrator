@@ -847,11 +847,80 @@
     "compiled": [],
     "downloaded": [],
     "lifetime": {
-      "in": 62,
-      "out": 663,
+      "in": 124,
+      "out": 1219,
       "draft": 0,
       "accepted": 0
     },
+    "last_seen_raw": {
+      "p": 93.0,
+      "g": 768.0,
+      "d": 0.0,
+      "a": 0.0
+    },
+    "launch_history": {
+      "8fd86ab76cea7d90": {
+        "last_success_ts": 1788450363.0284462,
+        "count": 1
+      }
+    },
+    "runs": [
+      {
+        "run_id": "1788450041-spark-4-0fc8554b38bd",
+        "ts": 1788450041.0,
+        "outcome": "ready",
+        "config_hash": "8fd86ab76cea7d90",
+        "total_sec": 320.402608,
+        "pre_load_sec": 124.599644,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 43.09,
+        "download_sec": 93.077304,
+        "download_confidence": "reported",
+        "compile_sec": 20.32,
+        "compile_stage_confidence": "reported_no_cache",
+        "engine_init_sec": 75.52,
+        "rank_count": 3,
+        "unaccounted_sec": 0.0
+      }
+    ]
+  },
+  "nemotron-3_5-lightning-bf16::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 62,
+      "out": 709,
+      "draft": 0,
+      "accepted": 0
+    },
+    "launch_history": {
+      "4dd0e99e1942cb73": {
+        "last_success_ts": 1788449510.06995,
+        "count": 1
+      }
+    },
+    "runs": [
+      {
+        "run_id": "1788449128-spark-4-0aa65f66d701",
+        "ts": 1788449128.0,
+        "outcome": "ready",
+        "config_hash": "4dd0e99e1942cb73",
+        "total_sec": 380.165644,
+        "pre_load_sec": 129.06015,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 98.56,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": 14.42,
+        "compile_stage_confidence": "reported_no_cache",
+        "engine_init_sec": 147.18,
+        "rank_count": 3,
+        "unaccounted_sec": 0.0
+      }
+    ],
     "last_seen_raw": {
       "p": 93.0,
       "g": 768.0,
