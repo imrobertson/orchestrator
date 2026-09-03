@@ -623,8 +623,44 @@
         "engine_init_sec": null,
         "rank_count": 1,
         "unaccounted_sec": 41.118469000000005
+      },
+      {
+        "run_id": "1788398376-spark-4-0f39ad5c858e",
+        "ts": 1788398376.0,
+        "outcome": "ready",
+        "config_hash": "16ed51feeb5685e4",
+        "total_sec": 670.708494,
+        "pre_load_sec": 120.218969,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 463.57,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 46.14,
+        "rank_count": 3,
+        "unaccounted_sec": 40.779525000000035
       }
-    ]
+    ],
+    "launch_history": {
+      "16ed51feeb5685e4": {
+        "last_success_ts": 1788399049.7149043,
+        "count": 1
+      }
+    },
+    "lifetime": {
+      "in": 96,
+      "out": 693,
+      "draft": 0,
+      "accepted": 0
+    },
+    "last_seen_raw": {
+      "p": 144.0,
+      "g": 696.0,
+      "d": 0.0,
+      "a": 0.0
+    }
   },
   "llama-4-fp4::1_node": {
     "cached": [
@@ -656,25 +692,71 @@
         "engine_init_sec": 29.67,
         "rank_count": 1,
         "unaccounted_sec": 57.367661
+      },
+      {
+        "run_id": "1788399598-spark-4-6d5d8cef838c",
+        "ts": 1788399598.0,
+        "outcome": "ready",
+        "config_hash": "294fa3791e3d7635",
+        "total_sec": 214.771852,
+        "pre_load_sec": 47.483864,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 97.77,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 11.61,
+        "rank_count": 1,
+        "unaccounted_sec": 57.90798800000002
       }
     ]
   },
   "llama-4-fp4::2_node": {
-    "cached": [],
+    "cached": [
+      729
+    ],
     "compiled": [],
     "downloaded": [],
     "lifetime": {
-      "in": 110,
-      "out": 1435,
+      "in": 198,
+      "out": 2836,
       "draft": 0,
       "accepted": 0
     },
     "last_seen_raw": {
-      "p": 132.0,
-      "g": 1464.0,
+      "p": 66.0,
+      "g": 732.0,
       "d": 0.0,
       "a": 0.0
-    }
+    },
+    "launch_history": {
+      "2e3ce8fb270686fc": {
+        "last_success_ts": 1788397557.2019067,
+        "count": 1
+      }
+    },
+    "runs": [
+      {
+        "run_id": "1788396872-spark-4-acb6cdcbd6b8",
+        "ts": 1788396872.0,
+        "outcome": "ready",
+        "config_hash": "2e3ce8fb270686fc",
+        "total_sec": 684.433729,
+        "pre_load_sec": 144.072738,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 44.27,
+        "download_sec": 395.548035,
+        "download_confidence": "reported",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 35.48,
+        "rank_count": 3,
+        "unaccounted_sec": 65.06295599999987
+      }
+    ]
   },
   "llama-4-fp8::2_node": {
     "cached": [],
