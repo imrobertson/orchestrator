@@ -24,4 +24,5 @@ topologies:
     - VLLM_USE_DEEP_GEMM=0
     vllm_args: >-
       --disable-custom-all-reduce --trust-remote-code --distributed-executor-backend ray
-      --max-num-seqs 2 --enforce-eager
+      --max-num-seqs 2 --enforce-eager --language-model-only
+      --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":3}'
