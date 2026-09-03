@@ -673,8 +673,7 @@ def resolve_variant(side: str, args, cfg) -> dict | None:
         "serve_args": getattr(args, f"{side}_serve_args"),
         "docker_env": getattr(args, f"{side}_docker_env"),
     }
-    any_override = any(v is not None for k, v in ov.items() if k != "docker_env") or bool(ov["docker_env"])
-
+     any_override = any(v is not None for k, v in ov.items() if k not in ("docker_env", "nodes")) or bool(ov["docker_env"])
     if name is None and not any_override:
         return None  # side not requested
 
