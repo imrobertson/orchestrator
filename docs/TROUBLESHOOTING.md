@@ -64,9 +64,30 @@ do.
 
 ### Multi-node executor requirements
 
-**Validated:** `--distributed-executor-backend ray` plus `VLLM_USE_V1=0`
-in `env_vars` for any 2-node topology. See failure mode #1 below for why
-the alternative (`mp` backend) doesn't work across physical hosts.
+**Validated:** `--distributed-executor-backend ray` for any 2-node
+topology on a physical-host pair — no safe default exists without it. See
+failure mode #1 below for why the alternative (`mp` backend) doesn't work
+across physical hosts.
+
+**Downgraded from Validated, 2026-09-02/03 — do not treat as blanket
+truth.** This section previously stated `VLLM_USE_V1=0` alongside the Ray
+flag as jointly required. Direct counter-evidence now exists on the same
+build (`v0.1.dev20003+gad848fc41.d20260815`): a real 2-node DSpark deploy
+(`deepseek-v4-flash-0731-dspark::2_node`) ran `distributed_executor_backend:
+'ray'` successfully with `VLLM_USE_V1=0` never set at all — the log shows
+`Initializing a V1 LLM engine` and the run completed `ready` with real
+phase data. This is stronger evidence than the earlier gemma-4-31b
+data point (which only showed the var having *no effect* when set,
+2026-08-29) — here it wasn't set and nothing broke. **Do not carry
+`VLLM_USE_V1=0` forward into a new 2-node recipe on this build without a
+specific reason; it is not a confirmed requirement, and blindly copying
+it forward (as `llama-3.3-70b.yaml`'s draft fix initially did, then
+corrected) risks treating a stale rule as load-bearing when it may only
+have mattered for whatever build/model combination `TOMBSTONES.md` #43
+was originally written from.** Two data points (one "no effect," one
+"not needed at all") isn't proof it's never needed — a genuine A/B on a
+2-node deploy would settle this properly — but it's enough to stop
+treating it as a default to copy without thinking.
 
 **Trap confirmed 2026-08-31 (Task MD):** this isn't only "don't
 deliberately choose the `mp` backend" — an *empty* `vllm_args` on a
@@ -82,6 +103,23 @@ from-scratch `Qwen/Qwen3-0.6B` TP=2 recipe with `vllm_args: ""` — nothing
 DeepSeek- or Gemma-specific about the trigger. **Any new 2-node recipe
 must explicitly carry `--distributed-executor-backend ray` in
 `vllm_args`; there is no safe default to fall back on.**
+
+**A second, distinct trap found 2026-09-02 — having the flag right isn't
+enough if the image can't run it.** Even with `--distributed-executor-
+backend ray` correctly present, the deploy still fails if the base image
+never shipped the `ray` binary at all: `exec: ray: not found` before any
+Python even starts. Confirmed on the current cluster `default_image`
+(`nvcr.io/nvidia/vllm:26.07-py3`) — this is a *different* failure from
+Incident #1's `mp`-backend assertion, not a rediscovery of it, and it
+means the `mp`/headless fallback isn't even a fallback here: it's the
+only thing that ever ran on this image, and it's the thing Incident #1
+says doesn't work across physical hosts. `llama-3.3-70b`, `llama-4-fp4`,
+`llama-4-fp8`, `qwen-3.6-27b-nvfp4`, and `qwen-2.5-coder-32b` all rely on
+`default_image` for their `2_node` topology and are affected; recipes
+pinned to `eugr/spark-vllm-b12x:latest` (gemma-4-31b, the DSpark family,
+deepseek-r1-distill-qwen-32b) are unaffected — confirmed that image does
+ship Ray. See `ROADMAP.md`'s "Recipe-level guardrails against known-bad
+flag combinations" entry for the cross-recipe pattern this points to.
 
 ### Speculative decoding / MTP (DSpark) config shape
 
@@ -276,3 +314,13 @@ Rule: Trust enp1s0f0np0 (the actually-cabled port, confirmed via matching real c
   under the stated org. For Gemma 4 specifically, always use the BF16
   base checkpoint with `--quantization fp8`, never a pre-quantized
   `-FP8` repo.
+
+### 11. `exec: ray: not found` — Correct `--distributed-executor-backend ray` flag, image never shipped the binary
+* **Failure:** `/opt/nvidia/nvidia_entrypoint.sh: line 55: exec: ray: not found`, before any Python or vLLM code runs at all.
+* **Cause:** `--distributed-executor-backend ray` being present in `vllm_args` is necessary but not sufficient — the container's base image must also have `ray` installed. `nvcr.io/nvidia/vllm:26.07-py3` (this cluster's `default_image`) does not. Community precedent (`makiisthenes/dgx-spark-multinode-vllm-ray`) confirms newer NVIDIA NGC vLLM images dropped Ray by default and documents adding it back via a derived Dockerfile.
+* **Rule:** Before assuming a 2-node recipe's only gap is the missing flag, confirm the target image actually has `ray` installed (`docker run <image> which ray`, or just watch the boot log for this exact error). `eugr/spark-vllm-b12x:latest` is confirmed to ship it; `default_image` is confirmed not to. A recipe needing both physical-host multi-node *and* an image without Ray has no working path today short of switching images or baking Ray in via the mods pipeline — see `ROADMAP.md`'s mods entry.
+
+### 12. `File size mismatch` on HF download — genuinely corrupted upstream shards, not local network flakiness
+* **Failure:** `RuntimeError: Task error: File size mismatch: expected N bytes but downloaded M bytes` from `huggingface_hub`'s Xet client, reproducibly the same exact byte counts across repeated attempts.
+* **Cause:** Not a transient network or local-cache issue — confirmed via a documented HF discussion thread on the specific repo (`saricles/MiniMax-M2.7-NVFP4-GB10/discussions/3`) that three specific shards serve short of their reported `Content-Length` from HF's CDN itself, reproducible with `curl` and `git lfs pull` independently of any vLLM/Xet-specific code path.
+* **Rule:** If the exact same expected/downloaded byte counts recur across attempts, stop retrying and check the repo's HF discussion tab before assuming it's our network, our cache, or our config — a deterministic short-by-the-same-amount result across attempts is the signature of a corrupted upstream file, not flakiness. Clearing the local cache does not help; every attempt re-fetches the same broken remote bytes.

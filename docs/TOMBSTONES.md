@@ -36,6 +36,114 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 103. Three recipes stuck on the `default_image`-has-no-Ray / TOMBSTONES #43 trap now confirmed fixed by an image swap plus the standard Ray fix -- `llama-3.3-70b`, `llama-4-fp4`, `llama-4-fp8` all now live-verified (V4.8.6+)
+
+* **The Trap:** covered live in `docs/TROUBLESHOOTING.md` Incident #11
+  and this file's own #43 -- `llama-3.3-70b::2_node` crashed with
+  `collective_rpc should not be called on follower node` (TOMBSTONES #43's
+  exact signature) because its `vllm_args` never carried
+  `--distributed-executor-backend ray`. Adding the flag alone wasn't the
+  fix: the recipe's `default_image` (`nvcr.io/nvidia/vllm:26.07-py3`)
+  doesn't ship the `ray` binary at all (`exec: ray: not found`), so the
+  flag had nowhere to run. `llama-4-fp4` and `llama-4-fp8` carried the
+  identical gap in their own `2_node` topologies.
+* **The Fix:** all three recipes switched `image:` to
+  `eugr/spark-vllm-b12x:latest` (confirmed to ship Ray) and added
+  `--distributed-executor-backend ray` plus `VLLM_USE_V1=0` to `vllm_args`
+  /`env_vars` -- the latter per this file's #43 precedent, not because it
+  was independently re-verified as necessary (see `TROUBLESHOOTING.md`'s
+  "Downgraded from Validated" note; `VLLM_USE_V1=0` still shows no
+  observable effect on this build -- `Initializing a V1 LLM engine` fires
+  regardless -- now confirmed on two more real deploys on top of the
+  existing gemma-4-31b/DSpark data points, same build in all cases, not
+  independent evidence of a different build). All three now live-verified,
+  not just drafted: `llama-4-fp8::2_node` first (session before this one),
+  then `llama-4-fp4::2_node` (first-ever deploy of that topology, real
+  cold weight download captured, `download_sec: 395.55`) and
+  `llama-3.3-70b::2_node` (config_hash moved from the old crashed
+  `a6e57cfa2cf641bd` to a new `16ed51feeb5685e4`, real `ready` outcome,
+  463.6s weight load matching the slow-but-real number expected for an
+  unquantized 70B) both same session, 2026-09-03. `qwen-3.6-27b-nvfp4`
+  and `qwen-2.5-coder-32b` carry the identical fix but are not yet
+  individually confirmed by a live deploy -- see `ROADMAP.md`'s
+  guardrails entry for current status of those two.
+
+### 102. `compile_stage_confidence` collapsed "genuinely uncached compile" and "possible cache hit" into one label — two real self-reported compile durations (78.32s, 31.78s) were indistinguishable from a lucky warm-cache 0.17s (V4.8.6, +fd079)
+
+* **The Trap:** `extract_phases()` reported any self-reported
+  `torch.compile took Ns` line as `compile_stage_confidence: "reported"`,
+  full stop. That's the right shape for "this number is real, not
+  fabricated," but it silently answers a second question it was never
+  designed to: whether the number could have been a persistent-cache hit
+  from a prior launch of the same shape, versus a launch where a cache
+  hit was structurally impossible. Two real 2-node archives this session
+  (`gemma-4-31b`, 78.32s; `llama-4-fp8`, 31.78s) both deploy with
+  `TORCHINDUCTOR_FX_GRAPH_CACHE=0`/`TORCHINDUCTOR_AUTOGRAD_CACHE=0` set in
+  `env_vars` — genuinely cache-disabled, every launch a real compile by
+  construction — but carried the same `"reported"` label as 1-node
+  recipes' trivial values (nemotron `0.17s`, deepseek-r1-distill `0.31s`)
+  that plausibly *are* cache hits, since those recipes never disable the
+  cache. One label, two structurally different situations, no way for a
+  reader of the ledger to tell which was which without re-deriving it
+  from each recipe's `env_vars` by hand.
+* **The Fix:** `extract_phases()` gained an `inductor_cache_disabled:
+  Optional[bool]` parameter — not derivable from log text (confirmed:
+  grepped `TORCHINDUCTOR`/`FX_GRAPH_CACHE` across every real archive on
+  hand, zero hits; it only ever appears in the recipe's own `env_vars`,
+  which the parser never sees). `compile_stage_confidence` now resolves
+  to `"reported_no_cache"` / `"reported_cache_possible"` /
+  `"reported_cache_state_unknown"` (the last being the old behavior's
+  honest default when the caller doesn't supply the parameter — additive,
+  not breaking, for any existing caller). The caller
+  (`dgx-orchestrator.py`) is the one holding the recipe, so a new
+  `_inductor_cache_disabled_for(model, topo_key)` helper reads
+  `env_vars` there, mirroring `_config_hash_for()`'s existing defensive
+  lookup pattern, and threads the answer through `archive_run_log()` in
+  `common/runlog.py` down to `extract_phases()`. Verified against all 8
+  real archives on hand: both cache-disabled samples correctly resolve to
+  `reported_no_cache`; every previously-`absent_known_stack` archive is
+  byte-for-byte unchanged. Confirmed live on maestro post-restart —
+  `orchestrator_version` suffix moved from the stale `+6b344453` (files
+  present, daemon never restarted — `docker compose up -d` alone doesn't
+  pick up source changes) to `+fd079` after a full `down` + `up -d`.
+
+### 101. No download-phase marker existed — a genuine 319s cold weight-download on `llama-4-fp4::1_node` was indistinguishable from unexplained slop (V4.8.6)
+
+* **The Trap:** `phase_extract.py` had a documented, known gap (flagged
+  in the ETA-rework session's own closeout doc): nothing recognized
+  vLLM's own self-reported download-duration line, so a cold
+  first-ever-pull of a model's weights had its entire download window
+  fall into `unaccounted_sec`, indistinguishable from genuine
+  unexplained overhead. Confirmed on the real triggering archive: a
+  first-ever launch of `llama-4-fp4::1_node` (never before in
+  `model_ledger.json` under any topology) reported `unaccounted_sec:
+  376.45` against a `total_sec` of `558.47` — the great majority of the
+  run's wall clock, unattributed.
+* **The Fix:** New `_DOWNLOAD_DONE` regex on
+  `[weight_utils.py:540] Time spent downloading weights for <model>: N
+  seconds` — same source file as the existing `_LOADER_DONE` marker,
+  structurally parallel, and confirmed to precede
+  `_LOADER_DONE`'s checkpoint-shard-loading window in every sample seen
+  (additive to `weight_load_sec`, not overlapping with or replacing it).
+  `download_sec`/`download_confidence` added to `RankTiming`,
+  `PhaseResult`, and the ledger-facing dict, mirroring
+  `compile_sec`/`compile_stage_confidence`'s existing
+  absence-isn't-zero discipline, and folded into the `known` sum so
+  `unaccounted_sec` stops silently absorbing it. On the triggering
+  archive: `unaccounted_sec` corrected from `376.45` to `57.37`, with
+  `download_sec: 319.09` at `"reported"` confidence accounting for the
+  difference. Regression-checked against all 5 previously-known
+  archives — every existing field (`total_sec`, `weight_load_sec`,
+  `compile_sec`, `engine_init_sec`, `unaccounted_sec`) matches
+  `model_ledger.json`'s already-recorded values exactly; `download_sec`
+  correctly resolves to `null`/`"absent_known_stack"` on all of them
+  since none had the download line. A second independent sample
+  (`nemotron-3-nano-30b-a3b-nvfp4::1_node`, `106.29s`, `"reported"`)
+  landed the same session on a different model and different stack —
+  confirms the marker generalizes beyond the one triggering archive, at
+  least across these two stacks. Still only two samples; whether it
+  generalizes further is open.
+
 ### 100. `UnrecognizedLogShape` catches total vocabulary mismatch but not partial mismatch — one marker silently failing while others matched produced a pre-load phase reported as 100% of total run time (V?.?.?)
 
 * **The Trap:** `extract_phases()`'s only safety net was

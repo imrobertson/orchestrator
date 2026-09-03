@@ -338,6 +338,79 @@ before a real load stall is observed on our hardware.
 
 ---
 
+### Multi-engine support: SGLang, llama.cpp
+
+**New, 2026-09-03.** The deploy path assumes vLLM is the only possible
+engine -- not as a documented constraint, as an absence. There is no
+`engine:` field on the recipe schema at all.
+
+**Context: real cases this session, not hypothetical.** Two separate
+models hit walls that community reports show other engines sidestep
+entirely. Nemotron 3 Nano 30B-A3B-FP8: vLLM and SGLang both failed on GB10
+(SGLang's `:spark` image predates the model's config format; FP8
+quantization kernels don't support compute capability 12.1 at all), and
+the working path in that forum thread was llama.cpp. MiniMax M2.7-NVFP4:
+this session's own attempt died on a corrupted upstream checkpoint (see
+`TOMBSTONES.md`, this session), unrelated to engine choice, but the same
+search pass surfaced that saricles' checkpoint family documents SGLang as
+a first-class serving path alongside vLLM -- i.e. this is routine
+enough in the community that recipes routinely ship both.
+
+**What's actually coupled to vLLM, confirmed by reading the code, not
+assumed:**
+- `_execute_deployment_impl()` in `dgx-orchestrator.py` hardcodes the
+  container entrypoint to `python3 -m vllm.entrypoints.openai.api_server`
+  with vLLM's exact flag names (`--gpu-memory-utilization`,
+  `--max-model-len`). No branch point exists for a different launcher.
+- `common/phase_extract.py` is built entirely on vLLM's specific log
+  vocabulary (`[weight_utils.py:540]`, `[default_loader.py:...]`,
+  `[core.py:121] Initializing a V1 LLM engine`, the self-reported
+  `torch.compile took Ns` line). None of it matches SGLang's or
+  llama.cpp's own log formats. A non-vLLM deploy today would not fail --
+  it would silently lose all phase/compile/download telemetry, the same
+  failure shape `UnrecognizedLogShape` already exists to catch for
+  genuinely garbled vLLM logs, but nothing currently raises it for "this
+  is a different engine's log entirely."
+
+**What already works and needs no change:** `image:` already accepts
+arbitrary overrides (confirmed -- this session's recipes used
+`eugr/spark-vllm-b12x:latest`; SGLang images like `lmsysorg/sglang:latest`
+are a different family but the field doesn't care). The
+recipe-catalog/config-hash/ledger machinery and the SSH/docker-run/host
+management plumbing are engine-agnostic in practice, just never exercised
+against anything but vLLM.
+
+**llama.cpp is a materially different problem from SGLang, not just
+another flag set.** SGLang is, like vLLM, an OpenAI-API-compatible server
+that loads safetensors from an HF snapshot -- swapping it in is an
+entrypoint/flag-translation problem. llama.cpp serves GGUF. `hf_path`
+today assumes vLLM's snapshot-download-and-load-safetensors flow; a
+GGUF-based deploy needs either a different artifact-resolution path or an
+HF repo that happens to host a GGUF alongside safetensors. Worth scoping
+llama.cpp separately from the SGLang question rather than solving both in
+one pass -- they don't share a fix shape.
+
+**Shape of a real fix:**
+- Add an `engine: vllm | sglang | llamacpp` field to the recipe schema
+  (`common/recipes.py`), defaulting to `vllm` so nothing existing changes.
+- Branch entrypoint/flag construction in `_execute_deployment_impl()` on
+  it.
+- Either build an SGLang-equivalent of `phase_extract.py` or explicitly
+  accept no phase telemetry for non-vLLM deploys until one exists --
+  silent data loss is worse than a documented gap.
+- Scope GGUF artifact resolution for llama.cpp as its own piece of work,
+  not bundled into the SGLang entrypoint change.
+
+**Depends on:** nothing structurally. Not urgent on its own, but the
+DSpark and Qwen3.8-Flash-Next backlog items (see
+`BACKLOG-dspark-sm120-image.md` and this session's Qwen3.8-Flash-Next
+investigation) are both cases where a non-vLLM engine might have avoided
+the problem entirely rather than needing a patched vLLM fork -- worth
+keeping in mind if either of those gets picked up again before this does,
+since the two backlogs could inform each other's priority.
+
+---
+
 ## Recipe catalog integrity
 
 ### Recipe-level guardrails against known-bad flag combinations
@@ -362,6 +435,23 @@ been validated against a real deploy before being committed:
    an internal container entrypoint hook that silently overrides the
    explicit KV cache dtype back to `nvfp4_ds_mla` -- recreating problem #1
    even when the recipe author correctly set `fp8` explicitly.
+3. **Added 2026-09-03, updated same day once fixes landed.** A `2_node`
+   topology whose `vllm_args` omits `--distributed-executor-backend ray`
+   entirely, on a recipe relying on `default_image`
+   (`nvcr.io/nvidia/vllm:26.07-py3`, confirmed not to ship the `ray`
+   binary at all). `dgx-orchestrator.py`'s `use_ray` check requires the
+   flag literally present; its absence silently routes the deploy onto
+   the `--nnodes`/`--headless` multiproc path instead of failing closed,
+   which on this cluster's default image hits the exact
+   `collective_rpc should not be called on follower node` assertion
+   `TOMBSTONES.md` #43 was written from. **`llama-3.3-70b`, `llama-4-fp4`,
+   and `llama-4-fp8` all hit this, and all three are now confirmed fixed
+   by a live deploy** (image switched to `eugr/spark-vllm-b12x:latest`,
+   which does ship Ray, plus the flag added -- see `TOMBSTONES.md` #103).
+   `qwen-3.6-27b-nvfp4` and `qwen-2.5-coder-32b` carry the identical fix
+   in their recipe files but are **not yet individually confirmed by a
+   live deploy** -- treat as drafted, not validated, until one actually
+   runs.
 
 Both are documented in `docs/TROUBLESHOOTING.md` now, but only as
 after-the-fact incident write-ups -- nothing stops a third recipe from
@@ -374,16 +464,16 @@ someone actually deploys it.
   itself (warn at load time, don't hard-fail the whole catalog per the
   existing fail-closed behavior) or a standalone `tools/lint_recipes.py`
   run in CI -- checking `vllm_args` for a small, explicit list of known-bad
-  flag combinations as they're discovered. Start with the two above; this
-  list only grows by adding real incidents, not by trying to anticipate
-  hypothetical ones.
+  flag combinations as they're discovered. Start with the three above;
+  this list only grows by adding real incidents, not by trying to
+  anticipate hypothetical ones.
 - Cheap enough to start: a dict of `{flag_or_value: incompatible_with}`
   pairs and a regex/shlex-split check against `vllm_args` at recipe load
   time, surfaced the same way an unrecognized `recipe_version` already
   warns today (soft warning, not a hard failure, unless confidence is
   high).
 
-**Depends on:** nothing. Small, and the two known cases above are already
+**Depends on:** nothing. Small, and the three known cases above are already
 fully specified.
 
 ---
@@ -456,6 +546,26 @@ launched successfully" join as though it mattered.
 | `VLLM_ENGINE_INITIALIZATION_TIMEOUT` | recipe `env_vars` | yes -- removed |
 | `VLLM_RPC_TIMEOUT` | recipe `env_vars` | yes -- removed |
 | `VLLM_BASE_DIR=/workspace/vllm` | **image `ENV`** (eugr's Dockerfile) | **no** -- see below |
+
+**Two more confirmed 2026-09-02/03, same build, from this session's
+`minimax-m2_7-nvfp4-gb10.yaml` (which carried them over directly from the
+checkpoint author's own documented deploy command without re-verifying
+against this build):**
+
+| Variable | Source | Actionable? |
+|---|---|---|
+| `VLLM_NVFP4_GEMM_BACKEND` | recipe `env_vars` | yes -- this build auto-selects (`Using 'FLASHINFER_CUTLASS' NvFp4 MoE backend`); the var never influenced that choice |
+| `VLLM_USE_FLASHINFER_MOE_FP4` | recipe `env_vars` | yes -- same, no observed effect on backend selection |
+
+`VLLM_CPU_OMP_THREADS` and `VLLM_BASE_DIR` recurred on the same run and on
+`nemotron-3-nano-30b-a3b-nvfp4.yaml`'s run the same session -- consistent
+with the existing table, not new information, but confirms the pattern
+holds across a third and fourth recipe rather than being specific to
+gemma-4-31b. **Community-sourced recipes are a real, recurring source of
+these** -- both new instances above were copied from a working third-party
+deploy command rather than authored fresh, and the community command
+predates or targets a different vLLM build than what's actually running
+here.
 
 **The two categories need different handling, and conflating them makes the
 check useless.** `VLLM_BASE_DIR` is baked into `eugr/spark-vllm-b12x` as an
@@ -632,6 +742,64 @@ anywhere.
 
 **Depends on:** nothing structurally. Small, self-contained fix in the
 benchmark invocation path.
+
+---
+
+### `tp_size: 2` vs `pp_size: 2` never actually A/B'd on this cluster -- community favors TP unanimously, our only working PP data point is one model
+
+**New, 2026-09-03.** `qwen-3.6-27b-nvfp4.yaml` and `qwen-2.5-coder-32b.yaml`
+both carry `pp_size: 2` for their `2_node` topology. That choice has zero
+external precedent either way for these two models specifically, and it
+runs against a strong, consistent community pattern: every GB10 2-node
+vLLM deployment found in a broad search this session -- the `veloGB10`
+Qwen3.6-27B card ("two-node TP=2 serving... proven to work" — different
+engine, but consistent with the pattern), `bjk110/spark_vllm_docker`,
+the DSpark concurrency patch, `mark-ramsey-ri/trt-dgx-spark` -- defaults
+to `tensor_parallel_size`, not pipeline. Nobody documents PP=2 as an
+option at all for GB10 2-node vLLM. The one thing pulling the other way
+is in-house: `llama-4-fp8`'s confirmed-`ready` deploy this session is
+real proof PP=2 + explicit Ray + `eugr/spark-vllm-b12x` works on this
+stack -- but it's one model, not these two, and nobody has ever put PP
+and TP head-to-head on the same model here.
+
+**Real tool gap found while scoping this, not just a data gap.**
+`tests/ab_test.py`'s override mechanism cannot express this comparison
+as a single command. `resolve_variant()` explicitly rejects it:
+`--{side}-nodes > 1 is only supported for a pure named-recipe passthrough
+(no --{side}-* overrides); ad-hoc scratch recipes here are always
+1-node.` There is also no `--{side}-tp-size`/`--{side}-pp-size` override
+flag at all -- `tp_size`/`pp_size` only ever come from a real topology
+block already on disk. Running this A/B means creating a second real
+catalog recipe (or a second `2_node`-shaped topology) with `tp_size: 2,
+pp_size: 1` for whichever model gets tested first, then a plain two-sided
+passthrough:
+
+    docker exec -it dgx-orchestrator-api python3 tests/ab_test.py \
+        --variant-a qwen-3.6-27b-nvfp4 \
+        --variant-b qwen-3.6-27b-nvfp4-tp \
+        --repeats 3
+
+**Shape of a real fix/follow-up:**
+- Pick one of the two recipes (whichever is used more) and author the
+  `tp_size: 2` sibling topology/recipe, mirroring the existing `2_node`
+  block's `env_vars`/`vllm_args` except the parallelism split.
+- Run the A/B via the command shape above once `ab_test.py` supports it
+  as-is (it already does, for two named recipes with no overrides -- the
+  gap is only in having a second recipe to point at, not in the tool).
+- If TP wins or ties, consider converting these two recipes' `2_node`
+  topology to match -- but only after a real measurement, not on
+  community precedent alone, since `llama-4-fp8` is direct proof PP can
+  be the right call on this exact image/stack for at least one model.
+- Separately, worth deciding whether `ab_test.py`'s `--{side}-nodes > 1`
+  restriction to pure-passthrough-only is worth lifting generally (a
+  `--{side}-tp-size`/`--{side}-pp-size` override pair on top of an
+  existing recipe base would make this kind of comparison a one-off
+  command instead of requiring a permanent second catalog entry every
+  time) -- not scoped here, just noted as the thing that would have made
+  this cheaper.
+
+**Depends on:** nothing structurally. Cheap to start whenever there's
+cluster time free from whatever's actively being tested.
 
 ---
 
