@@ -1,5 +1,5 @@
 recipe_version: '1'
-hf_path: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+hf_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
 image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.7
 capability:
@@ -15,17 +15,17 @@ topologies:
     env_vars:
     - OMP_NUM_THREADS=16
     - VLLM_CPU_OMP_THREADS=16
-    - TORCHINDUCTOR_AUTOGRAD_CACHE=0
-    - TORCHINDUCTOR_FX_GRAPH_CACHE=0
-    vllm_args: >-
-      --trust-remote-code --kv-cache-dtype fp8 --enable-chunked-prefill --enable-prefix-caching
-      --max-num-seqs 8
+    vllm_args: --trust-remote-code --enable-chunked-prefill
   # CONSTRUCTED 2026-09-03, NOT recovered -- the ledger shows real prior
   # launch_history for this catalog_key::2_node, but the original recipe
   # file was never committed to git (confirmed: no history to recover),
   # so this topology is built fresh by mirroring this repo's own
-  # established 2-node pattern (qwen-3.8-27b-nvfp4, deepseek-r1-distill-
-  # qwen-32b, gemma-4-31b), not reconstructed from anything real. UNTESTED.
+  # established 2-node pattern, not reconstructed from anything real.
+  # UNTESTED. Also: this file previously had NO top-level `image:` field
+  # at all (added above, `eugr/spark-vllm-b12x:latest`) -- without it,
+  # this 2_node topology would fall back to `default_image`, which
+  # doesn't ship Ray, and hit the identical #43/#103 trap on first
+  # deploy. Fixed proactively rather than let it recur a third time.
   2_node:
     max_model_len: 131072
     tp_size: 2
@@ -40,6 +40,5 @@ topologies:
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
     vllm_args: >-
-      --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8
-      --distributed-executor-backend ray --enable-chunked-prefill --enable-prefix-caching
-      --max-num-seqs 8
+      --disable-custom-all-reduce --trust-remote-code
+      --distributed-executor-backend ray --enable-chunked-prefill

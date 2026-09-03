@@ -808,8 +808,15 @@ hard-incompatible with `pp_size > 1` -- confirmed live, `NotImplementedError:
 Pipeline parallelism is not supported for this model.` The PP side cannot
 boot at all; TP "winning" would be by forfeit, not measurement. See
 `TOMBSTONES.md` #104, `docs/TROUBLESHOOTING.md` #13, and the new
-guardrails case #4 above. **`qwen-2.5-coder-32b` is the live pair now**
--- no speculative-config on either side, clean of this problem. Both its
+guardrails case #4 above. **The TP side itself is now fully confirmed,
+not just manually load-tested** -- container log review (2026-09-03)
+shows MTP genuinely engaging on both TP ranks (`Detected MTP model.
+Sharing target model embedding weights with the draft model`, both
+`Worker_TP0`/`Worker_TP1`), full engine init, and a real `GET /health`
+`200 OK` at `03:40:58`. Not a benchmark result -- no throughput number
+yet -- but a real, working, healthy deploy. **`qwen-2.5-coder-32b` is the
+live pair now** -- no speculative-config on either side, clean of this
+problem. Both its
 files also needed an unrelated fix this session: `max_model_len: 262144`
 exceeded the model's real 32768 context (YaRN would allow 131072, not
 262144, and wasn't configured either way) -- both files corrected to
@@ -825,17 +832,28 @@ attempts crashed identically on a Ray head/worker version mismatch as a
 result. Root-caused and fixed same session, see `TOMBSTONES.md` #106 --
 the actual A/B run has not been retried since that fix landed.
 
-**Separately, `qwen-3.5-122b.yaml` picked up MTP this same session**
-(previously had no speculative-config at all, `--enforce-eager`, `pp_size:
-2`) -- three new sibling files exist
-(`qwen-3.5-122b-mtp2.yaml`/`-mtp4.yaml` for a token-depth sweep,
-`qwen-3.5-122b-tp.yaml` for its own TP-vs-PP pairing at the settled
-`num_speculative_tokens: 3`), none deployed yet. Given the MTP+PP
-incompatibility above, **`qwen-3.5-122b.yaml`'s `pp_size: 2` + MTP combo
-is untested and may simply crash the same way `qwen-3.6-27b-nvfp4` did**
--- confirm `qwen-3.5-122b-tp` (the TP side) boots before assuming the PP
-side is a live comparison target at all, not an assumption to carry into
-a scheduled overnight run.
+**Update, later same session: `qwen-3.5-122b.yaml`'s `pp_size: 2` + MTP
+combo confirmed dead**, same failure as `qwen-3.6-27b-nvfp4`
+(`TOMBSTONES.md` #104) -- not independently reproduced on this specific
+model, but the mechanism (MTP draft model class, `SupportsPP`) is
+model-agnostic, so treated as confirmed rather than re-tested for its
+own sake. **`qwen-3.5-122b-tp` (n=3) now confirmed live with real
+throughput, not just a health check** -- `benchmark.py` 3-pass, warm avg
+**40.9 tok/s decode** (38.4 cold, TTFT 49.25s cold / ~0.19s warm -- the
+large cold TTFT is a one-time first-request tax, consistent with the JIT
+-compile-not-covered-by-warmup pattern already documented elsewhere in
+this repo for other first-ever deploys, not a per-request cost). Logged
+to `benchmark_ledger.csv` under key `qwen-3.5-122b-tp`. **Retirement
+blocker cleared** -- `qwen-3.5-122b.yaml` (the dead PP file) can now be
+safely removed; the replacement is confirmed working, not just assumed.
+`qwen-3.5-122b-mtp2.yaml`/`-mtp4.yaml` (the token-depth sweep siblings)
+rebuilt as `tp_size: 2` to match -- both were originally built as
+`pp_size: 2` before the MTP+PP incompatibility was known, which would
+have made the depth sweep meaningless even if it somehow booted (mixing
+topology and depth as confounded variables). All three
+(`mtp2`/`tp`[=n3]/`mtp4`) are topology-consistent now, and with `tp`
+confirmed, the sweep in `pairs.txt` is unblocked -- `mtp2`/`mtp4`
+themselves are still individually untested. See `TOMBSTONES.md` #107.
 
 **Shape of a real fix/follow-up:**
 - Get one clean completed `ab_test.py` run on the `qwen-2.5-coder-32b`

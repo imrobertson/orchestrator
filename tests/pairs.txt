@@ -8,10 +8,12 @@
 # tool bugs -- see TOMBSTONES.md #105).
 qwen-2_5-coder-32b-tp-vs-pp|qwen-2_5-coder-32b|qwen-2_5-coder-32b-tp|2
 
-# qwen-3.5-122b MTP token-depth sweep (n=2 vs n=3 vs n=4), all on the TP
-# topology since PP+MTP is confirmed dead (TOMBSTONES.md #104) --
-# qwen-3.5-122b-mtp2/-mtp4 don't have a TP variant of their own yet, so
-# these two lines assume qwen-3.5-122b-tp is confirmed booting first.
-# Uncomment once that's verified -- untested as of this writing.
-# qwen35-mtp2-vs-mtp3|qwen-3.5-122b-mtp2|qwen-3.5-122b-tp|2
-# qwen35-mtp3-vs-mtp4|qwen-3.5-122b-tp|qwen-3.5-122b-mtp4|2
+# qwen-3.5-122b MTP token-depth sweep (n=2 vs n=3 vs n=4), all on TP
+# topology since PP+MTP is confirmed dead (TOMBSTONES.md #104). All
+# three files (mtp2, tp [=n3], mtp4) rebuilt as tp_size:2/pp_size:1 as
+# of 2026-09-03 -- topology-consistent, isolates depth only.
+# qwen-3.5-122b-tp confirmed live 2026-09-03 (real benchmark: 40.9 tok/s
+# warm decode) -- prerequisite met, sweep unblocked. mtp2/mtp4 still
+# individually untested.
+qwen35-mtp2-vs-mtp3|qwen-3.5-122b-mtp2|qwen-3.5-122b-tp|2
+qwen35-mtp3-vs-mtp4|qwen-3.5-122b-tp|qwen-3.5-122b-mtp4|2

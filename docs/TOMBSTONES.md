@@ -36,6 +36,34 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 107. `qwen-3.5-122b.yaml` retired (PP+MTP dead per #104); token-depth sweep siblings rebuilt as TP (V?.?.?)
+
+* **Context:** `qwen-3.5-122b.yaml`'s `pp_size: 2` + `qwen3_next_mtp`
+  combo hits the identical MTP+PP incompatibility as `qwen-3.6-27b-nvfp4`
+  (#104) -- not independently reproduced on this specific model, but the
+  failure mechanism (the MTP draft model class not implementing
+  `SupportsPP`) is model-agnostic, so treated as confirmed rather than
+  burning a deploy cycle re-proving it. `qwen-3.5-122b-mtp2.yaml` and
+  `-mtp4.yaml` (the token-depth sweep siblings, `num_speculative_tokens`
+  2 and 4) were originally built as `pp_size: 2` siblings of the base
+  file, before the MTP+PP incompatibility was known -- would have hit
+  the identical crash, and even if it somehow hadn't, comparing a
+  `pp_size: 2` recipe against `qwen-3.5-122b-tp`'s `tp_size: 2` (the
+  n=3 baseline) would have confounded topology with token depth, making
+  any throughput delta uninterpretable.
+* **The Fix:** `qwen-3.5-122b.yaml` removed from the catalog rather than
+  left as a known-bad trap for someone to click later. **Update, same
+  session:** `qwen-3.5-122b-tp` confirmed live with real throughput --
+  `benchmark.py` 3-pass, warm avg 40.9 tok/s decode (38.4 cold, TTFT
+  49.25s cold / ~0.19s warm), logged to `benchmark_ledger.csv` under
+  `qwen-3.5-122b-tp` -- so the retirement's contingency is satisfied, not
+  just assumed; safe to remove the PP file now. `-mtp2.yaml`/`-mtp4.yaml`
+  rebuilt as `tp_size: 2, pp_size: 1`, matching `qwen-3.5-122b-tp.yaml`
+  exactly except `num_speculative_tokens` -- all three now topology-
+  consistent, isolating depth as the only variable. `mtp2`/`mtp4`
+  themselves individually untested as of this writing -- `tp` is the
+  only one of the three with a confirmed real deploy so far.
+
 ### 106. `ab_test.py`'s pre-pull only ever targeted the head node -- `spark-3` and `spark-4` silently drifted to different cached builds of the same `:latest` tag (V?.?.?)
 
 * **The Trap:** The pre-pull step ahead of every deploy (`docker pull
