@@ -731,6 +731,60 @@
         "engine_init_sec": 51.64,
         "rank_count": 3,
         "unaccounted_sec": 22.289895
+      },
+      {
+        "run_id": "1788519933-spark-4-5009b78f0f07",
+        "ts": 1788519933.0,
+        "outcome": "ready",
+        "config_hash": "c9097cbf66ec5e01",
+        "total_sec": 432.972381,
+        "pre_load_sec": 146.146853,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 71.11,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": 25.34,
+        "compile_stage_confidence": "reported_no_cache",
+        "engine_init_sec": 179.04,
+        "rank_count": 3,
+        "unaccounted_sec": 11.33552800000001
+      },
+      {
+        "run_id": "1788520674-spark-4-6bc497bb3871",
+        "ts": 1788520674.0,
+        "outcome": "ready",
+        "config_hash": "c9097cbf66ec5e01",
+        "total_sec": 296.905237,
+        "pre_load_sec": 140.586066,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 73.08,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": 23.89,
+        "compile_stage_confidence": "reported_no_cache",
+        "engine_init_sec": 40.17,
+        "rank_count": 3,
+        "unaccounted_sec": 19.179170999999997
+      },
+      {
+        "run_id": "1788521277-spark-4-192bf566c360",
+        "ts": 1788521277.0,
+        "outcome": "ready",
+        "config_hash": "c9097cbf66ec5e01",
+        "total_sec": 338.909907,
+        "pre_load_sec": 141.11599,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 72.15,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": 24.19,
+        "compile_stage_confidence": "reported_no_cache",
+        "engine_init_sec": 53.24,
+        "rank_count": 3,
+        "unaccounted_sec": 48.21391699999998
       }
     ]
   },
@@ -1147,6 +1201,28 @@
         "engine_init_sec": 14.92,
         "rank_count": 3,
         "unaccounted_sec": 41.563549999999964
+      }
+    ]
+  },
+  "llama-4-fp8-tp::2_node": {
+    "runs": [
+      {
+        "run_id": "1788521928-spark-4-acb5e13e41b0",
+        "ts": 1788521928.0,
+        "outcome": "ready",
+        "config_hash": "f00dac23d4019e90",
+        "total_sec": 435.646517,
+        "pre_load_sec": 142.976615,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 61.47,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": 54.27,
+        "compile_stage_confidence": "reported_no_cache",
+        "engine_init_sec": 160.21,
+        "rank_count": 3,
+        "unaccounted_sec": 16.719902000000047
       }
     ]
   }
