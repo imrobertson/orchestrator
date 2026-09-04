@@ -205,7 +205,7 @@ fully paid for but never cashed in.
 | Same verdict applied to `qwen-3.5-122b` | **By mechanism, not reproduced** | #107 reasons from model-agnosticism and declines to burn a deploy cycle. Reasonable; still inference, not a second data point. |
 | `qwen-3.5-122b.yaml` (PP file) retired | **Done** | #107. Contingency (a working TP replacement) satisfied. |
 | `qwen-3.5-122b-tp` throughput | **LIVE** | 3-pass warm avg **40.9 tok/s** decode (38.4 cold, TTFT 49.25s cold / ~0.19s warm), `benchmark_ledger.csv`. Confirmed real by the operator; the handoff ledger snapshot simply lagged. One run, one number. |
-| `qwen-3.5-122b-mtp2` / `-mtp4` | **LANDED, untested** | #107's claim verified by direct file comparison: `-mtp2` and `-tp` are byte-identical apart from `num_speculative_tokens` (2 vs 3). Same `hf_path` (`Qwen/Qwen3.5-122B-A10B-FP8`), image, `gpu_util`, `max_model_len`, env_vars, and every other flag. Depth is genuinely the only variable. **But note `-tp` is itself an MTP config at n=3, not a speculation-off baseline** — the sweep ranks depths and cannot establish whether MTP helps this model at all. The 40.9 tok/s figure recorded for `-tp` is an *n=3 MTP* number. |
+| `qwen-3.5-122b-mtp2` / `-mtp4` | **IN PROGRESS, overnight 2026-09-03/04** | #107's claim verified by direct file comparison: `-mtp2` and `-tp` are byte-identical apart from `num_speculative_tokens` (2 vs 3). Same `hf_path` (`Qwen/Qwen3.5-122B-A10B-FP8`), image, `gpu_util`, `max_model_len`, env_vars, and every other flag. Depth is genuinely the only variable. **But note `-tp` is itself an MTP config at n=3, not a speculation-off baseline** — the sweep ranks depths and cannot establish whether MTP helps this model at all. The 40.9 tok/s figure recorded for `-tp` is an *n=3 MTP* number. Two `ab_test.py` runs queued sequentially, `--repeats 3` each: `mtp2` vs `-tp` (n=2 vs n=3) first, `mtp2` vs `mtp4` (n=2 vs n=4) second — see D-1 for the reasoning and the pre-flight Ray-version check. Results not yet in as of this doc revision. |
 | `qwen-3.6-27b-nvfp4` TP side | **LIVE-HEALTH** | MTP genuinely engaging on both ranks (`Detected MTP model. Sharing target model embedding weights with the draft model`, `Worker_TP0`/`TP1`), full engine init, `GET /health 200 OK` at 03:40:58. No throughput number. |
 | `qwen-3.6-27b-nvfp4` as a TP-vs-PP pair | **Dead** | PP side cannot boot. TP would win by forfeit. Correctly abandoned. |
 | `qwen-2.5-coder-32b` pair | **LIVE-HEALTH** | No speculative-config either side, so clean of E005. Both sides confirmed loading via dashboard 2026-09-03. Also fixed: `max_model_len: 262144` against a real 32768 context (YaRN would allow 131072 and wasn't configured); both corrected to `32768`. |
@@ -301,7 +301,7 @@ justify a refactor.
 
 | Item | Status | Notes |
 |---|---|---|
-| **`nemotron-3.5-lightning-bf16` two-key split (#110)** | **Recipe-level cause RESOLVED 2026-09-03; ledger cleanup OPEN** | Duplicate `hf_path` recipe deleted by operator, closing the collision at its source. Two orphaned ledger keys remain, deliberately not yet touched — see below for the asymmetric rekey/drop recommendation. |
+| **`nemotron-3.5-lightning-bf16` two-key split (#110)** | **CLOSED end to end, 2026-09-03/04** | Duplicate `hf_path` recipe deleted; `errata.yaml` E018 guards the class going forward; `clean_ledger.py` extended, applied to production, verified live-read, committed. See below for the full record. |
 | Naming convergence, dot vs underscore | **DECIDED, sequenced** | Underscore. See below. |
 | `tools/reconcile_ledger.py` (read-only) | **OPEN** | The prerequisite for the rename pass. |
 | `benchmark_ledger.csv` `--model-key` mismatch | **OPEN** | Confirmed once: the DSpark validation run logged under `deepseek-v4-flash-0731-1M` while validating `-dspark`. Fix: have the orchestrator's own benchmark caller always pass `--model-key` derived from the recipe actually being benchmarked, plus warn loudly when the `model_id.split("/")[-1]` fallback matches nothing in the catalog. An audit of existing rows has never been done. |
@@ -407,41 +407,39 @@ rejected:**
   a pre-existing internal inconsistency in the entry, unrelated to the
   rekey itself, but worth a second look before trusting the `runs[]`
   record's numbers wholesale.
-- **`clean_ledger.py` extended and tested, 2026-09-03 — ready to run.** Added
-  a `REKEY` operation alongside the existing `DROP`: an explicit
-  `REKEY_MAP` (old key → new key, fields to strip, reason), applied after
-  all drops so a rekey destination can never collide with a key the same
-  run is removing. Refuses — does not partially apply — if the destination
-  already exists, reports both sides' contents, and exits 1 so the failure
-  can't be mistaken for a clean run; this mirrors the tool's existing
-  conservative bias (explicit allowlists, no heuristics, dry-run default)
-  rather than introducing a new one. `nemotron-3.5-lightning-bf16::2_node`
+- **`clean_ledger.py` extended, tested, applied, and committed — CLOSED,
+  2026-09-03/04.** Added a `REKEY` operation alongside the existing `DROP`:
+  an explicit `REKEY_MAP` (old key → new key, fields to strip, reason),
+  applied after all drops so a rekey destination can never collide with a
+  key the same run is removing. Refuses — does not partially apply — if the
+  destination already exists, reports both sides' contents, and exits 1 so
+  the failure can't be mistaken for a clean run; this mirrors the tool's
+  existing conservative bias (explicit allowlists, no heuristics, dry-run
+  default) rather than introducing a new one. `nemotron-3.5-lightning-bf16::2_node`
   moved from the stale "Deliberately NOT touched — legitimate, just
   incomplete" note into a fourth `DROP` class, `ORPHANED-RECIPE`; the
   `::1_node` entry is the one `REKEY_MAP` entry, stripping only
   `launch_history`.
 
-  Verified against a real copy of the production ledger before handing
-  over: dry run produces exactly the two expected operations and nothing
-  else (confirming this ledger snapshot has none of the tool's original
-  three drop classes present, which is fine — an empty class isn't a bug);
-  `--apply` moves `cached`/`compiled`/`runs[]` intact to
-  `nemotron-3_5-lightning-bf16::1_node` while dropping only
-  `launch_history`; a re-run against the cleaned output is a true no-op
-  (`0 to drop, 0 to rekey`); and a synthetic conflict test (destination
-  pre-populated) leaves both sides of the pair completely untouched and
-  exits 1, while an unrelated pending drop in the same run still goes
-  through — confirming the two operation types are independent.
-
-  ```bash
-  cd ~/docker/orchestrator
-  python3 clean_ledger.py model_ledger.json            # dry run first
-  python3 clean_ledger.py model_ledger.json --apply    # then commit
-  ```
-  Stop the orchestrator (or at minimum confirm nothing is deployed, per
-  `dgx-config status`) before running `--apply` — the daemon polls this
-  file every 4 seconds and the write is atomic, but there is no value in
-  racing it. The `.bak-<timestamp>` copy is written automatically.
+  Verified twice, not once: first against a local copy before handover
+  (dry run produced exactly the two expected operations; `--apply` moved
+  `cached`/`compiled`/`runs[]` intact while dropping only `launch_history`;
+  a re-run against the cleaned output was a true no-op; a synthetic
+  destination-conflict test left both sides of a colliding pair completely
+  untouched and exited 1 while an unrelated pending drop in the same run
+  still went through). Then run for real, on `maestro`, against production
+  `model_ledger.json` — dry run matched the local-copy plan exactly
+  (1 drop, 1 rekey, 0 conflicts); `--apply` produced the identical result
+  (26 keys, rekeyed entry present, `launch_history` absent, both old
+  dot-form keys gone) with a `.bak-1788484650` safety copy; confirmed
+  `dgx-config status` showed nothing deployed beforehand so nothing raced
+  the daemon's live poll of the file. Live-read confirmed, not assumed —
+  traced `get_estimated_load_time()` (`dgx-orchestrator.py:1285`) to
+  `data = _read_json_state(LEDGER_PATH)` called inline on every invocation,
+  so the change was live for the daemon immediately, no restart needed.
+  Committed to git the same session. **#110/#111 fully closed end to end**
+  — recipe deleted, `errata.yaml` E018 guards the class going forward,
+  ledger cleaned, change committed.
 
 **On merge safety, for the record — no longer live, but the reasoning stays
 useful for the reconciliation tool generally.** Both 2-node keys carried an
@@ -605,11 +603,29 @@ catalog-key naming (underscore, not dot)           CLEARED
                  └─> llama-4-fp8 (PP=2) needs its OWN A/B -- different model,
                      different quant, and the one in-house PP data point
 
-remaining in WS-1, and now the only open Qwen thread:
+remaining in WS-1, now IN PROGRESS overnight 2026-09-03/04:
   qwen-3.5-122b MTP token-depth sweep (mtp2 / tp[n=3] / mtp4)
+    ├─> Ray versions confirmed matching (2.58.0, both hosts) before launch --
+    │   #106's pre-pull fix holding, no repeat of the version-drift crash
+    ├─> run 1: mtp2 vs tp[n=3], --repeats 3, launched ~21:15 2026-09-03
+    ├─> run 2: mtp2 vs mtp4, --repeats 3, queued behind run 1 (waits for
+    │   run 1's ab_test.py process to exit before starting -- not racing it)
+    ├─> rationale for testing 2-vs-3 first rather than the wider 2-vs-4
+    │   contrast originally suggested: a third-party claim holds n=3 as
+    │   best, n=2 second-best, n=4 too aggressive -- this run tests whether
+    │   the top two are actually distinguishable on this hardware/image,
+    │   not just ranking three unknowns. If mtp2 wins or ties, that
+    │   contradicts the claim and is the more interesting result; if tp[n=3]
+    │   wins clearly, that corroborates it independently rather than just
+    │   inheriting it secondhand -- record which, explicitly, when writing
+    │   up the result. Source of the "3 best / 2 second / 4 too big" claim
+    │   itself not yet traced to a specific document -- do that before
+    │   citing it in a permanent record.
     └─> note: all three carry MTP. There is no speculation-OFF control,
         so the sweep can rank depths but cannot answer whether MTP helps
-        this model at all.
+        this model at all. Expect real prompt-category variance this time,
+        unlike the coder A/B's near-zero spread -- speculative acceptance
+        is workload-dependent; read per-category numbers, not the aggregate.
 ```
 
 **D-2 — the status-marker chain (prerequisite already paid)**

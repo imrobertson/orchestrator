@@ -1,11 +1,11 @@
 # Control Plane Release Tombstones & Fix Log
 
 <!--
-Reconciliation note (2026-09-03): #111-#113 added this session, appended
+Reconciliation note (2026-09-03): #111-#114 added this session, appended
 above #110 per usual (newest/highest on top). #111 resolves #110's open
 question -- #110 itself is left as originally written, uncorrected, since
 it's the accurate record of what was known and suspected at the time; the
-resolution is #111, not a rewrite of #110. Full numbering 27-113 confirmed
+resolution is #111, not a rewrite of #110. Full numbering 27-114 confirmed
 contiguous by the same exhaustive "### N." scan method the 2026-08-31 note
 below established (not just line-start matches).
 -->
@@ -45,6 +45,37 @@ fixed today, recorded here rather than silently:
     occurrence in the raw file (not just line-start matches, since
     that's exactly what let #76 hide undetected as long as it did).
 -->
+
+### 114. #111's ledger cleanup applied to production and committed -- #110 fully closed end to end (V?.?.?)
+
+* **The Trap:** #111 recorded that `clean_ledger.py` had been extended with
+  a `REKEY` operation and verified against a *copy* of the production
+  ledger, but the actual production `model_ledger.json` on `maestro` had
+  not yet been touched -- the drop/rekey plan existed and was tested, not
+  applied. Leaving that gap open across a doc-writing session risked the
+  usual failure this file exists to prevent: a written record implying
+  something is done when it's still just designed.
+* **The Fix:** Confirmed nothing deployed (`dgx-config status`, both hosts
+  idle) before running `--apply` against the real file. Dry run against
+  production matched the tested plan exactly (1 drop, 1 rekey, 0
+  conflicts); `--apply` produced 26 keys with a `.bak-1788484650` safety
+  copy, the rekeyed entry present with `launch_history` correctly absent,
+  and both old dot-form keys gone -- verified by direct read, not assumed
+  from the tool's own printed summary. Traced `get_estimated_load_time()`
+  (`dgx-orchestrator.py:1285`) to confirm it calls
+  `_read_json_state(LEDGER_PATH)` inline on every invocation rather than
+  reading a cached/startup-populated copy, so the fix was live for the
+  daemon immediately -- no restart required, and the ETA estimator's Tier 1
+  (`runs[]` median) will find the preserved phase data under the correct
+  key on the model's next 1-node deploy rather than falling through to the
+  hardcoded default. Committed to git the same session
+  (`model_ledger.json`, plus `.bak-*` deliberately left uncommitted --
+  worth adding `*.bak-*` to `.gitignore` if not already present, so a
+  future `--apply` doesn't get swept into a commit by an `add -A` out of
+  habit). #110's full arc -- symptom (#110) -> root cause + recipe deletion
+  (#111) -> ledger tool built and tested (#111) -> ledger tool applied to
+  production and committed (this entry) -- is now closed with nothing left
+  designed-but-unapplied.
 
 ### 113. Confirmed: `VLLM_USE_V1` no longer exists in vLLM on the current `:latest` build -- Incident #1's rule scoped, not deleted (V?.?.?)
 

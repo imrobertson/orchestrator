@@ -24,7 +24,7 @@
 # ADDING A RULE: only from a real incident. Do not anticipate.
 
 version: 1
-generated_from: "TOMBSTONES.md #27-#113, TROUBLESHOOTING.md #1-14, 2026-09-03 synthesis"
+generated_from: "TOMBSTONES.md #27-#114, TROUBLESHOOTING.md #1-14, 2026-09-03 synthesis"
 
 builds:
   # Named so a rule can be scoped to the build it was actually proven on.
