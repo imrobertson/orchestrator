@@ -414,6 +414,7 @@ rules:
       - "qwen-2_5-coder-32b / -tp (PP vs TP comparison pair)"
       - "qwen-3.5-122b-tp / -mtp2 / -mtp4 (speculative depth sweep)"
       - "deepseek-v4-flash-0731-dspark / -512k / -1M (context-size variants)"
+      - "llama-4-fp8 / -tp (PP vs TP comparison pair, WORKSTREAMS.md WS-1)"
     evidence: {tombstones: [57, 77, 110, 111]}   # 111 = the resolution entry
 
 
