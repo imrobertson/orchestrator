@@ -138,67 +138,6 @@
       }
     ]
   },
-  "nemotron-3.5-lightning-bf16::1_node": {
-    "cached": [
-      597,
-      611,
-      551
-    ],
-    "compiled": [
-      571,
-      674,
-      1017,
-      3001
-    ],
-    "downloaded": [],
-    "lifetime": {
-      "in": 0,
-      "out": 0,
-      "draft": 0,
-      "accepted": 0
-    },
-    "launch_history": {
-      "65c268515202a4f7": {
-        "last_success_ts": 1787946737.4961932,
-        "count": 1
-      }
-    },
-    "runs": [
-      {
-        "run_id": "1788369708-spark-4-72947e778880",
-        "ts": 1788369708.0,
-        "outcome": "ready",
-        "config_hash": "7f46f3161f0d6a4d",
-        "total_sec": 522.217368,
-        "pre_load_sec": 19.585157,
-        "pre_load_is_derived": true,
-        "pre_load_confidence": "measured",
-        "weight_load_sec": 465.51,
-        "compile_sec": 0.17,
-        "compile_stage_confidence": "reported",
-        "engine_init_sec": 28.93,
-        "rank_count": 1,
-        "unaccounted_sec": 8.02221099999997
-      }
-    ]
-  },
-  "nemotron-3.5-lightning-bf16::2_node": {
-    "cached": [],
-    "compiled": [],
-    "downloaded": [],
-    "lifetime": {
-      "in": 124,
-      "out": 1487,
-      "draft": 0,
-      "accepted": 0
-    },
-    "last_seen_raw": {
-      "p": 93.0,
-      "g": 768.0,
-      "d": 0.0,
-      "a": 0.0
-    }
-  },
   "deepseek-v4-flash-0731-dspark::2_node": {
     "cached": [
       444,
@@ -944,5 +883,43 @@
       "d": 0.0,
       "a": 0.0
     }
+  },
+  "nemotron-3_5-lightning-bf16::1_node": {
+    "cached": [
+      597,
+      611,
+      551
+    ],
+    "compiled": [
+      571,
+      674,
+      1017,
+      3001
+    ],
+    "downloaded": [],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    },
+    "runs": [
+      {
+        "run_id": "1788369708-spark-4-72947e778880",
+        "ts": 1788369708.0,
+        "outcome": "ready",
+        "config_hash": "7f46f3161f0d6a4d",
+        "total_sec": 522.217368,
+        "pre_load_sec": 19.585157,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 465.51,
+        "compile_sec": 0.17,
+        "compile_stage_confidence": "reported",
+        "engine_init_sec": 28.93,
+        "rank_count": 1,
+        "unaccounted_sec": 8.02221099999997
+      }
+    ]
   }
 }
