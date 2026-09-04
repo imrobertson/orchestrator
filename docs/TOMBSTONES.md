@@ -1,6 +1,16 @@
 # Control Plane Release Tombstones & Fix Log
 
 <!--
+Reconciliation note (2026-09-03): #111-#113 added this session, appended
+above #110 per usual (newest/highest on top). #111 resolves #110's open
+question -- #110 itself is left as originally written, uncorrected, since
+it's the accurate record of what was known and suspected at the time; the
+resolution is #111, not a rewrite of #110. Full numbering 27-113 confirmed
+contiguous by the same exhaustive "### N." scan method the 2026-08-31 note
+below established (not just line-start matches).
+-->
+
+<!--
 Reconciliation note (2026-08-31): this file had accumulated real
 inconsistencies from uncoordinated concurrent edits across sessions --
 fixed today, recorded here rather than silently:
@@ -35,6 +45,181 @@ fixed today, recorded here rather than silently:
     occurrence in the raw file (not just line-start matches, since
     that's exactly what let #76 hide undetected as long as it did).
 -->
+
+### 113. Confirmed: `VLLM_USE_V1` no longer exists in vLLM on the current `:latest` build -- Incident #1's rule scoped, not deleted (V?.?.?)
+
+* **The Trap:** `TROUBLESHOOTING.md`'s own tuning reference contradicted
+  itself on whether `VLLM_USE_V1=0` is required for 2-node cross-host
+  topologies -- Incident #1 (from V4.8.1, #43) says it's required alongside
+  `--distributed-executor-backend ray`; a later "Multi-node executor
+  requirements" note downgraded that from Validated after two real deploys
+  showed no effect (`gemma-4-31b::2_node`) or no need at all
+  (`deepseek-v4-flash-0731-dspark::2_node`). Direct inspection of
+  `eugr/spark-vllm-b12x:latest`, build `v0.1.dev20482+g83cb22a0e.d20260903`
+  (three weeks and ~480 dev revisions past the build every earlier
+  measurement in this file is scoped to), settles it: `vllm.envs` raises
+  `AttributeError: module 'vllm.envs' has no attribute 'VLLM_USE_V1'`.
+  The entire `vllm.executor` package -- the V0 executor stack, including
+  the Ray executor the original rule was written to select -- is absent
+  (`ModuleNotFoundError`). `vllm.engine.llm_engine` still resolves, but as
+  a V1 compatibility shim, not a V0 code path. There is no V0 executor
+  left for the variable to switch.
+* **The Fix:** Not a code fix -- a diagnostic result recorded before any
+  code changes. `errata.yaml` E015 records all four positions (required /
+  no-effect / not-needed / removed-entirely) and the resolution: the
+  Ray-flag half of Incident #1's rule (`--distributed-executor-backend
+  ray`) remains fully load-bearing and is unaffected; only the
+  `VLLM_USE_V1` half is dead, and it is dead specifically **on this
+  build** -- the rule is scoped, not deleted, since it came from a real
+  observed failure on an earlier one. Any recipe still carrying
+  `VLLM_USE_V1=0` now trips the "Unknown vLLM environment variable
+  detected" warning and contributes dead config to `compute_config_hash()`.
+  Remedy is to strip it opportunistically as each recipe is re-validated,
+  never as a catalog-wide sweep -- every `env_vars` change resets that
+  recipe's launch-success history. Worth flagging generally: the `:latest`
+  tag moving three weeks between two measurements in the same document set
+  is itself the likely explanation for the same-session Qwen A/B's
+  `boot_log_hit=False` on all six deploys (`run-20260903-154922.log`) --
+  the boot-log keyword scan is built on vLLM's log vocabulary, and a build
+  bump changing one log line is exactly #100's failure mode. Also exposes
+  a real gap: `compute_config_hash()` hashes the `image` field as a tag
+  string (`eugr/spark-vllm-b12x:latest`), not a digest, so an identical
+  `config_hash` across two runs does not guarantee an identical build --
+  a future `validated` status marker keyed on that hash could attest to a
+  build no longer running. Not yet fixed; recording the image digest as
+  run metadata (deliberately outside `config_hash`, to avoid orphaning
+  every recipe's history on each upstream push) is scoped but unbuilt.
+
+### 112. `models.yaml` and its legacy code path retired -- Phase 2's last remnant, verified by AST equivalence and a live argv diff, not just `py_compile` (V?.?.?)
+
+* **The Trap:** Phase 2 (per-model recipe files replacing the monolithic
+  `models.yaml`) completed weeks ago, but `models.yaml` and a
+  `USE_LEGACY_CATALOG=1` fallback survived untouched: the
+  `MODELS_YAML_PATH` constant, `_load_model_catalog_legacy()` (24 lines),
+  the branch in `load_model_catalog()`, a guard in
+  `_execute_deployment_impl()` skipping launch-state recording under
+  legacy mode, and two comments describing the now-dead mode. The one real
+  risk in removing it: `_load_model_catalog_legacy()` was also where
+  `GLOBAL_HF_HUB_OFFLINE`/`GLOBAL_TRANSFORMERS_OFFLINE` got injected into
+  each topology's `env_vars` -- deleting the function blind could have
+  silently dropped that behavior rather than just removing a fallback.
+* **The Fix:** Confirmed `build_catalog_response()`
+  (`common/recipes.py:577-620`) already performs the identical
+  strip-then-append injection for both offline switches, sourced from
+  `cluster_config.yaml` instead of `models.yaml`'s own top-level keys --
+  the trap didn't apply. Removed all five touchpoints. Verified two ways,
+  not one: (1) AST equivalence -- reparsed the pre-edit file, programmatically
+  hoisted the guarded block out of its `if` and collapsed the catalog
+  branch to its `else`, then compared `ast.dump()` against the edited file;
+  `_execute_deployment_impl` and `load_model_catalog` came back identical,
+  no other top-level function's AST changed, `legacy_hosts_dict` (a
+  same-word, unrelated mechanism for cluster host config, not this) was
+  correctly left untouched. (2) Live, on `maestro`: version badge moved
+  `+9c5fd079` -> `+3fdf79c5` exactly as predicted from the file's own
+  sha256 before deploying; catalog count held at 25 (the pre-existing
+  belief that it was 27 was this file set's own miscount, corrected the
+  same session); `GLOBAL_HF_HUB_OFFLINE`/`GLOBAL_TRANSFORMERS_OFFLINE`
+  both present and `0` post-restart; and a `--dry-run` argv diff on a real
+  2-node and 1-node recipe, before vs. after, showed the *only* differing
+  lines were the `deploy_run_id` timestamp embedded in the ray-logs
+  bind-mount path (expected -- each invocation mints a fresh run id) --
+  every other constructed `docker run` argument was byte-identical. This
+  is the first entry in this file verified by AST equivalence *and* a live
+  argv diff together, rather than either alone. `models.yaml` deleted from
+  the repo root after both checks passed.
+
+### 111. #110's root cause identified and resolved: not a key-derivation split, a duplicate recipe with an identical `hf_path` -- ledger cleanup handled separately (V?.?.?)
+
+* **The Trap:** #110 (below) recorded the symptom -- two ledger keys for
+  one model, `lifetime` and `launch_history`/`runs[]` split across a dot
+  form and an underscore form -- but declined to guess at a fix without
+  the call site identified, on the correct suspicion that guessing risked
+  merging entries that might not be safe to merge. #110's own hypothesis
+  (a live-telemetry code path deriving its key from the served HF name
+  while the deploy path used the sanitized recipe filename) turned out to
+  be wrong. Direct repo read found two **live recipe files** carrying the
+  identical `hf_path`
+  (`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`):
+  `nemotron-3.5-lightning-bf16.yaml` (no `image:` field, `1_node` only)
+  and `nemotron-3_5-lightning-bf16.yaml` (`eugr/spark-vllm-b12x:latest`,
+  `1_node` + `2_node`). `_resolve_catalog_key()` matches on
+  `hf_path.endswith(loaded_model) or cat_key == loaded_model or
+  loaded_model in hf_path`; both files satisfied it, so first-match-wins
+  by dict iteration order decided which key a given poll produced. This
+  is the near-duplicate catalog-entry class already named in #57 and,
+  precisely, #77 -- not a novel two-subsystems bug. `_resolve_active_recipe()`'s
+  no-match fallback returning `loaded_model` unchanged (rather than
+  lowercasing or sanitizing it) is what rules out the served-name-derivation
+  reading: that fallback would have produced the raw HF basename, not a
+  recipe-stem-shaped key.
+* **The Fix:** The duplicate recipe file (dot form) was deleted by the
+  operator, closing the collision at its source -- only one recipe with
+  this `hf_path` remains, so `_resolve_catalog_key()` can no longer return
+  an ambiguous match for it. `errata.yaml` gained rule E018 (duplicate
+  `hf_path` across catalog entries, `enforce: warn`, with the set of
+  *intentional* same-`hf_path` pairs -- TP/PP siblings, speculative-depth
+  sweeps, context-size variants -- explicitly allowlisted so the linter
+  doesn't fire on legitimate ones) so a future instance of this class is
+  caught before it produces a second incident. The two orphaned ledger
+  keys left behind by the deletion are a separate, deliberately
+  asymmetric cleanup, not a merge: `::2_node` (token counts only, no
+  `launch_history`, no `runs[]`, no diagnostic value) was dropped
+  outright; `::1_node` (real phase data -- `cached`, `compiled`, a full
+  `runs[]` record) was rekeyed onto the surviving recipe's key rather than
+  dropped, stripping only its `launch_history`, whose `config_hash`
+  attests to the now-deleted file and could never join to the surviving
+  recipe regardless (it adds an `image:` field the deleted one never had).
+  `clean_ledger.py` was extended with a `REKEY` operation to do this
+  safely and repeatably -- explicit allowlist (`REKEY_MAP`), refuses
+  rather than auto-merges if the destination key already exists, same
+  atomic-write and dry-run-by-default shape the tool already had. Verified
+  against a real copy of the ledger before handover: dry run produces
+  exactly the two expected operations; `--apply` moves `cached`/
+  `compiled`/`runs[]` intact while dropping only `launch_history`; a
+  re-run against the cleaned output is a true no-op; and a synthetic
+  destination-conflict test leaves both sides of a colliding pair
+  completely untouched and exits non-zero, while an unrelated pending
+  drop in the same run still completes -- confirming the two operation
+  types are independent. One unresolved detail surfaced during this
+  work, unrelated to the rekey's safety: the `::1_node` entry's
+  `launch_history` hash (`65c268515202a4f7`) never matched its own
+  `runs[]` record's `config_hash` (`7f46f3161f0d6a4d`) -- pre-existing,
+  not explained, not blocking, carried forward as an open flag rather
+  than resolved by assumption.
+
+### 110. `nemotron-3.5-lightning-bf16`'s live-telemetry and deploy-tracking code paths derive different ledger keys for the same model -- confirmed live, split real usage data across two entries (V?.?.?)
+
+* **The Trap:** `model_ledger.json` picked up **two** separate `2_node`
+  entries for the same model: `nemotron-3.5-lightning-bf16::2_node`
+  (literal dot) and `nemotron-3_5-lightning-bf16::2_node` (underscore,
+  matching the actual recipe filename). The underscore key has the real
+  `launch_history`/`runs[]` phase data from tonight's confirmed deploy;
+  the dot key has only `lifetime` token counts (`in: 124, out: 1487`)
+  from live-serving telemetry, no launch data at all -- two different
+  subsystems, two different keys, one model, silently split history.
+  Root cause not directly inspected in code, but strongly evidenced:
+  the HF model name itself is `nvidia/NVIDIA-Nemotron-3.5-Lightning-
+  30B-A3B-BF16` (literal dot in "3.5"), while `common/recipes.py`
+  derives catalog keys from the filename stem, which uses an underscore
+  by convention. `nemotron-3-nano-30b-a3b-nvfp4` -- same session, same
+  construction method, HF name has no decimal at all -- shows **zero**
+  duplicate-key issue, a clean single entry. Consistent with something
+  in the live-telemetry/session-tracking path (`SessionTracker` or
+  wherever `lifetime` counts get written) deriving its ledger key from
+  the served model name or `hf_path` rather than the sanitized recipe
+  filename the deploy/phase-recording path correctly uses. This is a
+  live, reproducible instance of the "Near-duplicate catalog key
+  detection" gap already flagged in `ROADMAP.md` -- see that entry,
+  extended same session with this incident plus the broader
+  ledger-reconciliation gap it exposes (recipe renamed vs. changed vs.
+  never-committed-only-ever-live-variant, currently indistinguishable).
+* **The Fix:** Not yet fixed -- documented as found. No safe one-line
+  fix without knowing which specific call site derives the dot-form key;
+  guessing at a patch here risks silently merging two ledger entries
+  that might not actually be safe to merge without inspecting both first
+  (this file already declines to guess at that per `ROADMAP.md`'s own
+  design principle after tonight's naming-mismatch issues). Needs the
+  actual call site identified before touching anything.
 
 ### 109. `nemotron-3-nano-30b-a3b-nvfp4`'s `2_node` topology, constructed from pattern (not recovered) -- confirmed live, near-zero cold TTFT worth a note (V?.?.?)
 

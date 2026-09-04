@@ -1,0 +1,439 @@
+# errata.yaml -- machine-readable recipe rules.
+#
+# Source of truth for the recipe linter AND for the human-readable tuning
+# reference (render the doc from this file; do not maintain both by hand --
+# that divergence is what TROUBLESHOOTING.md's tuning section became).
+#
+# Every rule carries its own evidence. A rule with confidence: unconfirmed
+# is present so nobody re-derives it, NOT so the linter can act on it --
+# see `enforce`.
+#
+# FIELDS
+#   id            stable identifier; never reused, never renumbered
+#   summary       one line, imperative where possible
+#   confidence    validated   -- watched it work
+#                 known_bad   -- watched it fail, mechanism understood
+#                 unconfirmed -- written down, never actually exercised
+#   enforce       error | warn | none
+#                 `none` = documentation only; the linter must not fire
+#   scope         what the rule is bounded by. A rule verified on exactly
+#                 one build/image is scoped to it, not generalized.
+#   condition     the predicate, as data. `all` = every clause must hold.
+#   evidence      tombstone/incident refs and dates. No ref, no rule.
+#
+# ADDING A RULE: only from a real incident. Do not anticipate.
+
+version: 1
+generated_from: "TOMBSTONES.md #27-#113, TROUBLESHOOTING.md #1-14, 2026-09-03 synthesis"
+
+builds:
+  # Named so a rule can be scoped to the build it was actually proven on.
+  # KNOWN LIMITATION, confirmed real 2026-09-03 (see E015): this image's tag
+  # is `:latest` and it floats. Every build string below is a point-in-time
+  # pin, not a guarantee of what a recipe will run tomorrow. A rule scoped
+  # to a build string goes silently DORMANT the moment :latest moves past
+  # it -- it does not fire incorrectly, it just stops firing at all, which
+  # is worse because nothing signals the gap. There is no fix for this
+  # inside errata.yaml itself; the real fix is recording the image DIGEST
+  # (not tag) as run metadata at deploy time (WORKSTREAMS.md WS-2/WS-9,
+  # unbuilt). Until that lands, treat every build-scoped rule below as
+  # needing a fresh spot-check whenever a deploy surfaces an unexpected
+  # version string in its boot log -- do not assume silence means the rule
+  # still applies.
+  original_pin: "v0.1.dev20003+gad848fc41.d20260815"
+    # The build every E001-E014 measurement in this file was originally
+    # taken against (2026-08-15 through 2026-09-02 sessions).
+  latest_confirmed:
+    tag: "v0.1.dev20482+g83cb22a0e.d20260903"
+    confirmed: "2026-09-03"
+    checked_directly: >-
+      vllm.envs has no attribute VLLM_USE_V1 (AttributeError); the entire
+      vllm.executor package (V0 executor stack) is absent
+      (ModuleNotFoundError). See E015.
+    NOT_rechecked: >-
+      Everything else in this file -- E001 through E014's specific error
+      messages, env-var lists, and flag behaviors -- was NOT re-verified
+      against this build. Their confidence: validated / known_bad ratings
+      describe what was true on original_pin, not a claim that they still
+      hold here. Most are vLLM core-mechanism errors (pydantic validation,
+      NotImplementedError) unlikely to have changed wording across ~480 dev
+      revisions, but E014 specifically (unrecognized VLLM_* env vars) is
+      inherently build-string-sensitive -- exactly the class VLLM_USE_V1
+      turned out to belong to -- and should be the first re-checked.
+
+images:
+  eugr_b12x:
+    tag: "eugr/spark-vllm-b12x:latest"
+    ships_ray: true
+    lineage: "lukealonso/b12x fork -- custom SM120 MoE/dense kernels"
+    note: >-
+      Version strings shaped like 0.1.devNNNNN+g<hash>.dYYYYMMDD (not
+      0.26.x) are the tell that this is the fork, not mainline. The exact
+      string moves with :latest -- most recently confirmed
+      v0.1.dev20482+g83cb22a0e.d20260903 on 2026-09-03, see builds.latest_confirmed.
+  eugr_mainline:
+    tag: "eugr/spark-vllm:latest"
+    ships_ray: true
+    lineage: "mainline-tracking"
+  ngc_default:
+    tag: "nvcr.io/nvidia/vllm:26.07-py3"
+    ships_ray: false          # confirmed: `exec: ray: not found`
+  hazyumps_gb10:
+    tag: "hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d"
+    ships_ray: true
+    lineage: "jasl PR #41834 fork, prebuilt for GB10/sm_121 aarch64"
+
+rules:
+
+  - id: E001
+    summary: "No nvfp4-family --kv-cache-dtype on an MLA-architecture model."
+    confidence: known_bad
+    enforce: error
+    scope: {engine: vllm, architecture: mla}
+    condition:
+      all:
+        - {field: vllm_args, flag: "--kv-cache-dtype", value_matches: "^nvfp4"}
+        - {field: hf_path, matches: "(?i)deepseek-v[234]|mla"}
+    failure: "pydantic_core.ValidationError: nvfp4 KV cache is not supported with MLA (Multi-head Latent Attention) backends"
+    fails_at: config_creation      # before any weight load or GPU cost
+    remedy: "Use --kv-cache-dtype fp8 or auto."
+    evidence:
+      tombstones: [56]
+      incidents: [3]
+      notes: >-
+        vLLM core guard, landed with upstream PR #40177. Not image-specific.
+        The validated fp8-on-MLA example is now
+        deepseek-v4-flash-0731-dspark.yaml / -512k.yaml / -1M.yaml; earlier
+        docs cite deepseek-v4-flash-0731-nvfp4.yaml, which was deleted in the
+        2026-08-29 catalog trim.
+
+  - id: E002
+    summary: "Do not pass --quantization modelopt_fp4 together with an explicit --kv-cache-dtype."
+    confidence: known_bad
+    enforce: error
+    scope: {image_family: eugr}
+    condition:
+      all:
+        - {field: vllm_args, flag: "--quantization", value: "modelopt_fp4"}
+        - {field: vllm_args, flag_present: "--kv-cache-dtype"}
+    failure: "Container entrypoint hook silently overrides the explicit dtype back to nvfp4_ds_mla, re-triggering E001 even when the author correctly wrote fp8."
+    remedy: "Omit --quantization modelopt_fp4; let vLLM auto-detect from config.json, and keep --kv-cache-dtype fp8 explicit."
+    evidence: {incidents: [3], notes: "This is the actual pattern in the working DeepSeek V4 Flash 0731 recipe."}
+
+  - id: E003
+    summary: "Every 2-node topology must carry --distributed-executor-backend ray explicitly."
+    confidence: known_bad
+    enforce: error
+    scope: {topology: multi_host}
+    condition:
+      all:
+        - {field: topology.nodes, gt: 1}
+        - {field: vllm_args, flag_absent: "--distributed-executor-backend"}
+    failure: "AssertionError: collective_rpc should not be called on follower node -- the mp backend relies on /dev/shm, which cannot cross physical hosts."
+    remedy: "Add --distributed-executor-backend ray. There is no safe default: use_ray requires the literal tokens present, and their absence silently routes onto the --nnodes/--headless path rather than failing closed."
+    evidence:
+      tombstones: [43]
+      incidents: [1]
+      notes: "Reproduced independently 2026-08-31 (Task MD) on a from-scratch Qwen3-0.6B TP=2 recipe with vllm_args: '' -- an ABSENT flag is enough, it does not require a deliberately wrong one."
+
+  - id: E004
+    summary: "A 2-node recipe must use an image that actually ships the ray binary."
+    confidence: known_bad
+    enforce: error
+    scope: {topology: multi_host}
+    condition:
+      all:
+        - {field: topology.nodes, gt: 1}
+        - {field: image, ships_ray: false}
+    failure: "/opt/nvidia/nvidia_entrypoint.sh: line 55: exec: ray: not found -- before any Python starts."
+    remedy: "Switch image to eugr/spark-vllm-b12x:latest (confirmed to ship Ray), or bake Ray in via the mods pipeline."
+    evidence:
+      tombstones: [103]
+      incidents: [11]
+      notes: "Distinct failure from E003, not a rediscovery of it. Having the flag right is not enough if the image cannot run it. Confirmed fixed live on llama-3.3-70b, llama-4-fp4, llama-4-fp8."
+
+  - id: E005
+    summary: "MTP-family speculative decoding cannot be combined with pp_size > 1."
+    confidence: known_bad
+    enforce: error
+    scope: {engine: vllm}
+    condition:
+      all:
+        - {field: vllm_args, flag: "--speculative-config", json_key: method, value_matches: "mtp"}
+        - {field: topology.pp_size, gt: 1}
+    failure: "NotImplementedError: Pipeline parallelism is not supported for this model. Supported models implement the SupportsPP interface."
+    fails_at: config_creation
+    remedy: "Use tp_size (or a single node). The MTP draft-model class does not implement SupportsPP, independent of whether the target model does."
+    evidence:
+      tombstones: [104, 107]
+      incidents: [13]
+      notes: "Confirmed live on qwen-3.6-27b-nvfp4::2_node 2026-09-03. Applied to qwen-3.5-122b by mechanism (model-agnostic), not independently reproduced."
+
+  - id: E006
+    summary: "DSpark requires num_speculative_tokens >= 5."
+    confidence: known_bad
+    enforce: error
+    scope: {engine: vllm, method: dspark}
+    condition:
+      all:
+        - {field: vllm_args, flag: "--speculative-config", json_key: method, value: dspark}
+        - {field: vllm_args, flag: "--speculative-config", json_key: num_speculative_tokens, lt: 5}
+    failure: "pydantic_core.ValidationError: DSpark requires num_speculative_tokens >= dspark_block_size (5)"
+    remedy: "Keep num_speculative_tokens at 5 or above; fit the VRAM budget with --max-num-seqs or a shorter context instead."
+    evidence: {tombstones: [61]}
+
+  - id: E007
+    summary: "DSpark speculative decoding must use tensor parallelism, never pipeline stages."
+    confidence: known_bad
+    enforce: error
+    scope: {engine: vllm, method: dspark, topology: multi_host}
+    condition:
+      all:
+        - {field: vllm_args, flag: "--speculative-config", json_key: method, value: dspark}
+        - {field: topology.pp_size, gt: 1}
+    failure: "Speculative state evaluation breaks across pipeline stages."
+    remedy: "tp_size: 2, pp_size: 1."
+    evidence: {notes: "TROUBLESHOOTING.md, Speculative Decoding / MTP (DSpark) Constraints."}
+
+  - id: E008
+    summary: "Gemma 4 requires --attention-backend TRITON_ATTN."
+    confidence: validated
+    enforce: warn
+    scope: {model_family: gemma-4, image_family: eugr}
+    condition:
+      all:
+        - {field: hf_path, matches: "(?i)gemma-4"}
+        - {field: vllm_args, flag_not_value: {flag: "--attention-backend", value: "TRITON_ATTN"}}
+    remedy: "Gemma 4 has heterogeneous head dimensions (256 local / 512 global) the default FlashInfer path does not handle correctly."
+    evidence:
+      notes: "Validated 2026-08-29 TP=2, 12.0 tok/s decode, matching independent community TP=2 figures (~11.2). Confirmed via 'Using AttentionBackendEnum.TRITON_ATTN backend.' 3x across the cluster -- resolved, not merely requested."
+
+  - id: E009
+    summary: "Gemma 4 uses the BF16 base checkpoint with --quantization fp8, never a pre-quantized -FP8 repo."
+    confidence: known_bad
+    enforce: warn
+    scope: {model_family: gemma-4}
+    condition:
+      all:
+        - {field: hf_path, matches: "(?i)gemma-4.*fp8"}
+    failure: "google/gemma-4-31B-it-FP8 does not exist (401 RepositoryNotFoundError). A real third-party FP8 repo fails differently: KeyError 'layers.0.mlp.down_proj.weight_scale' in gemma4.py load_weights (vLLM #38912)."
+    remedy: "hf_path: google/gemma-4-31B-it plus --quantization fp8. Opposite of the DeepSeek pattern."
+    evidence: {incidents: [10]}
+
+  - id: E010
+    summary: "Do not use eugr/spark-vllm-b12x for MTP speculative decoding on Gemma 4."
+    confidence: known_bad
+    enforce: error
+    scope: {model_family: gemma-4, image: "eugr/spark-vllm-b12x:latest"}
+    condition:
+      all:
+        - {field: hf_path, matches: "(?i)gemma-4"}
+        - {field: image, equals: "eugr/spark-vllm-b12x:latest"}
+        - {field: vllm_args, flag_present: "--speculative-config"}
+    failure: "TypeError: Gemma4Proposer._greedy_sample() takes 2 positional arguments but 3 were given -- on the first real generation request, NOT during warmup, so /health passing gives false confidence."
+    remedy: "Use eugr/spark-vllm:latest (mainline). Confirmed working across 8 live runs, ~50-53 tok/s single-stream."
+    evidence:
+      tombstones: [89]
+      notes: "Specific to the MTP proposer path. -b12x's MoE-kernel speedup remains worth keeping for workloads that do not need MTP."
+
+  - id: E011
+    summary: "vllm_args must be written as a YAML block scalar (>-), never a quoted flow scalar."
+    confidence: known_bad
+    enforce: error
+    scope: {applies_to: recipe_syntax}
+    condition:
+      any:
+        - {field: vllm_args, raw_style: double_quoted}
+        - {field: vllm_args, contains_comment: true}
+    failure: >-
+      A double-quoted scalar terminates at the first embedded " inside a JSON
+      --speculative-config, surfacing as 'Model ... not defined in catalog'
+      with nothing pointing at YAML. A folded scalar containing a # comment
+      flattens into the arg string and reaches argparse as a literal token.
+    remedy: "Use >-. Keep all operational notes outside the scalar."
+    evidence: {tombstones: [28, 42, 88], incidents: [4]}
+
+  - id: E012
+    summary: "Do not mount a broad host directory at /root/.cache when a subpath is also separately mounted."
+    confidence: known_bad
+    enforce: none          # not expressible from a recipe; documentation only
+    scope: {applies_to: docker_run_construction}
+    failure: "Docker resolves the overlap by path specificity, so it 'works' until heavy concurrent mmap (exactly what loading safetensors does) hits through the parent mount. Real, reproducible corruption risk."
+    remedy: "Mount each JIT cache root explicitly and separately (triton, tilelang, deepgemm, vllm, flashinfer), with the HuggingFace mount entirely outside that tree. This is what _jit_cache_mounts_and_env() does."
+    evidence: {notes: "Replicate this shape when hand-rolling a docker run outside the orchestrator."}
+
+  - id: E013
+    summary: "A chat-template mod requires a matching --chat-template flag in vllm_args."
+    confidence: unconfirmed
+    enforce: warn
+    scope: {applies_to: mods}
+    condition:
+      all:
+        - {field: mods, any_matches: "chat-template"}
+        - {field: vllm_args, flag_absent: "--chat-template"}
+    remedy: "The mod and the flag are correct only together; nothing else enforces the pairing."
+    evidence: {notes: "Derived from eugr's mod library, not from a local incident. Warn only."}
+
+  - id: E014
+    summary: "Recipe env_vars should not carry VLLM_* variables this build ignores."
+    confidence: validated   # validated against builds.original_pin ONLY -- see caveat below
+    enforce: warn
+    scope: {build: "v0.1.dev20003+gad848fc41.d20260815"}
+    needs_reverification: >-
+      :latest has since moved to builds.latest_confirmed
+      (v0.1.dev20482+g83cb22a0e.d20260903, confirmed 2026-09-03). This rule's
+      scope is deliberately left pinned to the OLD build rather than
+      silently widened -- these five env vars have not been re-checked
+      against the new one, and this is exactly the kind of build-specific
+      claim that VLLM_USE_V1 (E015) turned out to be wrong about. As
+      written, this rule now goes DORMANT for any recipe reporting the new
+      build string, which is the correct conservative behavior but means it
+      currently protects nothing live. Re-run the same boot-log check
+      ('Unknown vLLM environment variable detected') against
+      builds.latest_confirmed before widening scope or adding a second,
+      new-build-scoped copy of this rule.
+    condition:
+      all:
+        - {field: env_vars, key_in: [VLLM_CPU_OMP_THREADS, VLLM_ENGINE_INITIALIZATION_TIMEOUT, VLLM_RPC_TIMEOUT, VLLM_NVFP4_GEMM_BACKEND, VLLM_USE_FLASHINFER_MOE_FP4]}
+    remedy: >-
+      Confirmed inert on this build via 'WARNING [envs.py:2477] Unknown vLLM
+      environment variable detected'. Remove opportunistically when the recipe
+      is being re-validated anyway -- NOT as a catalog-wide sweep, since every
+      env_vars change alters compute_config_hash() and resets that recipe's
+      launch-success history.
+    not_actionable:
+      - key: VLLM_BASE_DIR
+        reason: "Image-level ENV on eugr bases (docker inspect .Config.Env). Present in every container from that base; no recipe change can remove it. A checker that flags it fires forever and trains people to ignore the warning."
+      - key: OMP_NUM_THREADS
+        reason: "A real OpenMP variable, not a vLLM one. Stays."
+    evidence: {notes: "Confirmed 2026-08-29/30 on gemma-4-31b, then again on minimax-m2_7-nvfp4-gb10 and nemotron-3-nano-30b-a3b-nvfp4 -- pattern holds across four recipes. Community-sourced recipes are a recurring source."}
+
+  - id: E015
+    summary: "VLLM_USE_V1=0 no longer exists in vLLM on the current build -- historically required, now dead weight. RESOLVED 2026-09-03."
+    confidence: known_bad   # known-bad TO INCLUDE, on builds.latest_confirmed specifically -- see scope
+    enforce: warn
+    scope: {build: "v0.1.dev20482+g83cb22a0e.d20260903"}   # = builds.latest_confirmed, deliberately pinned not aliased -- see builds: block header
+    condition:
+      all:
+        - {field: env_vars, key_in: [VLLM_USE_V1]}
+    status: resolved_on_latest_confirmed_build   # was: contested. See `positions` for the full history -- kept, not deleted.
+    positions:
+      - claim: "Required alongside --distributed-executor-backend ray for 2-node cross-host topologies."
+        source: "TROUBLESHOOTING.md Incident #1 / TOMBSTONES #43 (V4.8.1). Written from a real observed failure, on builds.original_pin."
+      - claim: "Has no observable effect."
+        source: "gemma-4-31b 2-node, 2026-08-29, on builds.original_pin. Set, and the engine still logged 'Initializing a V1 LLM engine'."
+      - claim: "Not needed at all."
+        source: "deepseek-v4-flash-0731-dspark::2_node, 2026-09-02, on builds.original_pin. Never set; ran with distributed_executor_backend: 'ray' and completed ready with real phase data."
+      - claim: "REMOVED FROM vLLM ENTIRELY -- decisive."
+        source: >-
+          Direct inspection of eugr/spark-vllm-b12x:latest,
+          builds.latest_confirmed (v0.1.dev20482+g83cb22a0e.d20260903),
+          2026-09-03. `vllm.envs` raises AttributeError: module 'vllm.envs'
+          has no attribute 'VLLM_USE_V1'. The whole `vllm.executor` package
+          (the V0 executor, including ray_distributed_executor) is absent --
+          ModuleNotFoundError. There is no V0 Ray executor left for the
+          variable to select. `vllm.engine.llm_engine` still resolves, but
+          as a compatibility shim over V1, not a V0 path.
+    resolution: >-
+      INERT on builds.latest_confirmed, and worse than inert: since vLLM no
+      longer defines the name, any recipe still carrying VLLM_USE_V1=0 now
+      trips the "Unknown vLLM environment variable detected" warning (same
+      mechanism as E014's category, though not literally E014's list -- E014
+      is still scoped to the OLD build, see its own needs_reverification
+      note) and contributes dead config to compute_config_hash(). Incident
+      #1's rule is hereby SCOPED to builds.original_pin, not deleted -- it
+      came from a real observed failure there, and the Ray-flag half of it
+      (E003) remains fully load-bearing and build-independent. Only the
+      VLLM_USE_V1 half is dead, and only confirmed dead on
+      builds.latest_confirmed specifically -- this rule's `scope.build`
+      reflects exactly that boundary rather than a general "always" claim.
+      TOMBSTONES.md #113 records this as a finding, independent of this
+      file.
+    remedy: >-
+      Strip VLLM_USE_V1=0 opportunistically as each recipe is re-validated,
+      never as a catalog-wide sweep: every env_vars change alters
+      compute_config_hash() and resets that recipe's launch-success history.
+    evidence: {tombstones: [43, 103, 113], incidents: [1]}
+
+  - id: E016
+    summary: "--attention-backend B12X_ATTN is known-bad with DeepSeek-V4 sparse MLA plus speculative draft tokens."
+    confidence: known_bad
+    enforce: warn
+    scope: {model_family: deepseek-v4, hardware: sm120}
+    condition:
+      all:
+        - {field: vllm_args, flag: "--attention-backend", value: "B12X_ATTN"}
+        - {field: vllm_args, flag_present: "--speculative-config"}
+    failure: "FlashInfer's JIT autotuner (sparse_mla_sm120_decode_dsv4) cannot match non-standard draft tensor shapes (7, 32, 512) to pre-compiled tuning buckets during _dummy_run -- startup timeout or fallback to unoptimized runners."
+    remedy: "--attention-backend FLASH_ATTN for speculative builds."
+    evidence: {tombstones: [62]}
+
+  - id: E017
+    summary: "--moe-backend flashinfer_b12x is UNCONFIRMED, not known-good."
+    confidence: unconfirmed
+    enforce: none
+    scope: {hardware: gb10}
+    remedy: >-
+      Only ever present in a recipe that also carried E001's known-bad
+      kv-cache-dtype, and that deploy crashed during config validation before
+      MoE execution was reached. Nothing confirms it works or that it is
+      broken. --moe-backend flashinfer_cutlass is the validated choice
+      (required for GB10's SwiGLU clamping, see incident #2).
+    evidence: {incidents: [2]}
+
+  - id: E018
+    summary: "Two catalog keys sharing an identical hf_path must be flagged, not silently resolved."
+    confidence: known_bad
+    enforce: warn
+    scope: {applies_to: catalog}     # cross-recipe, not per-recipe
+    condition:
+      all:
+        - {check: duplicate_field_across_recipes, field: hf_path}
+    failure: >-
+      _resolve_catalog_key() matches on
+      `hf_path.endswith(loaded_model) or cat_key == loaded_model or
+      loaded_model in hf_path` and returns the FIRST match. When two catalog
+      entries serve the same checkpoint, dict iteration order silently
+      decides which key the telemetry and dashboard attribute to -- splitting
+      real usage data across two ledger entries with nothing surfaced.
+    confirmed_instance: >-
+      nemotron-3.5-lightning-bf16.yaml and nemotron-3_5-lightning-bf16.yaml,
+      both live, both hf_path nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16.
+      Split lifetime tokens onto the dot key while launch_history/runs went to
+      the underscore key. TOMBSTONES #110. RESOLVED 2026-09-03: dot-form
+      recipe deleted by operator; only one hf_path owner remains. Orphaned
+      ledger keys from the deleted file are a separate, still-open cleanup --
+      see WORKSTREAMS.md WS-4 -- not a live instance of this rule anymore.
+    remedy: >-
+      Warn, never auto-resolve. Legitimate same-hf_path pairs exist by design
+      (TP vs PP siblings, context-size variants, speculative-depth sweeps), so
+      this cannot be an error -- but an UNINTENTIONAL pair is invisible today.
+      Separately, make _resolve_catalog_key() detect multiple matches rather
+      than returning the first.
+    known_intentional:
+      - "qwen-2_5-coder-32b / -tp (PP vs TP comparison pair)"
+      - "qwen-3.5-122b-tp / -mtp2 / -mtp4 (speculative depth sweep)"
+      - "deepseek-v4-flash-0731-dspark / -512k / -1M (context-size variants)"
+    evidence: {tombstones: [57, 77, 110, 111]}   # 111 = the resolution entry
+
+
+# 1. NEVER hard-fail the catalog. build_catalog_response() fails closed on any
+#    single bad recipe, so one linter exception would empty the entire model
+#    list with nothing surfaced to the dashboard user (TOMBSTONES #41).
+#    Report; do not raise out of load_recipes().
+# 2. `enforce: none` rules are documentation. The linter reads them so a human
+#    can query them; it must not emit a finding for them.
+# 3. A rule scoped to a build or image must not fire outside that scope. The
+#    VLLM_BASE_DIR case is the cautionary example: a warning that always fires
+#    is a warning nobody reads, and it hides the ones that matter.
+# 4. New rules come from real incidents only. Every rule needs an `evidence`
+#    block; a rule nobody can trace back to a failure is a guess with a
+#    version number.
+# 5. A `scope: {build: ...}` pin is a snapshot, not a guarantee -- :latest
+#    floats, confirmed real 2026-09-03 when the build moved three weeks
+#    between two sessions and made E015's contested history resolvable
+#    outright. A build-scoped rule does not fire incorrectly when the tag
+#    moves past it; it goes silently DORMANT, which is worse. Do not widen
+#    a rule's scope to "assume it still holds" without re-checking -- see
+#    E014's needs_reverification field for the pattern to follow: leave the
+#    old scope in place, name the gap explicitly, don't guess.
