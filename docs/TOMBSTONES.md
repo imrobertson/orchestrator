@@ -1,11 +1,11 @@
 # Control Plane Release Tombstones & Fix Log
 
 <!--
-Reconciliation note (2026-09-03): #111-#114 added this session, appended
+Reconciliation note (2026-09-03/09-04): #111-#120 added across this session, appended
 above #110 per usual (newest/highest on top). #111 resolves #110's open
 question -- #110 itself is left as originally written, uncorrected, since
 it's the accurate record of what was known and suspected at the time; the
-resolution is #111, not a rewrite of #110. Full numbering 27-114 confirmed
+resolution is #111, not a rewrite of #110. Full numbering 27-120 confirmed
 contiguous by the same exhaustive "### N." scan method the 2026-08-31 note
 below established (not just line-start matches).
 -->
@@ -45,6 +45,481 @@ fixed today, recorded here rather than silently:
     occurrence in the raw file (not just line-start matches, since
     that's exactly what let #76 hide undetected as long as it did).
 -->
+
+### 120. Why the rank-divergent tuning cost from #119 can't self-heal: `save_configs()` is gated to the leader rank only, and the cache path isn't host-persisted anyway. A general pattern for any future TP+EP MoE model on this cluster, not specific to `llama-4-fp8` (V?.?.?)
+
+* **The Trap:** #119 confirmed TP1's FlashInfer autotune cache key is
+  genuinely rank-divergent under expert parallelism (`local_expert_offset`
+  baked into `MoERunner._cache_key_extras()`), meaning TP1 must live-tune
+  every deploy while TP0 hits the baked cache instantly. The natural
+  follow-up: TP1 does the work once, live, every time -- why doesn't that
+  work get cached for the *next* deploy, the way TP0's apparently is?
+
+* **The Fix:** Two independent reasons, read directly from
+  `vllm/model_executor/warmup/kernel_warmup.py`'s `flashinfer_autotune()`
+  (already fetched for #118) and `flashinfer/fused_moe/runners.py`'s
+  `save_configs()` docstring (fetched for #119).
+
+  **1. The save call is gated to the leader rank only:**
+
+  ```python
+  if is_leader:
+      tuner.save_configs(str(cache_path))
+  ```
+
+  `AutoTuner` is a process-local singleton (`_instance`/`_class_lock`) --
+  each `RayWorkerProc` is a genuinely separate OS process, so TP1's
+  `self.profiling_cache`, holding everything it just spent ~48 minutes
+  computing, is entirely local to TP1's own process and is simply never
+  written anywhere, because only `is_leader` (rank 0 / TP0, which found
+  everything cached and computed nothing new) ever calls `save_configs()`.
+
+  This restriction is not required by the file format. `save_configs()`'s
+  own docstring states it re-reads the file from disk at save time
+  specifically "to reduce lost updates when multiple processes save to
+  the same path," with per-key merge (new entries win on key collision,
+  untouched keys pass through). Since `_cache_key_extras()` includes
+  `local_expert_offset`, TP0's and TP1's entries would land under
+  *different keys in the same file* -- no collision, nothing to lose. The
+  library is built to tolerate every rank saving; the `is_leader` gate in
+  the calling code is an added restriction the library doesn't need.
+
+  **2. Even if it saved, there's nowhere durable for it to land.** #116
+  already established that `/root/.cache/vllm/flashinfer_autotune_cache/`
+  -- the exact directory this file lives in -- is not bind-mounted
+  anywhere. The real mount (`~/.cache/flashinfer` ->
+  `/root/.cache/flashinfer`) is a different tree entirely. TP0's own
+  "Loaded 106 configs" on every fresh container is therefore almost
+  certainly a static artifact **baked into the image at build time**, not
+  a live cache the runtime is persisting and reusing across restarts. A
+  patched save-every-rank fix would write to ephemeral container storage,
+  destroyed at teardown, with nothing feeding back into the next deploy.
+
+  **What a real fix needs, both pieces together:** (a) drop the
+  `is_leader` gate on `save_configs()` in `kernel_warmup.py`, and (b) give
+  `/root/.cache/vllm/flashinfer_autotune_cache/` an actual host-mounted
+  destination, the way `~/.cache/flashinfer` already has. Neither alone
+  is sufficient. Whether (a) is a fix this team can make depends on build
+  access to the image -- `errata.yaml`'s `eugr_b12x` lineage records it as
+  a `lukealonso/b12x` fork with custom kernels; if that fork is buildable
+  in-house, this is a real local patch, not an upstream-only wait. Not
+  confirmed either way; worth checking before assuming.
+
+  **Why this generalizes, and the reason this entry exists separately
+  from #119:** any future TP+EP MoE model on this cluster that routes
+  through FlashInfer's autotuner will hit the identical asymmetry --
+  the signature to watch for is one rank's boot log showing instant
+  "Loaded N configs" while another shows live `[AutoTuner]: Tuning ...`
+  progress bars, on any model where EP rank differs across TP ranks. This
+  is not `llama-4-fp8`-specific; #119 explained why the divergence
+  happens on this model, this entry explains why it can't self-correct
+  on any model, until both pieces above are addressed or the image is
+  deliberately rebuilt with every EP offset's configs pre-baked.
+
+### 119. `llama-4-fp8-tp` root cause CONFIRMED, not just hypothesized: the FlashInfer MoE cache key is provably rank-divergent under expert parallelism, and this deploy runs EP -- read directly from `MoERunner._cache_key_extras()` and corroborated by the deploy's own boot log (V?.?.?)
+
+* **The Trap:** #118 identified a strong, code-grounded candidate mechanism
+  -- a second, per-tactic `all_reduce()` inside `_profile_single_kernel`,
+  which would deadlock/stall if the two TP ranks' cache lookups for
+  "the same" nominal op and profile step diverged -- but stopped short of
+  confirming it, since `choose_one`'s cache-key construction
+  (`get_cache_key_extras()`) hadn't been read. Two possibilities were left
+  open: the cache key is genuinely rank-dependent (confirming the
+  mechanism), or it is derived purely from input tensor shape/dtype
+  (in which case the real divergence would have to come from somewhere
+  else, e.g. genuinely different shapes reaching `choose_one` per rank).
+
+* **The Fix:** Read `flashinfer/fused_moe/runners.py` directly (pulled
+  from the resident `vllm-head` container, confirmed still running the
+  exact build under investigation via `python3 -c "import vllm;
+  print(vllm.__version__)"` before pulling -- `0.1.dev20482+g83cb22a0e...`,
+  matching every prior entry in this arc). `MoERunner._cache_key_extras()`
+  (`runners.py:154-184`) settles the question outright:
+
+  ```python
+  return (
+      self.backend_key,
+      self.config.quant.variant.name,
+      int(routing.top_k),
+      int(routing.num_experts),
+      int(local_num_experts),
+      int(experts.local_expert_offset),   # <-- rank-specific under EP
+      ...
+  )
+  ```
+
+  `local_expert_offset` is baked directly into the cache key, by design --
+  the accompanying comment states plainly that "routing shape affects
+  expert-token distribution and tactic ranking." This is not a bug in the
+  key construction; it is *correct*, because the actual GEMM computation
+  genuinely differs per expert shard. But it means the cache key for "the
+  same" nominal (op, profile-step) is provably different across EP ranks.
+
+  Whether this cluster actually runs expert parallelism was not assumed --
+  it's stated verbatim in the deploy's own boot log, already captured
+  during #117's investigation and only now connected to this question:
+
+  ```
+  rank 0 ... TP rank 0, EP rank 0    (spark-4 / TP0)
+  rank 1 ... TP rank 1, EP rank 1    (spark-3 / TP1)
+  ```
+
+  TP0 and TP1 are EP0 and EP1. `local_expert_offset` genuinely differs
+  between them. Whatever offset the image's baked-in cache was tuned
+  against (almost certainly `offset=0`, i.e. an EP-rank-0 or no-EP
+  build-time context) covers TP0/EP0 completely and covers none of
+  TP1/EP1's actual keys -- structurally guaranteeing TP0 hits cache while
+  TP1 must live-tune, on every single deploy, regardless of how many times
+  it's run. `get_valid_tactics()` (`_CutlassRunnerBase`, `runners.py:886+`)
+  corroborates the shape of this: it calls `tuner.rank_tactics()`
+  separately for `gemm1` then `gemm2`, keyed by
+  `f"moe_{self.backend_key}_sm{self._device_arch}_gemm{N}"` against the
+  same `self._inner` runner carrying the rank-divergent key -- matching
+  the observed log pattern (`gemm1` then `gemm2`, cycling) exactly.
+
+  **This confirms #118's mechanism, not just corroborates it.** The
+  per-tactic `all_reduce()` inside `_profile_single_kernel` (#118) is real;
+  the cache-key divergence that would cause one rank to call it while the
+  other doesn't (rather than both calling it symmetrically, or neither) is
+  now confirmed from source, not inferred. The chain is: EP shard assignment
+  -> rank-divergent `local_expert_offset` -> rank-divergent cache key ->
+  rank-divergent cache hit/miss for nominally-the-same profile step ->
+  one rank calls the inner collective, the other has already returned.
+
+  **Still explicitly open, and this entry does not close it:** why TP1
+  completed dozens of full profile cycles before the eventual crash rather
+  than stalling on first divergence. `rank_tactics()`'s own implementation
+  was not read, so it's not confirmed whether it shares `choose_one`'s
+  exact collective-cardinality contract or has its own -- a difference
+  there could explain partial progress before failure. Not pursued further;
+  the primary question (is the cache key genuinely rank-divergent under
+  this cluster's real EP configuration) is answered, and that's the
+  question that determines whether `llama-4-fp8-tp` is fixable from this
+  side at all -- it is not, without either a per-EP-rank baked cache
+  (upstream, not this codebase) or disabling EP for this model (a real,
+  checkable option not yet investigated: whether `--enable-expert-parallel
+  false` or an equivalent flag exists and what it costs in throughput).
+
+  **Unaffected by this confirmation, same as every prior entry in this
+  arc:** not a bug in this codebase -- confirmed by grep, four times now,
+  and this entry adds nothing to search since `flashinfer/fused_moe/` is
+  no more this repo's code than `autotuner.py` was. `llama-4-fp8` stays on
+  PP=2. The `/dev/shm` leak from #116 remains real and remains unconnected.
+
+### 118. `llama-4-fp8-tp` root cause NARROWED again: #117's "not a collective-asymmetry issue" was too broad. The asymmetry very plausibly exists one level deeper than the outer barrier, exactly where the original stack trace pointed. Confirmed against FlashInfer's actual `autotuner.py` source, not inferred (V?.?.?)
+
+* **The Trap:** #117 corrected #116's diagnosis on the strength of a full
+  manual deploy's logs, which showed both TP ranks calling
+  `world.barrier()` (`vllm/model_executor/warmup/kernel_warmup.py:324`)
+  symmetrically. From that, #117 concluded the hang was not an
+  asymmetric-collective issue at all, and reframed it as TP1's autotune
+  sweep simply taking a very long time before an idle-connection TCP
+  timeout. That framing left the actual multi-cycle timeline
+  ("why did the crash take ~48 minutes, across many completed profile
+  passes, rather than failing immediately") as an open, unresolved
+  question.
+* **The Fix:** Pulled the real FlashInfer source directly -- the running
+  build's version string is a resolvable `setuptools_scm` git hash
+  (`v0.1.dev20482+g83cb22a0e...`), and the flashinfer cache path named
+  its version (`0.6.18`) explicitly, so the exact matching source was
+  fetched from GitHub at that commit/tag rather than assumed from a
+  possibly-mismatched branch.
+
+  `kernel_warmup.py`'s `flashinfer_autotune()` confirms the outer barrier
+  is genuinely symmetric, as #117 found. But `autotuner.py`'s
+  `choose_one()` (`:1574`) and `_profile_single_kernel()` (`:2046`) reveal
+  a **second, separate collective**, one level deeper: every tactic
+  profiled inside the per-shape tuning loop ends with its own
+  `dist.all_reduce()` (`:2198`), so that per-tactic timing noise doesn't
+  cause different ranks to pick different tactics. The code's own comment
+  directly above that call states the exact risk class:
+
+  > "Collective cardinality invariant: every rank MUST reach the
+  > all-reduce below exactly once per `_profile_single_kernel` call. If
+  > one rank raises inside the measurement window and exits without
+  > reducing while peers are still waiting, the next tactic's reduce
+  > deadlocks."
+
+  -- and the surrounding code goes to real lengths to protect against
+  exactly that (catching `BaseException`, forcing `avg_time = inf`,
+  running the reduce unconditionally, only then re-raising). That
+  machinery covers one rank's *measurement* failing mid-loop. It says
+  nothing about two ranks reaching genuinely different *sets* of
+  (op, shape) pairs to profile in the first place -- which is exactly
+  what TP-sharded MoE plausibly produces, since each rank routes tokens
+  to different local experts. `choose_one`'s cache lookup
+  (`_get_cache_key`, incorporating `runner.get_cache_key_extras(inputs)`)
+  could very plausibly diverge by rank even for the same nominal
+  op/profile index, in which case TP0 would return on a cache hit and
+  simply never call this specific `all_reduce`, while TP1 -- missing
+  cache for the same nominal step -- calls it alone.
+
+  This is a genuine, code-grounded reopening of #116's original
+  mechanism at the correct granularity: the hang was always inside
+  `_profile_single_kernel`'s collective, exactly where the first `py-spy`
+  trace pointed. #117 was right that the *outer* barrier is symmetric; it
+  was too broad in concluding the whole class of asymmetric-collective
+  explanations was dead.
+
+  **Explicitly not confirmed, and not asserted as closed:** why TP1
+  completed dozens of full profile cycles before the eventual crash, if
+  an unmatched `all_reduce` should stall on first divergence -- possibly
+  a per-call collective timeout shorter than the total ~48 minutes,
+  letting individual stalls fall through; possibly the ranks' shape
+  spaces only diverging partway through the sweep, not from the first
+  profile. Neither is established. Also not confirmed: whether
+  `get_cache_key_extras()` for the fused-MoE runner actually encodes
+  anything rank-specific -- that single read would settle whether this
+  mechanism is the real cause or just a strong candidate. Not read as
+  part of this pass.
+
+  **What stays true across all three entries (#116, #117, #118), unaffected
+  by any of these corrections:** not a bug in this codebase -- confirmed by
+  direct grep against `dgx-orchestrator.py`/`common/*.py`, both before and
+  after this deeper read; `llama-4-fp8` stays on PP=2; the `/dev/shm` leak
+  documented in #116 remains real and remains unconnected to this specific
+  failure.
+
+### 117. `llama-4-fp8-tp` root cause CORRECTED: not an asymmetric collective call, a TP1-side autotune loop running dozens of times until the barrier's TCP transport times out. Confirmed via a full manual deploy's complete logs (V?.?.?)
+
+* **The Trap:** #116 diagnosed the hang from a live `py-spy dump` captured
+  mid-stall during `ab_test.py` repeat 2, showing TP1's MainThread blocked
+  in `torch.distributed.all_reduce` inside FlashInfer's
+  `_profile_single_kernel` (`autotuner.py:2198`). From that single snapshot,
+  #116 concluded FlashInfer's autotuner calls a collective only on the
+  cache-miss branch, with TP0 skipping it entirely on a cache hit --
+  "one rank participates, the other doesn't."
+* **The Fix:** A subsequent manual deploy
+  (`dgx-config deploy --model llama-4-fp8-tp --nodes 2`, left running to
+  completion rather than killed by `ab_test.py`'s 900s ceiling) produced
+  the complete `docker logs -f` output from both `vllm-head` (spark-4) and
+  `vllm-worker` (spark-3), and it tells a different, more precise story.
+
+  **TP0 genuinely does call the barrier.** `world.barrier()` at
+  `vllm/model_executor/warmup/kernel_warmup.py:324` -- vLLM's own code,
+  not FlashInfer's -- is called by both ranks symmetrically, by design.
+  TP0's log shows it finishing warmup normally and entering that barrier.
+  #116's "one rank never calls the collective" framing is **superseded by
+  this evidence**, not merely extended -- recorded as a correction, per
+  this file's own convention (see #77's recovery, the 2026-08-31
+  reconciliation note, and #115's own correction of #113), rather than a
+  silent edit of #116.
+
+  **What actually happened: TP1's own tuning pass looped dozens of times.**
+  TP1's log shows the full 21-profile sweep for both `fused_moe::gemm1`
+  and `fused_moe::gemm2` repeating over and over -- from first entering the
+  tuner at 14:13 to `autotuner.py:995 [Autotuner]: Autotuning process ends`
+  at 15:01, roughly 48 minutes and dozens of complete repeated sweeps, each
+  one re-logging `"Skipped 21 unsupported tactic(s)"` for every kernel,
+  every pass. A single tune should run once. This repetition -- not an
+  asymmetric collective call -- is the real defect, and its cause is not
+  yet understood: possibly the warmup loop invoking the tuner once per
+  warmup iteration or once per decode step on TP1's side without an
+  equivalent multiplier on TP0's, possibly a negative-result cache that
+  isn't actually caching anything. Not established without reading
+  `kernel_warmup.py`'s and `autotuner.py`'s actual retry/caching logic,
+  which was not available.
+
+  **The crash, when it finally came, was a transport failure, not a
+  logical deadlock:**
+  `[gloo/transport/tcp/pair.cc:553] Connection closed by peer
+  [192.168.99.1]:54173` -- the Gloo TCP connection backing the CPU-side
+  barrier group was reset, most plausibly by an OS-level idle-connection
+  timeout somewhere in the path, given the connection sat essentially idle
+  (from TP0's side) for the better part of an hour while TP1 kept looping.
+  `EngineCore` and both `Worker_TP0`/`Worker_TP1` processes crashed cleanly
+  with full tracebacks once the connection dropped -- `EngineCoreProc`
+  raised `RuntimeError: Engine core initialization failed`, `APIServer`
+  caught it and shut down via its own `RuntimeError` path. This is a
+  well-behaved crash, not a silent hang -- the earlier `ab_test.py` repeats
+  never reached this point because the 900s poll killed the deploy first,
+  well before TP1's sweep could ever finish or the transport could time out.
+
+  **Still confirmed, unaffected by this correction:** not a bug in this
+  codebase -- `grep` for `shm_broadcast`/`flashinfer` across
+  `dgx-orchestrator.py`/`common/*.py` remains empty, and this trace
+  confirms the mechanism is entirely inside vLLM's `kernel_warmup.py` and
+  FlashInfer's own retry logic. The orphaned `/dev/shm` files documented in
+  #116 remain real and remain unconnected to this specific bug -- neither
+  finding changes with this correction. `llama-4-fp8` stays on PP=2; this
+  is now understood as a severe, reproducible defect (a 45+ minute hang
+  ending in a hard crash) rather than a rare race, which if anything argues
+  more strongly against pursuing it further on this side. The cache-priming
+  workaround #116 proposed (pre-warm TP1's cache with a longer timeout) is
+  downgraded from "worth trying" to "unlikely to help" -- even a warm cache
+  on TP0 does nothing about whatever makes TP1's own sweep loop, which is
+  now understood to be the actual defect.
+
+### 116. `llama-4-fp8-tp` TP=2 deploy deadlocks intermittently -- confirmed via live stack trace as a FlashInfer autotuner cross-rank `all_reduce` bug, not orchestrator code. PP remains the only reliable topology for this model (V?.?.?)
+
+* **The Trap:** WS-1's Qwen A/B (#116's sibling, the coder pair) found TP
+  beating PP by ~1.9x with zero reliability issues, and flagged that
+  `llama-4-fp8`'s existing confirmed-`ready` PP=2 deploy needed its own
+  A/B rather than assuming the result transfers -- different model,
+  different quantization (FP8 via ModelOpt, not whatever the coder model
+  used). A new `llama-4-fp8-tp.yaml` was authored, verified programmatically
+  (`yaml.safe_load` diff) to be byte-identical to the PP recipe except
+  `tp_size`/`pp_size`, and run through the same 3-repeat `ab_test.py`
+  harness. PP: 3/3 clean, 11.8-12.0 tok/s, matching WS-2's existing record
+  exactly. TP: repeat 1 succeeded (16.9/16.7/16.8/16.5 tok/s), repeats 2
+  and 3 both hung at the independent `/health` poll and were killed by the
+  harness's 900s ceiling. `42/44 checks passed` -- the harness correctly
+  stopped short on each TP failure rather than silently continuing.
+
+* **The Fix:** Diagnosed by direct evidence at every step, not narrative --
+  worth recording the discarded hypotheses along with the confirmed one,
+  since each was chased with a real check before being ruled out rather
+  than assumed.
+
+  **Hypothesis 1, ruled out: orphaned `/dev/shm` files exhausting some
+  resource.** `ipcs -m` empty on both hosts (SysV sweep working correctly)
+  versus `/dev/shm` on spark-4 holding 29 `psm_*` files spanning ~36 hours,
+  zero on spark-3 -- a real, confirmed leak, matching WORKSTREAMS.md WS-7's
+  already-documented gap (POSIX `/dev/shm` inventoried at teardown but never
+  swept, unlike the SysV segments) and the suspected-but-unconfirmed
+  2026-08-23 incident referenced there. But `df -h /dev/shm` showed
+  `1.3M` used against `61G` available -- the large nominal file sizes are
+  sparse-file artifacts on tmpfs, not real consumption. Capacity-innocent,
+  and no plausible mechanism connects 29 stale files in an apparently
+  random 8-hex-char namespace to a repeatable stall. **The leak is real and
+  still open as its own WS-7 item; it is not this bug.**
+
+  **Hypothesis 2, a real error in the investigation, corrected in the
+  same session:** twice checked `/root/.cache/vllm/flashinfer_autotune_cache/`
+  on the bare host filesystem -- the exact path from the container's own
+  boot log -- and found nothing, which briefly looked like evidence the
+  autotune cache never persists across container restarts. Both checks were
+  against the wrong location: `grep -n "_jit_cache_mounts_and_env"
+  dgx-orchestrator.py` showed the actual host-side mount is `~/.cache/flashinfer`
+  bound to container path `/root/.cache/flashinfer` -- a completely
+  different directory tree than `/root/.cache/vllm/flashinfer_autotune_cache`,
+  which is not mounted anywhere and is genuinely ephemeral by design, not
+  by omission. TP0 loading "106 configs" identically in every fresh
+  container is therefore almost certainly baked into the image at build
+  time, not host-persisted -- consistent with the eventual root cause,
+  where TP0's shapes happen to already be in that baked set and TP1's
+  don't.
+
+  **Confirmed root cause:** `docker exec vllm-worker py-spy dump --pid
+  <TP1 worker PID>` while the second hang was live, before killing anything,
+  captured the stuck MainThread's exact call stack. It is blocked in
+  `torch.distributed.all_reduce` (`distributed_c10d.py:3252`), called from
+  FlashInfer's own autotuner at `_profile_single_kernel`
+  (`flashinfer/autotuner/autotuner.py:2198`), reached via
+  `choose_one` -> `cutlass_fused_moe` -> vLLM's
+  `flashinfer_cutlass_moe.py:390` -> the model's forward pass -> vLLM's own
+  `flashinfer_autotune()` warmup step. `nvidia-smi
+  --query-gpu=utilization.gpu,utilization.memory,memory.used` on spark-3
+  during the hang showed `0%, 0%, N/A` -- genuinely idle, not slow, ruling
+  out "first-time-shape tuning is just expensive" as an alternative
+  explanation before the stack trace made it moot anyway.
+
+  The mechanism: FlashInfer's autotuner calls a collective `all_reduce`
+  only on the live-tune (cache-miss) branch of `_profile_single_kernel`,
+  with no matching call on the cache-hit branch. TP0 (spark-4, always the
+  head/local rank in this cluster's convention) hit its pre-baked cache for
+  every kernel including `fused_moe::gemm1`/`gemm2` and returned in ~70ms,
+  never entering the branch that calls `all_reduce`. TP1 (spark-3) missed
+  cache on the same kernels -- plausibly because TP-sharded MoE weight
+  shapes are rank-specific under tensor parallelism, and the image's
+  build-time tuning likely only ever profiled unsharded/reference shapes --
+  took the live-tune branch, and called `all_reduce`, which TP0 was never
+  going to answer. A classic collective deadlock: one rank participates,
+  the other silently doesn't. `EngineCore`'s own repeating
+  `shm_broadcast.py:801 No available shared memory broadcast block found`
+  message is a downstream symptom of TP1's worker thread never returning
+  to service its IPC channel, not an independent cause -- correctly
+  reclassified from "candidate root cause" to "symptom" once the deadlock
+  was confirmed.
+
+  **Confirmed not a bug in this codebase.**
+  `grep -rn "shm_broadcast\|VLLM_WORKER_MULTIPROC\|broadcast_group"
+  dgx-orchestrator.py common/*.py` returned zero hits -- neither the
+  autotuner nor its IPC mechanism is touched by any orchestrator code or
+  env var. This is entirely internal to FlashInfer (and possibly vLLM's own
+  `flashinfer_autotune()` call site, which does not appear to guard against
+  rank divergence either).
+
+  **Why repeat 1 succeeded:** unresolved. Plausibly a lucky warm state on
+  both ranks from an even earlier, untracked deploy, or non-deterministic
+  timing in which rank happens to reach the collective first. Not
+  investigated further -- the mechanism is understood well enough that the
+  specific timing of any one success is not decision-relevant.
+
+  **Consequence for WS-1:** `llama-4-fp8-tp`'s repeat-1 numbers
+  (16.9/16.7/16.8/16.5 tok/s) are held separately and are explicitly **not**
+  a valid PP-vs-TP comparison point -- they may reflect a fortunate
+  cache state rather than TP's real steady-state behavior, and a topology
+  that hangs 2 times in 3 is not production-viable regardless of its
+  throughput when it happens to work. **`llama-4-fp8` stays on PP=2.** No
+  fix exists in this codebase; options are (1) file upstream against
+  FlashInfer with this exact stack trace, (2) attempt a cache-priming
+  workaround -- a deliberate, long-timeout deploy to let TP1's live tune
+  either complete once and bake into a persistent location, or definitively
+  confirm it cannot complete even with both ranks present and idle, (3)
+  avoid TP for this model on this image/FlashInfer version entirely until
+  upstream resolves it. None attempted yet.
+
+### 115. `qwen-3.5-122b` MTP token-depth sweep (n=2/3/4) completed -- no single best depth, a real Pareto trade-off across prompt categories. Corrects a hypothesis in #113 (V?.?.?)
+
+* **The Trap:** WORKSTREAMS.md's D-1 chain had queued this sweep to test a
+  third-party claim ("depth 3 is best, 2 second-best, 4 too aggressive")
+  against real hardware, run overnight via two sequential `ab_test.py`
+  invocations (`mtp2` vs `-tp`[n=3], then `mtp2` vs `mtp4`). Separately,
+  #113 had speculated that the coder A/B's `boot_log_hit=False` on all six
+  deploys was "likely" explained by `eugr/spark-vllm-b12x:latest` having
+  drifted builds mid-session -- a guess, explicitly flagged as unquantified
+  at the time.
+* **The Fix:** Both runs completed clean: `mtp2` vs `-tp` at 54/54 checks;
+  `mtp2` vs `mtp4` with `deployed=True, boot_log_hit=True` on both sides.
+  Ray versions confirmed matching (2.58.0) on both hosts before launch --
+  #106's pre-pull fix holding. `n=2` was independently re-measured in both
+  invocations and reproduced within ~0.2 tok/s across all four categories
+  both times, which is itself worth citing as evidence of measurement
+  stability before trusting the comparison at all. Full ordering across all
+  three depths, derived transitively (no third pairwise run needed):
+  **extraction** rises monotonically with depth -- 46.3 -> 51.3 -> 54.4
+  tok/s, +17.5% n=2 to n=4. **Coding** falls monotonically -- 45.4 -> 43.8
+  -> 41.6, -8.5%. **Creative** falls mildly -- 43.3 -> 42.7 -> 41.5, -4%.
+  **Default** is flat, ~40.6 across all three (one low-outlier sample at
+  n=4 widens its range to 38.6-41.3; single sample, not investigated
+  further). This is not "depth 3 wins" -- it is two categories moving in
+  opposite directions, and increasingly so as depth increases, consistent
+  with acceptance-rate theory: templated/predictable continuations
+  (extraction) keep paying off with a longer draft chain, free-form
+  generation (coding, creative) pays a growing verify-and-discard cost for
+  the same chain length. This is the second independent confirmation of
+  the principle the DFlash sweep first established (49-203 tok/s swing
+  across categories on a different model and speculative method entirely)
+  -- worth treating as load-bearing at this point, not a one-off. The
+  source of the "3 is best overall" claim was never traced to a specific
+  document before this run and still hasn't been; since the run contradicts
+  it as a categorical claim, tracing the source matters less now than
+  confirming the actual per-category numbers did.
+
+  Separately: this run **undercuts #113's build-drift guess**. Both
+  deploys here share #113's exact build string
+  (`v0.1.dev20482+g83cb22a0e.d20260903`, visible in this run's own boot
+  logs) and correctly report `boot_log_hit=True` -- if the build moving had
+  been the coder A/B's actual cause, this run, on the identical build,
+  should have shown the same failure and didn't. #113 itself is left
+  unedited, per this file's own convention (see #77's recovery and the
+  2026-08-31 reconciliation note) -- the correction lives here, not as a
+  silent rewrite. The more mundane explanation, visible directly in this
+  run's own "matching lines" output: the boot-log scanner's keyword list
+  includes `marlin`, `mtp`, `cutlass`, and this run's log genuinely
+  contains `mtp` (MTP speculative decoding, present here, absent on the
+  coder recipes) and `cutlass` (`CutlassFp8BlockScaledMMKernel`, a specific
+  kernel selection). The coder recipes use neither -- plain TP, no
+  speculative decoding -- and may simply never have had a matching keyword
+  present in their logs at all, independent of any build version. Not yet
+  fully confirmed (would need the coder run's own boot log re-read against
+  this exact keyword list to close out completely), but a materially
+  better-supported explanation than the build-drift guess it replaces.
+  Worth folding into WORKSTREAMS.md WS-3's unbuilt boot-log/env-var scanner
+  work: the keyword list is architecture/method-specific, not universal,
+  and a recipe legitimately using none of marlin/mtp/cutlass should
+  probably not be scored as a failed check at all.
 
 ### 114. #111's ledger cleanup applied to production and committed -- #110 fully closed end to end (V?.?.?)
 

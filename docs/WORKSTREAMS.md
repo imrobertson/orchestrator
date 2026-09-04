@@ -196,8 +196,12 @@ port 5001 — not FastAPI's default 8000, corrected mid-verification):
 
 ## WS-1 — Qwen topology (TP vs PP) and MTP validation
 
-The largest cluster of open work, and the one where a fix chain has been
-fully paid for but never cashed in.
+Started as the largest cluster of open work in this doc. As of 2026-09-04,
+both of its live threads — the coder TP-vs-PP A/B and the 122B MTP
+depth sweep — are closed with real, decisive results. What remains is a
+single deferred decision (converting other `pp_size: 2` recipes) and one
+never-reproduced inference (`qwen-3.5-122b`'s MTP/PP incompatibility) —
+see D-1.
 
 | Item | Status | Evidence |
 |---|---|---|
@@ -205,14 +209,15 @@ fully paid for but never cashed in.
 | Same verdict applied to `qwen-3.5-122b` | **By mechanism, not reproduced** | #107 reasons from model-agnosticism and declines to burn a deploy cycle. Reasonable; still inference, not a second data point. |
 | `qwen-3.5-122b.yaml` (PP file) retired | **Done** | #107. Contingency (a working TP replacement) satisfied. |
 | `qwen-3.5-122b-tp` throughput | **LIVE** | 3-pass warm avg **40.9 tok/s** decode (38.4 cold, TTFT 49.25s cold / ~0.19s warm), `benchmark_ledger.csv`. Confirmed real by the operator; the handoff ledger snapshot simply lagged. One run, one number. |
-| `qwen-3.5-122b-mtp2` / `-mtp4` | **IN PROGRESS, overnight 2026-09-03/04** | #107's claim verified by direct file comparison: `-mtp2` and `-tp` are byte-identical apart from `num_speculative_tokens` (2 vs 3). Same `hf_path` (`Qwen/Qwen3.5-122B-A10B-FP8`), image, `gpu_util`, `max_model_len`, env_vars, and every other flag. Depth is genuinely the only variable. **But note `-tp` is itself an MTP config at n=3, not a speculation-off baseline** — the sweep ranks depths and cannot establish whether MTP helps this model at all. The 40.9 tok/s figure recorded for `-tp` is an *n=3 MTP* number. Two `ab_test.py` runs queued sequentially, `--repeats 3` each: `mtp2` vs `-tp` (n=2 vs n=3) first, `mtp2` vs `mtp4` (n=2 vs n=4) second — see D-1 for the reasoning and the pre-flight Ray-version check. Results not yet in as of this doc revision. |
+| `qwen-3.5-122b-mtp2` / `-mtp4` | **LIVE, DECISIVE — 2026-09-04. No single winner; real Pareto trade-off.** | Both `ab_test.py` runs completed clean overnight: `mtp2` vs `-tp` (n=2 vs n=3) at 54/54 checks; `mtp2` vs `mtp4` (n=2 vs n=4) also `deployed=True, boot_log_hit=True` both sides. Full n=2/3/4 ordering derived transitively (n=2 independently re-measured in both runs, reproduced within ~0.2 tok/s both times — no third pairwise run needed): **extraction monotonically increases with depth** (46.3→51.3→54.4 tok/s, +17.5% n=2→n=4) while **coding monotonically decreases** (45.4→43.8→41.6, −8.5%) and **creative mildly decreases** (43.3→42.7→41.5, −4%); **default is flat** (~40.6 across all three, one low-outlier sample at n=4 widening its range to 38.6–41.3, not yet individually investigated). This directly contradicts a single "depth 3 is best" framing — it's two categories moving in opposite directions, increasingly so with depth, matching acceptance-rate theory (predictable/templated continuations reward longer draft chains; free-form generation pays an increasing verify-discard cost). Second independent confirmation of the same principle the DFlash sweep established (49–203 tok/s swing across categories) — now on a different model and speculative method entirely. **Practical read: pick depth per workload, there is no universal answer** — if this model serves a known-skewed traffic mix, that should drive the choice, not a borrowed "best overall" number. |
 | `qwen-3.6-27b-nvfp4` TP side | **LIVE-HEALTH** | MTP genuinely engaging on both ranks (`Detected MTP model. Sharing target model embedding weights with the draft model`, `Worker_TP0`/`TP1`), full engine init, `GET /health 200 OK` at 03:40:58. No throughput number. |
 | `qwen-3.6-27b-nvfp4` as a TP-vs-PP pair | **Dead** | PP side cannot boot. TP would win by forfeit. Correctly abandoned. |
 | `qwen-2.5-coder-32b` pair | **LIVE-HEALTH** | No speculative-config either side, so clean of E005. Both sides confirmed loading via dashboard 2026-09-03. Also fixed: `max_model_len: 262144` against a real 32768 context (YaRN would allow 131072 and wasn't configured); both corrected to `32768`. |
 | **The A/B run** | **LIVE, DECISIVE — 2026-09-03** | Completed (`tests/logs/run-20260903-154922.log`). **TP=2 beats PP=2 by ~1.9x on `qwen-2_5-coder-32b`**, uniformly: PP mean 3.5-3.6 tok/s vs TP 6.7 tok/s across all four prompt categories (+86% to +91%). 3/3 repeats deployed successfully per side; ranges are extremely tight (PP 3.5-3.6, TP 6.6-6.8). 12 measurements per side. This is the best-evidenced result in the entire doc set — every other throughput figure here is a single 3-pass run. |
 | `ab_test.py` `--{side}-nodes` bug | **LIVE-VERIFIED** | #105. Six real 2-node deploys reached the catalog passthrough path via `--a-nodes 2 --b-nodes 2` (`nodes=2` confirmed in each variant header). Promoted from LANDED. |
 | `ab_test.py` head-only pre-pull | **LIVE-VERIFIED** | #106. Pre-pull ran on **both** `spark-4` and `spark-3` on all six deploys, all PASS. No Ray version mismatch recurred. Promoted from LANDED. |
-| Convert other `pp_size: 2` recipes to TP | **UNBLOCKED, decision ready** | The measurement exists now. `qwen-2_5-coder-32b` (PP) is proven ~half the throughput of its TP sibling on identical hardware, image, and prompts — convert or retire it. `llama-4-fp8` remains the one in-house counter-example (confirmed-`ready` PP=2), so it wants its own A/B rather than conversion by analogy; it is a different model and a different quantization. |
+| Convert other `pp_size: 2` recipes to TP | **DECISION REVERSED for `llama-4-fp8` — do not convert.** For `qwen-2_5-coder-32b`, TP is proven ~2x faster on identical hardware and image; convert or retire that PP file. For `llama-4-fp8`, the analogous A/B surfaced a real TP-side defect instead of a throughput answer — see the new row directly below and #116. **PP remains the only reliable topology for this model today.** |
+| `llama-4-fp8-tp` — its own A/B, as WS-1 flagged it would need | **BLOCKED — root cause CONFIRMED, see #119; why it can't self-heal explained in #120. Not fixable from this repo; two real options surfaced, neither checked.** 3-run `ab_test.py` (2026-09-04): PP 3/3 clean (11.8–12.0 tok/s). TP 1/3 succeeded (16.9/16.7/16.8/16.5 tok/s — **not a valid PP-vs-TP data point**), 2/3 hung, killed by the 900s poll ceiling; a full manual deploy crashed with a Gloo TCP transport failure after ~48 minutes. Diagnosis arc, five entries: #116 (mid-hang trace → `_profile_single_kernel`'s `all_reduce`) → #117 (outer `world.barrier()` confirmed symmetric, over-broadly ruled out any collective asymmetry) → #118 (a *second*, per-tactic `all_reduce` inside `_profile_single_kernel` reopens the mechanism) → #119 (**confirmed**: `MoERunner._cache_key_extras()` bakes `local_expert_offset` into the cache key; this deploy's own boot log shows TP0/TP1 are EP0/EP1 — genuinely different shards, genuinely different keys) → #120 (why TP1's live-tuned results can't persist for next time: `save_configs()` is gated to the leader rank only, *and* the cache path isn't host-mounted regardless — a general pattern for any future TP+EP MoE model, see WS-9). **Confirmed unfixable from this codebase** — `flashinfer/fused_moe/` and `vllm/model_executor/warmup/` are no more this repo's code than `autotuner.py` was, confirmed by grep five times across this arc. **Two real, uninvestigated options:** whether `--enable-expert-parallel false` (or equivalent) exists for this model — removes the rank-divergent key at whatever cost EP was buying; or, if this fork is buildable in-house, patching the leader-only save gate plus mounting the cache path persistently (#120). Neither checked. `llama-4-fp8` stays on PP=2 until one of those is explored. Still genuinely open, not pursued: why TP1 completed dozens of profile cycles before crashing rather than stalling immediately — `rank_tactics()`'s own collective contract was never read. Full record: #116–#120. |
 | Boot-log backend scan | **BROKEN, fires on every run** | All six deploys reported `boot_log_hit=False` — "no keyword matched". That is 6 of the run's 6 failed checks (48/54 passed); everything else was clean. The scan's keyword list does not match what these recipes emit, so it produces a false alarm every time, which is the "warning that always fires" failure mode. Consequence: the `TROUBLESHOOTING.md` standard of "we confirmed vLLM *resolved* the backend" is **not** met for this result — only "we set the flags". Recoverable: the full container logs were saved (`a-...-155759.log`, 124632 bytes, and siblings). Grep those rather than re-running. |
 | `--{side}-tp-size` / `--{side}-pp-size` overrides | **OPEN, would pay for itself** | Would make this comparison a one-off command instead of a permanent second catalog entry each time. |
 
@@ -539,7 +544,7 @@ evidence. Ordered by what each unblocks.
 | `--dry-run` embeds live `HF_TOKEN` | **OPEN, no fix applied** | #86. Became a real incident when a dry-run response containing a real token was pasted into a conversation. Decide deliberately: mask before it reaches any response dict, or document the output as sensitive. Masking touches the same `env_flags` path real deploys use. |
 | Teardown: orphaned compile children | **Partial** | 4.8.4 added grace period, graceful stop, `--init`. Not fixed: the grace period has a ceiling; `ps aux | grep -E 'vllm|ray'` can't match bare `ptxas`/`nvcc`/`cicc`; nothing checks whether a compile is in flight before killing. |
 | Host-level `ps aux` step is inert for containers | **Understood, keep the note** | Structurally cannot see containerized processes; kept only as a bare-metal safety net. Documented so nobody "fixes" it thinking it was the protection. |
-| POSIX `/dev/shm` files never swept | **OPEN** | SysV segments with `nattch == 0` are swept every teardown (a hard kernel guarantee). `/dev/shm` needs a `/proc/*/fd` + `/proc/*/maps` cross-reference — buildable, but riskier to get subtly wrong, deliberately deferred. SysV semaphores are inventoried, not swept. |
+| POSIX `/dev/shm` files never swept | **OPEN, second real confirmation 2026-09-04** | SysV segments with `nattch == 0` are swept every teardown (a hard kernel guarantee). `/dev/shm` needs a `/proc/*/fd` + `/proc/*/maps` cross-reference — buildable, but riskier to get subtly wrong, deliberately deferred. SysV semaphores are inventoried, not swept. #116 independently confirmed this gap while investigating an unrelated deadlock: 29 orphaned `psm_*` files on spark-4 spanning ~36 hours, zero on spark-3, `ipcs -m` clean on both. Capacity-innocent (`df -h /dev/shm`: 1.3M/61G) and ruled out as that bug's cause, but the leak itself is real and this makes two suspected-or-confirmed incidents (2026-08-23, 2026-09-04) rather than one. |
 | Cache integrity retrospection | **OPEN, wants ground truth** | One concrete artifact: a `tilelang` entry named `tmp` with an implausible ~56-year age. The heuristic needs real Triton/TileLang/DeepGEMM cache-layout contracts before it can be trusted. |
 | Two fixes never verified in their real UI path | **OPEN, small** | #78's teardown error toast (no failing teardown existed to test against) and #66's `headSelect` sync (only `node --check`'d). |
 
@@ -587,6 +592,44 @@ entirely. Not evaluated: `MiaAI-Lab`'s alternative image
 (`ghcr.io/anemll/dspark-vllm-gx10`); `drowzeys`' concurrency patch, relevant
 only for high concurrency *and* long context together.
 
+### General pattern: TP+EP MoE models and FlashInfer's rank-divergent autotune cache
+
+Discovered debugging `llama-4-fp8-tp` (WS-1, TOMBSTONES #116–#120), but not
+specific to that model — applies to **any future TP+EP MoE model on this
+cluster that routes through FlashInfer's autotuner.**
+
+**The signature to watch for:** one rank's boot log shows an instant
+`Loaded N configs` with zero live tuning; another shows real
+`[AutoTuner]: Tuning <op> ...` progress bars that can run for many minutes.
+If that split appears on a model where EP rank differs across TP ranks
+(check the boot log for `TP rank X, EP rank Y` — if X and Y move together,
+EP is active), expect this exact class of problem, not a random flake.
+
+**Why it happens (#119):** FlashInfer's MoE cache key
+(`MoERunner._cache_key_extras()`) includes `local_expert_offset` by design
+— correctly, since the actual GEMM computation differs per expert shard.
+That means the cache key for "the same" nominal op is provably different
+across EP ranks. Whichever offset the image's baked-in cache was tuned
+against is covered; every other offset live-tunes from scratch, every
+deploy.
+
+**Why it can't self-heal (#120):** `flashinfer_autotune()`'s save call
+(`vllm/model_executor/warmup/kernel_warmup.py`) is gated to the leader
+rank only — the one rank guaranteed to have found everything cached and
+computed nothing new to save. And even if every rank saved,
+`/root/.cache/vllm/flashinfer_autotune_cache/` isn't bind-mounted to
+anything host-persistent, so nothing would survive a container restart
+regardless. A real fix needs both: drop the leader-only gate, *and* mount
+that path somewhere durable — neither alone is sufficient. Whether the
+first is patchable depends on build access to the `eugr/spark-vllm-b12x`
+fork (`lukealonso/b12x` per `errata.yaml`'s lineage note); not confirmed.
+
+**Practical takeaway for a future model:** if a fresh MoE+TP+EP deploy
+hangs or crashes after a long, repeated `[AutoTuner]` progress-bar pattern,
+check the boot log for EP rank divergence *before* assuming it's a new bug
+— it may be this exact, already-understood class, and the fix (or
+workaround: disable EP, at whatever throughput cost) is already scoped.
+
 ---
 
 # 2. Dependency chains
@@ -599,34 +642,76 @@ catalog-key naming (underscore, not dot)           CLEARED
        └─> ab_test.py head-only pre-pull (#106)    CLEARED
             └─> A/B RUN COMPLETED                  ✓ TP wins ~1.9x, n=3/side
                  ├─> #105 + #106 now live-verified, not syntax-only
-                 ├─> decision unblocked: convert/retire qwen-2_5-coder-32b (PP)
-                 └─> llama-4-fp8 (PP=2) needs its OWN A/B -- different model,
-                     different quant, and the one in-house PP data point
+                 └─> decision unblocked: convert/retire qwen-2_5-coder-32b (PP)
 
-remaining in WS-1, now IN PROGRESS overnight 2026-09-03/04:
-  qwen-3.5-122b MTP token-depth sweep (mtp2 / tp[n=3] / mtp4)
+llama-4-fp8's own A/B, run 2026-09-04:                                       ✓
+  new recipe llama-4-fp8-tp.yaml, byte-identical to the PP original except
+  tp_size/pp_size -- diffed programmatically before the run to confirm
+    └─> RESULT IS A DEFECT, NOT A THROUGHPUT ANSWER: TP hangs 2/3 runs,
+        eventually crashes with a Gloo TCP transport failure. Root cause
+        arc, four entries, ending in CONFIRMATION not just hypothesis:
+          #116: mid-hang py-spy -> _profile_single_kernel's all_reduce
+          #117: outer world.barrier() confirmed symmetric on both ranks;
+                over-broadly ruled out any collective asymmetry
+          #118: SECOND, per-tactic all_reduce found one level deeper,
+                reopens the mechanism at correct granularity; the
+                rank-divergent-cache-key half unconfirmed
+          #119: CONFIRMED -- MoERunner._cache_key_extras() bakes
+                local_expert_offset into the cache key; this deploy's
+                own boot log shows TP0/TP1 ARE EP0/EP1 -- genuinely
+                different shards, different keys, different cache
+                coverage for nominally the same profile step. Baked
+                image cache covers one offset; the other rank live-
+                tunes from scratch, EVERY deploy, permanently.
+        NOT FIXABLE FROM THIS REPO -- flashinfer/fused_moe/ confirmed
+        not this codebase, five times over. #116-#120.
+        (#120: TP1's live results can't persist either -- leader-only
+         save gate + no host-mounted cache path. General pattern,
+         written up standalone in WS-9, not llama-4-fp8-specific.)
+        ├─> PP remains the only reliable topology for this model
+        ├─> repeat 1's clean TP numbers held separately, not comparable
+        ├─> cache-priming workaround now DEAD, not just downgraded --
+        │   the divergence is structural (EP shard assignment), no
+        │   amount of pre-warming touches it
+        ├─> ONE real uninvestigated option surfaced by #119: does
+        │   --enable-expert-parallel false (or equivalent) exist for
+        │   this model/image? Would remove the rank-divergent key
+        │   entirely, at whatever cost EP was buying. Not checked.
+        └─> two dead-end hypotheses chased and ruled out along the way,
+            before the (now confirmed, after three revisions) real cause
+            was found (orphaned /dev/shm files; wrong cache-mount host
+            path checked twice) -- correctly not written up as final
+            at any of the three earlier stages
+
+remaining in WS-1, CLOSED 2026-09-04:
+  qwen-3.5-122b MTP token-depth sweep (mtp2 / tp[n=3] / mtp4)                ✓
     ├─> Ray versions confirmed matching (2.58.0, both hosts) before launch --
-    │   #106's pre-pull fix holding, no repeat of the version-drift crash
-    ├─> run 1: mtp2 vs tp[n=3], --repeats 3, launched ~21:15 2026-09-03
-    ├─> run 2: mtp2 vs mtp4, --repeats 3, queued behind run 1 (waits for
-    │   run 1's ab_test.py process to exit before starting -- not racing it)
-    ├─> rationale for testing 2-vs-3 first rather than the wider 2-vs-4
-    │   contrast originally suggested: a third-party claim holds n=3 as
-    │   best, n=2 second-best, n=4 too aggressive -- this run tests whether
-    │   the top two are actually distinguishable on this hardware/image,
-    │   not just ranking three unknowns. If mtp2 wins or ties, that
-    │   contradicts the claim and is the more interesting result; if tp[n=3]
-    │   wins clearly, that corroborates it independently rather than just
-    │   inheriting it secondhand -- record which, explicitly, when writing
-    │   up the result. Source of the "3 best / 2 second / 4 too big" claim
-    │   itself not yet traced to a specific document -- do that before
-    │   citing it in a permanent record.
-    └─> note: all three carry MTP. There is no speculation-OFF control,
-        so the sweep can rank depths but cannot answer whether MTP helps
-        this model at all. Expect real prompt-category variance this time,
-        unlike the coder A/B's near-zero spread -- speculative acceptance
-        is workload-dependent; read per-category numbers, not the aggregate.
+    │   #106's pre-pull fix held, no repeat of the version-drift crash
+    ├─> run 1: mtp2 vs tp[n=3], --repeats 3, 54/54 checks, boot_log_hit=True
+    ├─> run 2: mtp2 vs mtp4, --repeats 3, deployed=True/boot_log_hit=True
+    │   both sides -- ran cleanly behind run 1 as queued, no race
+    ├─> result: NO SINGLE BEST DEPTH -- extraction +17.5% n=2->n=4
+    │   (monotonic up), coding -8.5% n=2->n=4 (monotonic down), creative
+    │   -4% (mild monotonic down), default flat. Contradicts the "3 is
+    │   best overall" framing this run was testing -- it's a genuine
+    │   Pareto trade-off across categories, not a total ordering. Second
+    │   independent confirmation of the DFlash sweep's core finding
+    │   (speculative throughput is sharply workload-dependent), now on a
+    │   different model and method. Full writeup: TOMBSTONES.md #115.
+    ├─> source of the "3 best / 2 second / 4 too big" claim itself was
+    │   never traced to a specific document before this run started --
+    │   still not traced. Given the result contradicts it as a categorical
+    │   claim, tracing the source matters less now than it would have if
+    │   the run had corroborated it; not pursuing further unless the claim
+    │   resurfaces elsewhere.
+    └─> CORRECTION to a hypothesis in TOMBSTONES #113: this run shares
+        #113's exact build string and correctly reports boot_log_hit=True
+        both times, undercutting #113's "likely explains the coder A/B's
+        boot_log_hit=False" build-drift guess. See TOMBSTONES #115 for the
+        revised, more mundane explanation (keyword list vs. what these
+        specific recipes' logs contain, independent of build).
 ```
+
 
 **D-2 — the status-marker chain (prerequisite already paid)**
 
