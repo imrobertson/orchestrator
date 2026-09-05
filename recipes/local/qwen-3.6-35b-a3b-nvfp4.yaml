@@ -1,0 +1,32 @@
+recipe_version: '1'
+# Qwen3.6-35B-A3B is a 35B-total / 3B-active MoE. NVFP4 MoE variant -- the
+# community-nominated single-DGX-Spark sweet spot (Appreciable A3B active footprint).
+# Speculative decode: MTP with a 3-token draft (confirmed pattern from vLLM recipes /
+# Qwen3.6-35B-A3B landing threads on one GB10; Steve Scargall measured 83-93% MTP
+# acceptance on NVFP4). 1_node (tp=1) ONLY per the no-PP=2/2-node rule -- this
+# intentionally has no 2_node topology: A3B NVFP4 fits one GB10 and must not be
+# racked across both (dead-end multi-node path, see REFERENCE-flashinfer-autotune-internals.md).
+hf_path: unsloth/Qwen3.6-35B-A3B-NVFP4
+image: eugr/spark-vllm-b12x:latest
+gpu_util: 0.75
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+topologies:
+  1_node:
+    # 35B-A3B NVFP4 fits one GB10 with room (A3B active). MTP spec-decode with a
+    # 3-token draft is the community-validated config on single GB10.
+    max_model_len: 262144
+    tp_size: 1
+    pp_size: 1
+    env_vars:
+    - OMP_NUM_THREADS=16
+    - VLLM_CPU_OMP_THREADS=16
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    vllm_args: >-
+      --trust-remote-code --kv-cache-dtype fp8 --language-model-only
+      --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+      --moe-backend marlin --compilation-config '{"mode": 0}'
+      --max-num-seqs 8 --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":3}'
