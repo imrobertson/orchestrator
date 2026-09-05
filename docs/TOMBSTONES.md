@@ -1,11 +1,11 @@
 # Control Plane Release Tombstones & Fix Log
 
 <!--
-Reconciliation note (2026-09-03/09-04): #111-#120 added across this session, appended
+Reconciliation note (2026-09-03/09-05): #111-#126 added across this session, appended
 above #110 per usual (newest/highest on top). #111 resolves #110's open
 question -- #110 itself is left as originally written, uncorrected, since
 it's the accurate record of what was known and suspected at the time; the
-resolution is #111, not a rewrite of #110. Full numbering 27-120 confirmed
+resolution is #111, not a rewrite of #110. Full numbering 27-126 confirmed
 contiguous by the same exhaustive "### N." scan method the 2026-08-31 note
 below established (not just line-start matches).
 -->
@@ -45,6 +45,337 @@ fixed today, recorded here rather than silently:
     occurrence in the raw file (not just line-start matches, since
     that's exactly what let #76 hide undetected as long as it did).
 -->
+
+### 126. Closing the deep dive past #125: the actual TP0/TP1 divergence trigger was never confirmed, but a real, durable, model-independent structural fragility in FlashInfer's tuning architecture was -- traced until it hit a JIT-compiled-extension wall. Recorded for its transferable value, not because `llama-4-fp8` needed it
+
+* **The Trap:** #125 closed the EP hypothesis but left the actual cause of
+  TP0's instant cache hit vs. TP1's ~48-minute live sweep unknown. Purely
+  out of curiosity (explicitly not pursued for `llama-4-fp8` remediation,
+  which #122's decision already closed), the investigation continued one
+  layer at a time: `choose_one`'s per-tactic exception handling (confirmed
+  correctly lockstep-preserving when a tune group is set, per FlashInfer's
+  own code comments) -> `rank_tactics()`, a *second*, separately-defined
+  tuning entry point nested inside `get_valid_tactics()` -> the actual
+  per-architecture `MoERunner` class, defined dynamically inside
+  `get_cutlass_fused_moe_module()`.
+
+* **The Fix:** Not a fix -- a deliberate closing note, because the chase
+  hit a real boundary rather than running out of leads. `get_cutlass_
+  fused_moe_module()` calls `gen_cutlass_fused_moe_sm120_module(...)
+  .build_and_load()` -- a JIT-compiled CUDA extension, built and loaded at
+  runtime, architecture-specific (`sm120`/`121`, matching this GB10
+  build). The `MoERunner` class wrapping it is Python, but its actual
+  `get_valid_tactics()`/`forward()` almost certainly delegate straight
+  into compiled C++/CUDA symbols with no `.py` source left to grep.
+  Tracing stopped here, deliberately -- not from lack of a next question
+  (the constructor's `ep_size`/`ep_rank` parameters, visible but unread,
+  were a live remaining thread) but from a judgment that the specific
+  answer, even if found, would be scoped to one FlashInfer version
+  (`0.6.18`), one vLLM commit (`g83cb22a0e`), one architecture, and one
+  fork already confirmed to have moved its `:latest` tag once during this
+  same investigation (#113/#118) -- likely stale before it mattered again.
+
+  **What's durable and worth keeping, independent of any of that:**
+
+  1. **A real, structural fragility in FlashInfer's tuning architecture,
+     broader than `llama-4-fp8` or expert-parallelism specifically.**
+     `choose_one`'s outer 21-bucket loop is safely rank-agnostic (buckets
+     come from `tuning_config`, identical by construction across ranks).
+     But `rank_tactics()` -- called from inside `get_valid_tactics()`,
+     itself called once per bucket -- iterates `valid_tactics`, a list
+     whose *length* is computed fresh per call with no cross-rank
+     synchronization. If any two ranks' local shapes ever produce a
+     different-length result here, for *any* reason (expert-parallel
+     sharding, as #119 originally proposed and #125 disconfirmed for this
+     specific deploy; or plain uneven TP sharding of an expert's own
+     weight matrices, if the relevant dimension doesn't divide cleanly by
+     `tp_size`; or something else entirely), every call to
+     `_profile_single_kernel()` inside that loop carries its own
+     `all_reduce()` (confirmed in #118), and cardinality breaks silently.
+     This explains, structurally, why a hang can present as dozens of
+     *completed* outer-bucket cycles before failing -- the divergence
+     lives one level deeper than the progress bar tracks. **Any future
+     TP-parallel MoE model on this cluster inherits this exact fragility,
+     independent of whether EP is involved at all** -- narrower and more
+     accurate than WS-9's original "TP+EP" framing, corrected there
+     alongside this entry.
+
+  2. **The debugging method itself, not the specific finding.** Pull
+     source at the exact commit/version the running build's own string
+     resolves to; verify identity via `docker run --rm <image>:<tag>`
+     rather than trust a resident container's name (the concrete failure
+     mode -- checking an unrelated live DeepSeek deploy under the name
+     `vllm-head` -- is recorded in #123); read one function at a time,
+     confirm before extending. This transfers to any future investigation
+     on this cluster regardless of FlashInfer, vLLM, or this model ever
+     coming up again.
+
+  **What does not transfer, and is recorded as expired-by-design rather
+  than lost:** the specific trigger for `llama-4-fp8-tp`'s hang. Not
+  confirmed to be shape-divergence, not confirmed to be something else.
+  `#122`'s decision stands, unaffected -- this was never going to change
+  it either way. `llama-4-fp8` stays on PP=2.
+
+### 125. CLOSED: #119's rank-divergent-EP mechanism is disconfirmed, by direct source read, not inference -- the boot log's `EP rank` label is unconditional bookkeeping under any variable name. Actual root cause of the observed TP0/TP1 cache-hit asymmetry is unknown
+
+* **The Trap:** #124 found `enable_expert_parallel` absent from
+  `parallel_state.py` entirely, but flagged a real remaining gap: the
+  codebase is confirmed elsewhere (`multiproc_executor.py`) to rename this
+  exact flag to `enable_ep` when passing it downstream, so a grep for the
+  literal string `enable_expert_parallel` alone could not rule out
+  `parallel_state.py` reading the same value under a different local name.
+
+* **The Fix:** `grep -n "enable_ep\|ep_rank\|EP rank"
+  vllm/distributed/parallel_state.py`, against the same confirmed image,
+  closes that gap directly. Three matches, none of them what would be
+  needed to support #119's mechanism:
+
+  - Line 1446 and line 1972 both gate on `enable_eplb` -- Expert
+    Parallelism *Load Balancing*, a distinct config flag layered on top
+    of expert parallelism, not `enable_expert_parallel` under a different
+    name and not the same thing.
+  - Line 1994 is the log format string itself:
+    `"TP rank %s, EP rank %s, EPLB rank %s"` -- the exact line the
+    original boot log's `[parallel_state.py:1991]`-tagged output came
+    from. No conditional anywhere near it in this file gates on
+    `enable_expert_parallel`, under any name, including `enable_ep`.
+
+  **This closes #124's remaining gap outright.** The `EP rank` value in a
+  vLLM boot log on this build is unconditional rank bookkeeping, computed
+  and printed regardless of whether expert-parallel sharding is actually
+  happening. `#119`'s reading of `TP rank 0, EP rank 0` / `TP rank 1,
+  EP rank 1` as proof of active EP sharding -- the entire foundation its
+  cache-key-divergence mechanism was built on -- does not hold. Combined
+  with the two facts already established (`enable_expert_parallel`
+  defaults `False`; the original failing deploy's boot log never
+  overrode it), the case is no longer "in doubt" (#123) or "leaning"
+  (#124) -- it is **closed**: EP was not active on this deploy, and
+  `MoERunner._cache_key_extras()`'s rank-divergent `local_expert_offset`
+  mechanism, real as *code*, was not what caused this specific incident's
+  hang.
+
+  **What remains genuinely, honestly unknown:** the original observation
+  that motivated all of #116-#124 -- TP0 hitting the baked FlashInfer
+  cache instantly while TP1 live-tuned for ~48 minutes before the Gloo
+  transport crashed -- is real and unexplained by anything confirmed in
+  this arc. Closing the EP hypothesis does not supply a replacement one.
+  If `_cache_key_extras()`'s other fields (`routing.top_k`,
+  `routing.num_experts`, `self.backend_key`, `self.config.quant.variant.name`)
+  somehow diverged between TP0 and TP1 for a reason unrelated to expert
+  sharding, that would need its own investigation from scratch -- not
+  attempted here, and not recommended given #122's standing decision.
+
+  **Unaffected by this closure:** `#122`'s decision to not pursue further
+  remediation stands, for exactly the same reasons as before, now more
+  strongly -- there is no confirmed, actionable mechanism left to remediate
+  even if time were available. `llama-4-fp8` stays on PP=2. WS-9's general
+  pattern note (TP+EP MoE models on this cluster) needs correcting from "a
+  real, code-verified mechanism whose applicability is uncertain" to "a
+  real vLLM code path that exists in principle, with no confirmed instance
+  of it actually causing a problem on this cluster to date" -- a
+  meaningfully weaker claim than either #119 or #123/#124 left standing.
+
+### 124. Further evidence against #119's mechanism: `parallel_state.py` (the file that prints the boot log's `EP rank` label) has zero textual reference to `enable_expert_parallel` -- strengthens #123's reopening toward "EP likely wasn't active," one gap short of full closure
+
+* **The Trap:** #123 reopened #119's confirmed root cause on two pieces of
+  evidence -- `enable_expert_parallel` defaults `False`, and the original
+  failing deploy's boot log never overrode it -- but left open whether the
+  boot log's `TP rank X, EP rank Y` label is reliable evidence of active
+  EP sharding at all, since `vllm/distributed/parallel_state.py`'s actual
+  print-construction logic was never read.
+
+* **The Fix:** `grep -rn "enable_expert_parallel" vllm/ --include=*.py`
+  against the confirmed-matching image (`eugr/spark-vllm-b12x:latest`,
+  `vllm.__version__` re-verified as `0.1.dev20482+g83cb22a0e...` in the
+  same transcript as this grep, closing the process-hygiene gap #123
+  flagged from the earlier wrong-container false start) returned every
+  file in the codebase that touches this flag -- MoE layer config,
+  several models' own EP-aware code paths (`deepseek_v4`, `kimi_k3`,
+  `minimax_m3`, `inkling`, `gpt_oss`), the executor, the arg parser --
+  and **`parallel_state.py` is not among them.** The one file confirmed
+  (via a direct `import` + `__file__` check) to be where the boot log's
+  `[parallel_state.py:1991]`-tagged rank-assignment line is printed has no
+  textual connection to the flag whose value determines whether expert
+  sharding actually happens.
+
+  Two things independently worth noting from the same grep, beyond the
+  main finding: (1) **no `llama4`/`mllama4` model file appears anywhere in
+  this list** -- Llama4's own implementation doesn't reference the flag
+  at all, consistent with it relying on generic `FusedMoE` layer
+  construction (`model_executor/layers/fused_moe/config.py:1214`) rather
+  than a model-specific EP branch; (2) `v1/executor/multiproc_executor.py`
+  **renames the flag to `enable_ep`** when passing it downward
+  (`enable_ep=vllm_config.parallel_config.enable_expert_parallel`) --
+  which matters directly for how far this evidence can be trusted.
+
+  **The gap this doesn't close, stated precisely rather than glossed
+  over:** because the codebase is confirmed to rename this exact flag at
+  least once in its own call chain, a grep for the literal string
+  `enable_expert_parallel` cannot rule out `parallel_state.py` reading the
+  same value under a different local name (e.g. `enable_ep`, or something
+  computed one layer further removed). "Zero matches for one exact
+  string" is real, meaningful evidence that the print is *probably*
+  unconditional -- it is not proof. The one remaining check
+  (`grep -n "enable_ep\|ep_rank\|EP rank" parallel_state.py`) would close
+  this fully; not yet run as of this entry.
+
+  **Where this leaves #119, stated at the correct confidence level:** the
+  case that EP was NOT actually active on the deploy that produced #116's
+  original hang is now meaningfully stronger than at #123 -- not just "in
+  doubt," but leaning toward "likely wasn't the actual mechanism." If
+  confirmed by the remaining check, `MoERunner._cache_key_extras()`'s
+  rank-divergent `local_expert_offset` -- real as *code*, verified line-
+  by-line in #119 -- would be established as **not what caused this
+  specific incident**, and the actual cause of the rank-divergent cache
+  key (if the keys genuinely did diverge) would remain unknown.
+
+  **Unaffected by any of this:** #122's decision not to pursue remediation
+  further stands regardless of which mechanism turns out to be correct --
+  this entry exists for the accuracy of the permanent record and for
+  whichever future model surfaces this question again (WS-9's general
+  pattern note), not because the practical answer for `llama-4-fp8`
+  changes. `llama-4-fp8` stays on PP=2.
+
+### 123. #119's "confirmed" root cause reopened: `enable_expert_parallel` defaults `False` in this exact build, and the failing deploy's own boot log never overrode it -- the EP-rank labels #119 relied on may just be bookkeeping, not evidence of active expert sharding
+
+* **The Trap:** #119 read `rank 0 ... TP rank 0, EP rank 0` /
+  `rank 1 ... TP rank 1, EP rank 1` in the original failing deploy's boot
+  log as proof that expert parallelism was active, and built a confirmed
+  root cause on it: EP sharding makes `local_expert_offset` genuinely
+  differ between TP0 and TP1, which `MoERunner._cache_key_extras()` bakes
+  into the FlashInfer cache key, producing rank-divergent cache hits/misses
+  for nominally the same op. `#120` and `#121` both build on that same
+  premise.
+
+* **The Fix:** Not a fix -- a genuine reopening, caught before it went
+  into the record uncorrected. Checked `EngineArgs`' actual field defaults
+  against `eugr/spark-vllm-b12x:latest`, confirmed via `docker run --rm`
+  (not a resident container, so it couldn't have been running an
+  unrelated deploy -- see the false start below) and confirmed via
+  `vllm.__version__` matching `0.1.dev20482+g83cb22a0e.d20260903`, the
+  exact build this whole #116-#122 arc is about:
+
+  ```
+  enable_expert_parallel = False
+  ```
+
+  Cross-referenced against evidence already sitting in this
+  conversation, not newly gathered: the original failing deploy's own
+  boot log line, `non-default args: {'model': ..., 'tensor_parallel_size':
+  2, ...}`, **never includes `enable_expert_parallel`** -- meaning nothing
+  in that deploy overrode the default. Two independent signals, same
+  direction: EP was very possibly never active on the deploy that
+  produced #116's original hang.
+
+  **What this means, stated precisely and not further than the evidence
+  allows:** the boot log's `EP rank` labels most plausibly reflect
+  vLLM's parallel-state group bookkeeping printing an EP rank regardless
+  of whether `enable_expert_parallel` is actually sharding anything --
+  not confirmed, since `vllm/distributed/parallel_state.py`'s actual
+  group-construction logic was never read. If that reading is right,
+  `local_expert_offset` may have been identical (0) on both ranks, in
+  which case the specific mechanism #119 confirmed from source -- real as
+  *code*, verified line-by-line in `runners.py` -- may simply not be what
+  caused this particular deploy's hang. The real cause, if not this, is
+  **unknown again.**
+
+  **A real false start along the way, worth recording as its own lesson:**
+  the first attempt to check this ran against whatever container was
+  named `vllm-head` at the time, without first confirming what that
+  container was actually running -- it turned out to be a live DeepSeek
+  DSpark deploy on a completely different image
+  (`hazyumps/deepseek-v4-flash-gb10:...`, not `eugr/spark-vllm-b12x`),
+  making its `EngineArgs` defaults meaningless for this question. Caught
+  before being written up, not after. The corrected method --
+  `docker run --rm <image>:<tag>` against the specific image tag, never a
+  resident container by name -- is the one that should have been used
+  from the start; every earlier code-pull in this same arc (#118's
+  `kernel_warmup.py`, #119's `runners.py`) had correctly checked
+  `vllm.__version__` first for exactly this reason, and this one check
+  skipped that discipline.
+
+  **Explicitly not resolved by this entry:** whether EP actually was or
+  wasn't active on the original deploy; what the real cause is if it
+  wasn't. Not pursued further -- #122's decision to deprioritize this
+  item stands regardless of which mechanism turns out to be correct, and
+  chasing this exact question further isn't worth the time either. If
+  this is ever revisited, **re-verify EP activation status first** via
+  `parallel_state.py`, before assuming #119-#121's cache-key mechanism is
+  the thing to fix -- it may not be.
+
+### 122. Decision: `llama-4-fp8-tp`'s upstream/local-rebuild fix paths (#121) deliberately not pursued -- no relationship with the fork maintainer, limited time, working PP fallback already exists
+
+* **The Trap:** #121 named two real fix paths for the FlashInfer
+  rank-divergent-cache-key issue (#119/#120) -- upstream to whoever
+  maintains `eugr/spark-vllm-b12x`, or a local rebuild. Neither is a code
+  change available in this repo, so leaving the item as "two options,
+  neither checked" risks reading as an oversight to a future reader,
+  rather than the deliberate call it actually is.
+
+* **The Fix:** Not a fix -- a recorded decision, per this repo's own
+  standing practice of surfacing scope-crossing calls explicitly rather
+  than letting them sit ambiguous. Operator's own words: no personal
+  relationship with the fork's maintainer, limited time to spend chasing
+  an upstream contribution or a rebuild for one model's TP path, and a
+  working PP=2 fallback already exists for this model. **Deliberately not
+  pursued.** `llama-4-fp8` stays on PP=2, indefinitely, not pending
+  further action.
+
+  **One remaining check flagged as genuinely low-cost, not chased as part
+  of this decision:** whether `--enable-expert-parallel false` (or
+  equivalent) exists for this build -- a local recipe flag, not a contact
+  with `eugr` or an image rebuild. If it exists, it would remove the EP
+  divergence outright at whatever throughput/memory cost EP was buying.
+  Optional; not required to close out this item.
+
+  If circumstances change -- a relationship with the maintainer forms,
+  build access becomes available, or TP for this model becomes actually
+  needed rather than nice-to-have -- #119/#120/#121 already contain
+  everything needed to act: the exact code locations, the exact patches
+  needed (drop the `is_leader` gate on `save_configs()`; mount
+  `/root/.cache/vllm/flashinfer_autotune_cache/` persistently), and the
+  general pattern (WS-9) this will recur under for any future TP+EP MoE
+  model on this cluster.
+
+### 121. Correction: #119/#120's "unfixable from this codebase" framing was imprecise -- the fix is unavailable within `imrobertson/orchestrator`, but real fix paths exist against the image itself, upstream or local
+
+* **The Trap:** #119 and #120 both stated the FlashInfer/vLLM
+  cache-key-divergence and leader-only-save issues as "confirmed unfixable
+  from this codebase," supported by repeated grep evidence that the
+  relevant code (`flashinfer/fused_moe/`,
+  `vllm/model_executor/warmup/kernel_warmup.py`) doesn't live in
+  `dgx-orchestrator.py` or `common/*.py`. That grep evidence is correct
+  and stands. The conclusion drawn from it overreached: "not fixable by
+  editing this repo's own source" was stated in a way that read as "not
+  fixable, period" -- a materially different and untrue claim.
+
+* **The Fix:** Not a technical correction, a scope correction, flagged
+  explicitly rather than left standing. Two real paths exist against the
+  `eugr/spark-vllm-b12x` image itself, neither requiring a change to this
+  repo:
+
+  1. **Upstream.** File the exact finding -- the `is_leader` gate on
+     `save_configs()` in `kernel_warmup.py`, and the missing bind mount
+     for `/root/.cache/vllm/flashinfer_autotune_cache/` -- as an issue or
+     PR against whoever maintains that fork
+     (`lukealonso/b12x` per `errata.yaml`'s lineage note, published under
+     the `eugr` namespace).
+  2. **Local rebuild.** If there is build access to that image, or a
+     Dockerfile layering on top of it, both fixes from #120 (drop the
+     leader-only gate; mount the cache path persistently) are ordinary
+     patches, not upstream-only waits.
+
+  **Which of these is actually realistic for this team is not established
+  and is not assumed here either way** -- whether `eugr/spark-vllm-b12x`
+  is a public repo reachable for a PR, an internal build alias already
+  under this team's control, or an opaque third-party image with neither
+  option available, changes which path applies and is worth confirming
+  directly rather than guessing from the image tag alone.
+
+  `#119`/`#120`'s underlying technical findings (the rank-divergent cache
+  key, the leader-only save gate, the missing mount) are unaffected by
+  this correction -- only the "unfixable" framing around them is
+  corrected here.
 
 ### 120. Why the rank-divergent tuning cost from #119 can't self-heal: `save_configs()` is gated to the leader rank only, and the cache path isn't host-persisted anyway. A general pattern for any future TP+EP MoE model on this cluster, not specific to `llama-4-fp8` (V?.?.?)
 

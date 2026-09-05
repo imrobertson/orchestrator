@@ -153,6 +153,7 @@ by omission.
 | `SESSION-CLOSEOUT-2026-09-02-FINAL.md` | **Archive.** Ported to WS-5; verify the port lost nothing first. |
 | `SESSION-SEED.md` | **Archive**, unless it is a live onboarding aid — then fold into `USERMANUAL.md`. |
 | `EUGR-REFERENCE-NOTES.md` + `EUGR-NOTES-UPDATE-2026-08-29.md` | **Merge the two, keep as reference.** External-ecosystem notes with no equivalent elsewhere. Add the note that we adopt eugr's mod *format* but not their delivery. |
+| `REFERENCE-flashinfer-autotune-internals.md` | **Keep.** Same category as the row above — durable internals notes on a third-party dependency (FlashInfer's autotuner call chain, confirmed via direct source read across `TOMBSTONES.md` #116–#126), not project history and not a backlog item. Distilled specifically so a future TP-parallel-MoE hang doesn't require re-deriving the call chain from scratch. Line numbers inside it are pinned to one build and will drift — the doc says so up front. |
 | `UsageShortcut.md` | **Fold into `USERMANUAL.md`** as a fast-path section. |
 | `QUESTIONS.md` | **Triage.** 1.2 KB, untouched since 2026-08-22. Answered → `TOMBSTONES.md`; open → `WORKSTREAMS.md`; then archive. |
 | `REFERENCE-dspark-shared-expert-fix.md` | **Does not exist.** Cited by `BACKLOG-dspark-sm120-image.md` as "saved as", but absent from `docs/` and the repo root. Either re-save it from the upstream source (tonyd2wild's repo) or delete the citation. The conclusion it supports — the shared-expert bug does not apply to our image — is preserved in `TROUBLESHOOTING.md` and WS-9. |
