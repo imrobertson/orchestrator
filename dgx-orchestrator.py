@@ -43,7 +43,12 @@ from pathlib import Path
 from typing import Literal, Optional
 import yaml
 
-from common.config import legacy_hosts_dict, load_cluster_config
+from common.config import (
+    default_deploy_target,
+    legacy_hosts_dict,
+    load_cluster_config,
+    reserved_hosts,
+)
 from common.constants import ContainerRole
 from common.mods import ModBakeError, ModResolutionError, ensure_mods_baked, resolve_mod_tag
 from common.runlog import archive_run_log
@@ -205,6 +210,82 @@ HOSTS = legacy_hosts_dict()
 PRIMARY_HOST = next(iter(HOSTS), "spark-4")
 SECONDARY_HOST = list(HOSTS.keys())[1] if len(HOSTS) > 1 else PRIMARY_HOST
 PRIMARY_HOST_IP = HOSTS.get(PRIMARY_HOST, {}).get("ip", "10.0.14.43")
+
+# PRIMARY_HOST above is a STRUCTURAL role: the head node of a 2-node Ray
+# deploy, and the host whose /metrics feed SESSION_TRACKER. It was also,
+# separately, the fallback target for any operation that didn't name a
+# host -- which is fine on a cluster that runs one thing at a time and
+# actively hostile on one where a node holds something long-lived. The
+# node you most want to be telemetry-authoritative is then also the node a
+# bare `deploy` flattens.
+#
+# DEFAULT_DEPLOY_HOST splits that second job out. It is cluster_config
+# .yaml's default_deploy_target when set, else the first active host --
+# i.e. identical to the old behaviour for any config that doesn't opt in.
+# It governs 1-node defaults ONLY; 2-node deploys still put the head on
+# PRIMARY_HOST, so the head node stays the same across topologies.
+DEFAULT_DEPLOY_HOST = default_deploy_target() or PRIMARY_HOST
+
+# Hosts carrying something that must not be disturbed by routine work.
+# Enforced in execute_deployment()/execute_teardown(), so every surface
+# (CLI, API, menu) inherits it rather than each remembering to check.
+RESERVED_HOSTS = reserved_hosts()
+
+def resolve_deploy_head(head: Optional[str], nodes: int) -> str:
+    """
+    Resolve an unspecified --head/head to the right host for the topology.
+
+    Cannot be an argparse default because it depends on --nodes, which
+    isn't known until after parsing. 2-node keeps the head on PRIMARY_HOST
+    so the head stays consistent across topologies; 1-node goes to the
+    scratch node.
+    """
+    if head:
+        return head
+    return PRIMARY_HOST if nodes == 2 else DEFAULT_DEPLOY_HOST
+
+def deployment_target_hosts(nodes: int, head: str) -> list:
+    """
+    The hosts a deploy will occupy -- and therefore tear down first.
+
+    Single definition shared by _execute_deployment_impl() and the
+    reserved-host guard in execute_deployment(), so the guard can never
+    check a different set of hosts than the deploy actually touches.
+    """
+    return [PRIMARY_HOST, SECONDARY_HOST] if nodes == 2 else [head]
+
+def check_reserved_hosts(target_hosts: list, force: bool, action: str) -> Optional[str]:
+    """
+    Returns an error message if the operation would disturb a reserved
+    host without --force, else None.
+
+    Names what is currently recorded as running there, since "spark-4 is
+    reserved" is much less useful than knowing which model is about to be
+    taken down. ACTIVE_DEPLOYMENT_STATE only records what this
+    orchestrator deployed, so an out-of-band container shows as unknown
+    rather than being missed -- the host is still protected either way.
+    """
+    if force:
+        return None
+    hit = [h for h in (target_hosts or list(HOSTS.keys())) if h in RESERVED_HOSTS]
+    if not hit:
+        return None
+
+    state = _load_active_deployment_state()
+    detail = []
+    for h in hit:
+        rec = state.get(h) or {}
+        running = rec.get("catalog_key")
+        topo = rec.get("topo_key")
+        if running:
+            detail.append(f"{h} (running {running}{'/' + topo if topo else ''})")
+        else:
+            detail.append(f"{h} (contents unknown)")
+    return (
+        f"Refusing to {action}: {', '.join(detail)} "
+        f"{'is' if len(hit) == 1 else 'are'} marked reserved in cluster_config.yaml. "
+        f"Re-run with --force if this is intended."
+    )
 
 NETWORK_STATE_FILE = BASE_DIR / ".network_mode"
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9?]*[ -/]*[@-~])')
@@ -2018,7 +2099,15 @@ def _detect_live_model_topo_metrics() -> dict:
     matched_model, _, _ = _resolve_active_recipe(
         serving_host, catalog_models, raw_loaded_model, require_active=False
     )
-    topo = "2_node" if len([h for h, i in container_info.items() if i.get("active_container") != "None"]) > 1 else "1_node"
+    # Role-based, matching _compute_cluster_status_impl() and
+    # _finalize_host_status(). See the long note at the former's own topo
+    # derivation for why counting active containers across hosts is wrong
+    # and what it does to the ledger. This path matters just as much: it
+    # is what `correct-ledger` with no arguments uses to decide WHICH key
+    # it is about to overwrite, so a wrong topo here means a repair
+    # command writes to the wrong entry.
+    serving_active_container = container_info.get(serving_host, {}).get("active_container", "None")
+    topo = "2_node" if serving_active_container in (ContainerRole.HEAD, ContainerRole.WORKER) else "1_node"
 
     return {
         "status": "success",
@@ -2659,7 +2748,29 @@ def _compute_cluster_status_impl() -> dict:
     matched_model, _, _ = _resolve_active_recipe(
         serving_host, catalog_models, raw_loaded_model, active_container=serving_active_container
     )
-    topo = "2_node" if len([h for h, i in container_info.items() if i.get("active_container") != "None"]) > 1 else "1_node"
+    # Derived from the SERVING host's own container ROLE, not from a count
+    # of how many hosts happen to have a container. HEAD/WORKER only ever
+    # exist in a Ray 2-node deploy; a STANDALONE container is 1-node by
+    # definition regardless of what any other host is doing.
+    #
+    # The previous count-based form reported "2_node" whenever two
+    # INDEPENDENT 1-node deploys were up at once -- e.g. a resident agent
+    # on one Spark while the other is used for testing. That is not a
+    # cosmetic mislabel: SESSION_TRACKER.update() latches self.model and
+    # self.topo on its inactive->active transition and freezes them for
+    # the whole session, so a session that happens to START while both
+    # hosts have containers commits every subsequent flush under a
+    # fabricated "<model>::2_node" ledger key. _load_last_seen_raw() finds
+    # no checkpoint under that key, re-baselines to the current cumulative
+    # counters, and the model's real history is left stranded on its
+    # "::1_node" key while a partial duplicate accumulates alongside it.
+    # Scoped teardowns make this MORE likely, not less, since each one
+    # ends the session and opens a fresh latch window with the other
+    # host's container still up.
+    #
+    # Matches _finalize_host_status()'s existing role-based derivation --
+    # that one was always correct; this is the site that drifted.
+    topo = "2_node" if serving_active_container in (ContainerRole.HEAD, ContainerRole.WORKER) else "1_node"
     if cluster_ready:
         SESSION_TRACKER.update(vllm_metrics, matched_model, topo)
 
@@ -2747,9 +2858,33 @@ def _compute_cluster_status_impl() -> dict:
             status_data["hosts"][host] = host_status
 
     # Strictly guarded worker state mirroring
+    #
+    # This mirror is only meaningful for a genuine Ray 2-node deploy, where
+    # PRIMARY_HOST really is the head and SECONDARY_HOST really is its
+    # worker -- there, the worker has no model of its own to report and
+    # inheriting the head's is correct. Gating on the two hosts merely
+    # being RUNNING and healthy was an unstated assumption that the cluster
+    # only ever runs one deployment at a time.
+    #
+    # Two independent 1-node deploys break that assumption: both hosts are
+    # healthy, neither is the other's worker, and the mirror overwrites the
+    # SECONDARY host's active_model/model_status with the PRIMARY host's --
+    # so the dashboard reports a model on a node that isn't running it.
+    # That is display-only (the ledger is unaffected), but it is wrong at
+    # exactly the moment it matters: reading off which node is serving what
+    # while testing on one and serving from the other.
+    #
+    # ContainerRole is the authoritative signal and is already carried on
+    # each host's status as "container_name". HEAD and WORKER exist only in
+    # a Ray deploy; STANDALONE means the host is independent. Requiring
+    # both ends confines the mirror to the topology it was written for.
+    # Same root cause as the count-based topo derivation above: inferring
+    # deployment topology from host identity instead of reading the role.
     head_s = status_data["hosts"].get(PRIMARY_HOST)
     worker_s = status_data["hosts"].get(SECONDARY_HOST)
-    if head_s and worker_s:
+    if (head_s and worker_s
+            and head_s.get("container_name") == ContainerRole.HEAD
+            and worker_s.get("container_name") == ContainerRole.WORKER):
         head_is_active = (head_s["container_state"] == "RUNNING" and 
                           head_s["active_model"] != "None" and 
                           not head_s["model_status"].startswith("CRASHED"))
@@ -3265,18 +3400,112 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
         # invalidate.
         _clear_active_deployment(hosts_to_clean)
 
-def execute_teardown(target_hosts: list = None) -> dict:
+def resolve_teardown_hosts(host_arg: Optional[str], all_hosts: bool) -> tuple:
+    """
+    Turn a CLI/API host selection into an explicit host list.
+
+    Returns (hosts, error_message). Exactly one of the two is meaningful:
+    on success error_message is None; on failure hosts is None.
+
+    Deliberately has NO "neither given" fallback to every host. Teardown
+    used to mean "everything is going away" unconditionally, which is a
+    footgun the moment one Spark hosts something long-lived (a resident
+    agent) while the other is used for testing -- the common case now.
+    Requiring --host or --all makes destroying the whole cluster something
+    someone typed on purpose rather than something they got by default.
+
+    An unrecognised name is an ERROR, not a silent no-op. Without this,
+    `--host spark4` (missing hyphen) would filter down to an empty list
+    and _execute_teardown_impl would cheerfully report a clean teardown of
+    nothing -- while the container the operator meant to remove kept
+    running. Report the valid names instead.
+    """
+    if all_hosts:
+        return list(HOSTS.keys()), None
+    if not host_arg:
+        return None, "No hosts selected: pass --host <name[,name...]> or --all."
+
+    requested = [h.strip() for h in host_arg.split(",") if h.strip()]
+    if not requested:
+        return None, "No hosts selected: --host was given but parsed to an empty list."
+
+    unknown = [h for h in requested if h not in HOSTS]
+    if unknown:
+        return None, f"Unknown host(s) {unknown}. Known hosts: {list(HOSTS.keys())}."
+
+    # De-duplicate while preserving the order given, so `--host
+    # spark-3,spark-3` behaves as one host rather than tearing it down
+    # twice concurrently.
+    seen = set()
+    hosts = [h for h in requested if not (h in seen or seen.add(h))]
+    return hosts, None
+
+def execute_teardown(target_hosts: list = None, force: bool = False) -> dict:
+    """
+    target_hosts=None still means every host, so existing callers that
+    pass nothing are unchanged. The CLI no longer reaches that default --
+    see resolve_teardown_hosts() for why it requires an explicit choice.
+
+    target_hosts=None (and --all) is checked against the reserved list too:
+    "tear down everything" includes the reserved host, and that is the case
+    where an unintended teardown costs most.
+    """
+    blocked = check_reserved_hosts(target_hosts, force, "tear down")
+    if blocked:
+        return {"status": "error", "message": blocked}
+
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
     if not acquired: return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
     try:
+        # Committing is unconditional and safe: _commit_session() no-ops
+        # when there is no real delta. Deactivating is NOT unconditional
+        # any more.
+        #
+        # SESSION_TRACKER is a single global instance with one self.model
+        # and one self.topo, so "the session" has always implicitly meant
+        # "the one thing the cluster is serving". Under a scoped teardown
+        # that assumption breaks: clearing `active` while another host is
+        # still serving blanks that model's live dashboard panel, resets
+        # its session duration, and -- worse -- opens a fresh
+        # inactive->active latch window in update(), which is exactly when
+        # a wrong model/topo pair gets frozen in for the next session.
+        #
+        # ACTIVE_DEPLOYMENT_STATE is the right thing to consult: it is
+        # per-host, already disk-backed, already read on every status
+        # poll, and _execute_teardown_impl clears the torn-down hosts from
+        # it in its own finally block. Reading it here costs one small
+        # JSON read and no SSH. Caveat worth knowing: it only records
+        # containers THIS orchestrator deployed, so anything started
+        # out-of-band on a surviving host is invisible to this check and
+        # will not hold the session open.
+        survivors = set(_load_active_deployment_state()) - set(
+            target_hosts if target_hosts else list(HOSTS.keys())
+        )
         SESSION_TRACKER._commit_session()
-        SESSION_TRACKER.active = False
+        if not survivors:
+            SESSION_TRACKER.active = False
         return _execute_teardown_impl(target_hosts=target_hosts)
     finally:
         CLUSTER_OP_LOCK.release()
 
-def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
+def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False, force: bool = False) -> dict:
     """Thread-safe public wrapper for cluster model deployments."""
+    # Checked before the lock and before any SSH: a refusal should be
+    # instant and should not make a queued caller wait on it. A deploy
+    # tears its target hosts down first, so deploying onto a reserved host
+    # destroys the thing it was reserved for -- the same protection
+    # teardown gets, applied at the other door into the same outcome.
+    #
+    # dry_run is deliberately NOT exempt. It reports what a real deploy
+    # would do, so it should report the refusal a real deploy would hit
+    # rather than printing a docker command that would in fact be blocked.
+    blocked = check_reserved_hosts(
+        deployment_target_hosts(nodes, head), force,
+        f"deploy {model!r} ({nodes}-node)"
+    )
+    if blocked:
+        return {"status": "error", "message": blocked}
+
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
     if not acquired: return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
     try:
@@ -3423,7 +3652,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     if nodes not in (1, 2): return {"status": "error", "message": f"Invalid 'nodes' value {nodes!r}: must be 1 or 2."}
     if head not in HOSTS: return {"status": "error", "message": f"Invalid 'head' value {head!r}: must be one of {list(HOSTS.keys())}."}
 
-    target_hosts = [PRIMARY_HOST, SECONDARY_HOST] if nodes == 2 else [head]
+    target_hosts = deployment_target_hosts(nodes, head)
     catalog_resp = load_model_catalog()
     models_catalog = catalog_resp.get("catalog", {}).get("models", {})
 
@@ -3879,11 +4108,21 @@ def interactive_menu():
 
         selected_topo = topo_keys[int(t_choice) - 1]
         nodes = 2 if selected_topo == "2_node" else 1
-        head = PRIMARY_HOST
+        head = resolve_deploy_head(None, nodes)
 
         if nodes == 1:
-            h_choice = input(f"Target head node for 1-node deploy (1: {PRIMARY_HOST}, 2: {SECONDARY_HOST}) [1]: ").strip()
-            if h_choice == "2": head = SECONDARY_HOST
+            # Offer the hosts in cluster_config.yaml order but default to
+            # the scratch node, and say which hosts are reserved rather
+            # than letting someone pick one and hit a refusal afterwards.
+            options = list(HOSTS.keys())
+            labels = ", ".join(
+                f"{i + 1}: {h}{' [reserved]' if h in RESERVED_HOSTS else ''}"
+                for i, h in enumerate(options)
+            )
+            default_idx = options.index(head) + 1 if head in options else 1
+            h_choice = input(f"Target host for 1-node deploy ({labels}) [{default_idx}]: ").strip()
+            if h_choice.isdigit() and 1 <= int(h_choice) <= len(options):
+                head = options[int(h_choice) - 1]
 
         user_name = os.environ.get("USER") or getpass.getuser()
         user_id = input(f"Enter User ID / Auditor [{user_name}]: ").strip() or user_name
@@ -3909,16 +4148,31 @@ if HAS_FASTAPI:
     class DeployRequest(BaseModel):
         model: str
         nodes: Literal[1, 2]
-        head: str = PRIMARY_HOST
+        # None resolves by topology via resolve_deploy_head(): PRIMARY_HOST
+        # for 2-node, DEFAULT_DEPLOY_HOST for 1-node. An explicit host is
+        # still honoured as given.
+        head: Optional[str] = None
         user_id: str = "dashboard_user"
         wait: bool = False
         run_benchmark: bool = False
         dry_run: bool = False
+        # Deploying onto a reserved host takes deliberate intent.
+        force: bool = False
 
     class BenchmarkRequest(BaseModel):
         head: str = PRIMARY_HOST
         nodes: Literal[1, 2] = 2
         model: Optional[str] = None  # catalog key, threaded to benchmark.py --model-key for ledger join
+
+    class TeardownRequest(BaseModel):
+        # None means every host, preserving the existing body-less POST
+        # that index.html's teardownRuntimes() already sends -- the
+        # dashboard is untouched by this change. The CLI deliberately does
+        # NOT get that default; see resolve_teardown_hosts().
+        hosts: Optional[list[str]] = None
+        # Tearing down a reserved host takes deliberate intent. Applies to
+        # whole-cluster teardowns too, since hosts=None includes it.
+        force: bool = False
 
     class NetworkToggleRequest(BaseModel):
         offline: bool
@@ -3962,7 +4216,8 @@ if HAS_FASTAPI:
 
     @app.post("/api/deploy")
     def api_deploy(req: DeployRequest):
-        res = execute_deployment(req.model, req.nodes, req.head, req.user_id, wait=req.wait, run_benchmark=req.run_benchmark, dry_run=req.dry_run)
+        head = resolve_deploy_head(req.head, req.nodes)
+        res = execute_deployment(req.model, req.nodes, head, req.user_id, wait=req.wait, run_benchmark=req.run_benchmark, dry_run=req.dry_run, force=req.force)
         if res.get("status") not in ("success", "dry_run"): raise HTTPException(status_code=400, detail=res.get("message", "Deployment failed"))
         return res
 
@@ -3973,8 +4228,17 @@ if HAS_FASTAPI:
         return res
 
     @app.post("/api/teardown")
-    def api_teardown():
-        results = execute_teardown()
+    def api_teardown(req: TeardownRequest = TeardownRequest()):
+        # Validated the same way the CLI validates, so an unknown host name
+        # is a 400 rather than a 200 reporting a clean teardown of nothing.
+        # An omitted/None `hosts` keeps the whole-cluster behaviour that
+        # existing callers depend on.
+        target_hosts = None
+        if req.hosts is not None:
+            target_hosts, err = resolve_teardown_hosts(",".join(req.hosts), all_hosts=False)
+            if err:
+                raise HTTPException(status_code=400, detail=err)
+        results = execute_teardown(target_hosts=target_hosts, force=req.force)
         # execute_teardown() has two possible shapes: a top-level
         # {"status": "error", "message": ...} if it never even started
         # (e.g. CLUSTER_OP_LOCK busy -- see execute_teardown()'s own early
@@ -4119,14 +4383,19 @@ def main():
 
     subparsers.add_parser("daemon").add_argument("--port", type=int, default=5001)
     subparsers.add_parser("status")
-    subparsers.add_parser("teardown")
+    teardown_parser = subparsers.add_parser("teardown", help='Stop and remove vLLM/Ray runtimes. Requires an explicit scope: --host for one or more named nodes, --all for the whole cluster. There is deliberately no default -- see resolve_teardown_hosts().')
+    teardown_parser_scope = teardown_parser.add_mutually_exclusive_group(required=True)
+    teardown_parser_scope.add_argument("--host", default=None, help='Comma-delimited host name(s) to tear down, e.g. --host spark-4 or --host spark-3,spark-4. Unknown names are rejected rather than silently skipped.')
+    teardown_parser.add_argument("--force", action="store_true", help="Proceed even if a target host is marked reserved in cluster_config.yaml.")
+    teardown_parser_scope.add_argument("--all", action="store_true", dest="all_hosts", help='Tear down every host in the cluster (the old argument-free behaviour).')
     subparsers.add_parser("menu")
     subparsers.add_parser("cache-inventory", help="Read-only cache snapshot across the cluster. No deletion, safe against production.")
 
     deploy_parser = subparsers.add_parser("deploy")
     deploy_parser.add_argument("--model", required=True)
     deploy_parser.add_argument("--nodes", type=int, default=2, choices=[1, 2])
-    deploy_parser.add_argument("--head", default=PRIMARY_HOST)
+    deploy_parser.add_argument("--head", default=None, help="Default: {} for 2-node (head stays consistent across topologies), {} for 1-node.".format(PRIMARY_HOST, DEFAULT_DEPLOY_HOST))
+    deploy_parser.add_argument("--force", action="store_true", help="Proceed even if a target host is marked reserved in cluster_config.yaml.")
     deploy_parser.add_argument("--wait", action="store_true", help="Block until HTTP /health passes")
     deploy_parser.add_argument("--benchmark", action="store_true", help="Automatically run benchmark.py when ready")
     deploy_parser.add_argument("--dry-run", action="store_true", help="Print the docker run command(s) this deploy would send, without SSHing or executing anything")
@@ -4174,15 +4443,26 @@ def main():
     cli_parser = subparsers.add_parser("cli")
     cli_sub = cli_parser.add_subparsers(dest="cli_action")
 
-    for cmd in ["status", "teardown", "menu", "cache-inventory", "list-cached-models", "ipc-inventory"]:
+    for cmd in ["status", "menu", "cache-inventory", "list-cached-models", "ipc-inventory"]:
         cli_sub.add_parser(cmd)
+
+    # teardown is no longer in the loop above: it now takes a required
+    # scope flag, so it needs a real parser of its own. Kept byte-identical
+    # in shape to the top-level one so `teardown` and `cli teardown` can
+    # never drift apart.
+    cli_teardown = cli_sub.add_parser("teardown", help='Stop and remove vLLM/Ray runtimes. Requires an explicit scope: --host for one or more named nodes, --all for the whole cluster. There is deliberately no default -- see resolve_teardown_hosts().')
+    cli_teardown_scope = cli_teardown.add_mutually_exclusive_group(required=True)
+    cli_teardown_scope.add_argument("--host", default=None, help='Comma-delimited host name(s) to tear down, e.g. --host spark-4 or --host spark-3,spark-4. Unknown names are rejected rather than silently skipped.')
+    cli_teardown.add_argument("--force", action="store_true", help="Proceed even if a target host is marked reserved in cluster_config.yaml.")
+    cli_teardown_scope.add_argument("--all", action="store_true", dest="all_hosts", help='Tear down every host in the cluster (the old argument-free behaviour).')
         
     cli_sub.add_parser("daemon").add_argument("--port", type=int, default=5001)
 
     cli_deploy = cli_sub.add_parser("deploy")
     cli_deploy.add_argument("--model", required=True)
     cli_deploy.add_argument("--nodes", type=int, default=2, choices=[1, 2])
-    cli_deploy.add_argument("--head", default=PRIMARY_HOST)
+    cli_deploy.add_argument("--head", default=None, help="Default: {} for 2-node (head stays consistent across topologies), {} for 1-node.".format(PRIMARY_HOST, DEFAULT_DEPLOY_HOST))
+    cli_deploy.add_argument("--force", action="store_true", help="Proceed even if a target host is marked reserved in cluster_config.yaml.")
     cli_deploy.add_argument("--wait", action="store_true")
     cli_deploy.add_argument("--benchmark", action="store_true")
     cli_deploy.add_argument("--dry-run", action="store_true", help="Print the docker run command(s) this deploy would send, without SSHing or executing anything")
@@ -4240,8 +4520,14 @@ def main():
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
     elif subcommand == "status": print(json.dumps(get_cluster_status(), indent=2))
-    elif subcommand == "teardown": print(json.dumps(execute_teardown(), indent=2))
-    elif subcommand == "deploy": print(json.dumps(execute_deployment(args.model, args.nodes, args.head, os.environ.get("USER") or getpass.getuser(), wait=getattr(args, "wait", False), run_benchmark=getattr(args, "benchmark", False), dry_run=getattr(args, "dry_run", False)), indent=2))
+    elif subcommand == "teardown":
+        hosts, err = resolve_teardown_hosts(getattr(args, "host", None), getattr(args, "all_hosts", False))
+        if err:
+            sys.exit(f"[-] {err}")
+        print(json.dumps(execute_teardown(target_hosts=hosts, force=getattr(args, "force", False)), indent=2))
+    elif subcommand == "deploy":
+        head = resolve_deploy_head(getattr(args, "head", None), args.nodes)
+        print(json.dumps(execute_deployment(args.model, args.nodes, head, os.environ.get("USER") or getpass.getuser(), wait=getattr(args, "wait", False), run_benchmark=getattr(args, "benchmark", False), dry_run=getattr(args, "dry_run", False), force=getattr(args, "force", False)), indent=2))
     elif subcommand == "logs": print("\n".join(get_container_logs(args.host, args.tail).get("logs", [])))
     elif subcommand == "authorize-key": print(json.dumps(authorize_user_key(args.key), indent=2))
     elif subcommand == "cache-inventory":

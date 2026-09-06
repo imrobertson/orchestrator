@@ -3,6 +3,27 @@ ssh_key_name: id_dgx_orchestrator
 default_image: nvcr.io/nvidia/vllm:26.07-py3
 gpu_util_ceiling: 0.75
 
+# Which host an unqualified 1-node operation lands on.
+#
+# Every "default host" used to resolve to the first entry under `hosts:`
+# below (dgx-orchestrator.py's PRIMARY_HOST). That one variable was doing
+# two unrelated jobs: naming the structural head node for 2-node Ray
+# deploys and the telemetry-authoritative serving host, AND acting as the
+# fallback target for anything that didn't name a host explicitly. Those
+# pull in opposite directions as soon as one node holds something
+# long-lived -- the node you most want to stay authoritative is then also
+# the node a bare `deploy` would flatten.
+#
+# Setting this splits the two apart. It governs 1-node defaults only: a
+# 2-node deploy still puts the head on the first listed host, so the head
+# node stays consistent across topologies. Affects `deploy` with no
+# --head, tests/metest.py and ab_test.py with no --host, and the
+# interactive menu's default selection.
+#
+# Omit it entirely and everything falls back to the first active host,
+# i.e. the behaviour before this field existed.
+default_deploy_target: spark-3
+
 # Cluster-wide offline-mode switches. Set to 1 to force offline mode across
 # all models; toggled at runtime by /api/toggle-network. Moved here from
 # models.yaml's GLOBAL_HF_HUB_OFFLINE / GLOBAL_TRANSFORMERS_OFFLINE as part
@@ -63,6 +84,10 @@ tuning:
   crash_log_retention_days: 7
 
 hosts:
+  # Listed first, so this is PRIMARY_HOST: the head node of every 2-node
+  # Ray deploy and the host whose /metrics feed SESSION_TRACKER. Order
+  # here is load-bearing -- do not reorder without reading
+  # dgx-orchestrator.py's comment above PRIMARY_HOST.
   spark-4:
     alias: spark-9dbe
     role: head
@@ -70,6 +95,22 @@ hosts:
     backplane_ip: 192.168.99.2
     volume_mount: /home/tetrel/.cache/huggingface:/root/.cache/huggingface
     active: true
+    # Carries the resident hermes agent. Deploy and teardown both refuse
+    # to touch this host without --force, including whole-cluster
+    # teardowns (`--all`, and the dashboard's Teardown button, which posts
+    # no host list and therefore means "everything").
+    #
+    # A property of the NODE, not of any deployment: unlike `role` above,
+    # which describes this host's part in one particular topology, being
+    # reserved is a statement about what the machine is for. It stays
+    # meaningful under an N-node generalization where any node can be head
+    # or worker.
+    #
+    # Note this does NOT protect against a 2-node deploy being blocked
+    # rather than silently proceeding -- 2-node always spans both hosts,
+    # so any 2-node work needs --force and will take hermes down. That is
+    # intended: it should be a decision, not a surprise.
+    reserved: true
   spark-3:
     alias: spark-6e63
     role: worker

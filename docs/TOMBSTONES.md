@@ -46,6 +46,125 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+### 128. Head→worker state mirroring assumed the cluster only ever ran one deployment
+
+**Trap:** `_compute_cluster_status_impl()` mirrors the head host's model state
+onto the worker host's status row, gated only on both hosts being RUNNING and
+healthy:
+
+```python
+head_s = status_data["hosts"].get(PRIMARY_HOST)
+worker_s = status_data["hosts"].get(SECONDARY_HOST)
+if head_s and worker_s:
+    ...
+    if head_is_active and worker_is_healthy_runner:
+        worker_s["active_model"] = head_s["active_model"]
+        worker_s["model_status"] = head_s["model_status"]
+```
+
+That is correct for a Ray 2-node deploy, where the worker genuinely has no
+model of its own to report and inheriting the head's is the right answer. It
+is wrong for two INDEPENDENT 1-node deploys: both hosts are healthy, neither
+is the other's worker, and the mirror overwrites the SECONDARY host's
+`active_model`/`model_status`/`eta_*` with the PRIMARY host's. The dashboard
+then reports a model running on a node that is not running it.
+
+Display-level only — the ledger is unaffected, and `active_recipe_key`
+survives because it is only overwritten when falsy. But it is wrong at exactly
+the moment it matters: reading off which node is serving what while one node
+holds a resident service and the other is under test.
+
+Same root cause as #127: inferring deployment topology from host identity
+rather than reading the container role.
+
+**Fix:** Gate the mirror on the actual Ray roles, which are already carried on
+each host's status as `container_name` (set from `active_container` in
+`_finalize_host_status()`):
+
+```python
+if (head_s and worker_s
+        and head_s.get("container_name") == ContainerRole.HEAD
+        and worker_s.get("container_name") == ContainerRole.WORKER):
+```
+
+`HEAD`/`WORKER` exist only in a Ray deploy; a `STANDALONE` on either host means
+the two are independent and nothing should be mirrored. Requiring both ends
+confines the mirror to the topology it was written for. Inner logic unchanged.
+
+---
+
+### 127. Cluster topology derived by counting hosts, poisoning model_ledger.json with fabricated `::2_node` keys
+
+**Trap:** Two sites derived topology by counting how many hosts had a container:
+
+```python
+topo = "2_node" if len([h for h, i in container_info.items()
+                        if i.get("active_container") != "None"]) > 1 else "1_node"
+```
+
+- `_compute_cluster_status_impl()` — feeds `SESSION_TRACKER.update()` on the
+  4-second status poll. **This is the live ledger write path.**
+- `_detect_live_model_topo_metrics()` — used by argument-free `correct-ledger`
+  to decide which key it is about to overwrite.
+
+Two independent 1-node deploys therefore read as `2_node`. That is not a
+cosmetic mislabel, because of how the tracker latches:
+
+`SessionTracker.update()` sets `self.model` and `self.topo` ONLY on the
+inactive→active transition, and freezes them for the life of the session — the
+`elif self.active` branch merely bumps `last_active_ts`. Sessions go inactive
+from exactly three places: 600s idle, `execute_teardown()`, and
+`_execute_deployment_impl()`'s pre-deploy step. So every teardown and every
+deploy opens a fresh latch window.
+
+If traffic then moves while both hosts have containers, the session latches
+`2_node` and commits every subsequent flush under a fabricated
+`<model>::2_node` key. `_load_last_seen_raw()` finds no checkpoint under that
+key, re-baselines to the current cumulative counters, and the model's real
+history is stranded on its `::1_node` key while a partial duplicate accumulates
+alongside it. Two incomplete entries for one model, neither correct.
+
+`correct-ledger` with no arguments, run while two containers were up, used the
+same bad heuristic to pick which key to repair — so the recovery path could
+write to the wrong entry too.
+
+Aggravating factor: host-scoped teardown (landed in the same change) INCREASES
+the poisoning rate rather than reducing it, since its whole purpose is repeated
+deploy/teardown cycles on one node while the other stays up — precisely the
+latch window.
+
+`_finalize_host_status()` had always used the correct role-based form. This was
+drift at two sites, not a missing idea.
+
+**Fix:** Derive from the SERVING host's own container role at both sites,
+reusing `serving_active_container` (already computed in
+`_compute_cluster_status_impl`; newly assigned in
+`_detect_live_model_topo_metrics`):
+
+```python
+topo = "2_node" if serving_active_container in (ContainerRole.HEAD, ContainerRole.WORKER) else "1_node"
+```
+
+`HEAD`/`WORKER` exist only in a Ray 2-node deploy; a `STANDALONE` container is
+1-node by definition regardless of what any other host is doing.
+
+Paired with a survivor gate in `execute_teardown()`, which now clears
+`SESSION_TRACKER.active` only when no host recorded in
+`ACTIVE_DEPLOYMENT_STATE` survives the teardown — so the latch window mostly
+never opens in the first place. `_commit_session()` remains unconditional (it
+no-ops on zero delta).
+
+**Not fixed here:** `SESSION_TRACKER` holds a single `self.model`/`self.topo`
+pair, and `serving_host` picks the first host in `HOSTS` order with a
+`STANDALONE`/`HEAD` container. With two models serving, one of them is simply
+not tracked. That is under-counting rather than corruption — recoverable via
+`correct-ledger`, which a fabricated key was not. Tracked separately in
+`BACKLOG-session-tracker-multi-model.md`.
+
+**Audit still owed:** grep `model_ledger.json` for `::2_node` keys belonging to
+models whose recipe defines no `2_node` topology. Any such key is fabricated
+and its counterpart `::1_node` entry is missing the corresponding tokens.
+
 ### 126. Closing the deep dive past #125: the actual TP0/TP1 divergence trigger was never confirmed, but a real, durable, model-independent structural fragility in FlashInfer's tuning architecture was -- traced until it hit a JIT-compiled-extension wall. Recorded for its transferable value, not because `llama-4-fp8` needed it
 
 * **The Trap:** #125 closed the EP hypothesis but left the actual cause of

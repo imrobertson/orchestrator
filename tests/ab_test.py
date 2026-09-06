@@ -128,7 +128,13 @@ _REPO_ROOT = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent.parent))
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from common.config import BASE_DIR, legacy_hosts_dict, load_cluster_config
+from common.config import (
+    BASE_DIR,
+    default_deploy_target,
+    legacy_hosts_dict,
+    load_cluster_config,
+    reserved_hosts,
+)
 from common.constants import ContainerRole
 from common.recipes import load_recipes
 from common.ssh import run_ssh
@@ -142,6 +148,16 @@ PRIMARY_HOST = next(iter(HOSTS), None)
 # fix below needs to touch the same hosts the deploy step will actually
 # use, not redefine that set independently. TOMBSTONES.md #106.
 SECONDARY_HOST = list(HOSTS.keys())[1] if len(HOSTS) > 1 else PRIMARY_HOST
+
+# Where an ab_test run lands when --host isn't given. Previously this was
+# PRIMARY_HOST, which is also the head node for 2-node deploys and the
+# telemetry-authoritative serving host -- so on a cluster where that node
+# holds something long-lived, a bare `ab_test.py` would deploy straight
+# over it. DEFAULT_DEPLOY_HOST is cluster_config.yaml's
+# default_deploy_target when set, and falls back to PRIMARY_HOST when it
+# isn't, so this is a no-op for any config that hasn't opted in.
+DEFAULT_DEPLOY_HOST = default_deploy_target() or PRIMARY_HOST
+RESERVED_HOSTS = reserved_hosts()
 
 # Legacy constants -- only referenced by KNOWN_PRESETS now. A from-scratch
 # ad-hoc or raw-docker variant sources every one of these from --a-*/--b-*
@@ -577,8 +593,22 @@ def run_benchmark_suite(side: str, label: str, ip: str, model_key: str, args) ->
     return any_ok
 
 
-def teardown() -> None:
-    subprocess.run([sys.executable, "dgx-orchestrator.py", "cli", "teardown"],
+def teardown(host: str) -> None:
+    """
+    Scoped to the single host this run deploys to, NOT the whole cluster.
+
+    Two reasons this had to change. The mechanical one: `cli teardown` now
+    requires an explicit --host or --all, so the old argument-free call
+    would fail outright. The substantive one: an A/B run on one Spark has
+    no business removing containers from the other. That was always true
+    in principle and merely harmless while the cluster ran one model at a
+    time; it stops being harmless the moment something long-lived is
+    resident on the other node.
+
+    ab_test only ever deploys 1-node (see run_stage), so the host it
+    deployed to is the complete set of hosts it should clean up.
+    """
+    subprocess.run([sys.executable, "dgx-orchestrator.py", "cli", "teardown", "--host", host],
                     cwd=str(BASE_DIR), capture_output=True, text=True, timeout=120)
 
 
@@ -953,7 +983,7 @@ def run_stage(side: str, spec: dict, args, cfg, host: str, ip: str, user: str) -
     finally:
         if not args.keep:
             print(f"\n--- tearing down after '{composed}' ---")
-            teardown()
+            teardown(host)
             if recipe_path is not None:
                 try:
                     recipe_path.unlink(missing_ok=True)
@@ -993,7 +1023,7 @@ def main() -> int:
 
 def _run(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--host", default=None, help="Default: cluster's primary host (%s)" % PRIMARY_HOST)
+    parser.add_argument("--host", default=None, help="Target host for this run. Default: %s" % DEFAULT_DEPLOY_HOST)
 
     for side in ("a", "b"):
         S = side.upper()
@@ -1049,7 +1079,17 @@ def _run(argv: list[str]) -> int:
         return 2
 
     cfg = load_cluster_config()
-    host = args.host or PRIMARY_HOST
+    host = args.host or DEFAULT_DEPLOY_HOST
+    # ab_test deploys and tears down, so it inherits the orchestrator's
+    # reserved-host rule. Refusing here rather than letting the deploy fail
+    # deeper in keeps the message specific and costs nothing -- ab_test has
+    # no --force of its own by design: forcing a run onto a reserved host
+    # should be a deliberate `dgx-orchestrator.py deploy --force`, not a
+    # flag that ends up in a benchmark script's saved invocation.
+    if host in RESERVED_HOSTS:
+        print(f"[-] Refusing to run against {host}: marked reserved in cluster_config.yaml. "
+              f"Pass --host explicitly to target a different node.")
+        return 2
     if host not in HOSTS:
         print(f"[!] Unknown host {host!r}. Known hosts: {list(HOSTS)}", file=sys.stderr)
         return 2
@@ -1081,7 +1121,7 @@ def _run(argv: list[str]) -> int:
             except KeyboardInterrupt:
                 print(f"\n[!] Interrupted during '{side}:{spec['label']}' (repeat {repeat_idx}/{args.repeats}) -- tearing down before exit.")
                 if not args.keep:
-                    teardown()
+                    teardown(host)
                 raise
             # Snapshot SUMMARY[side] before the next repeat overwrites it --
             # run_stage() resets SUMMARY[side] at its own start, so without
