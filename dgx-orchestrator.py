@@ -19,7 +19,7 @@ import datetime
 # is what actually answers "did my push/pull/restart take" now -- it's
 # derived, not typed, so it can't be forgotten the way this slug already
 # has been.
-ORCHESTRATOR_VERSION_SLUG = "2026-08-28-primary-secondary-host-refactor"
+ORCHESTRATOR_VERSION_SLUG = "2026-09-06-reserved-hosts-scoped-teardown"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
