@@ -21,16 +21,34 @@ To perform operations, your credentials must be configured.
 dgx-config authorize-key --key ~/.ssh/id_ed25519.pub
 
 
+== Reserved Hosts ==
+
+A host can be marked `reserved: true` in `cluster_config.yaml` when it carries something that must not be disturbed by routine work — a resident agent, a shared endpoint the team depends on. '''Deploy and teardown both refuse to touch a reserved host without `--force`.'''
+
+This is why a bare `dgx-config teardown --all` can come back with a refusal rather than doing anything: "everything" includes the reserved host. Same for the dashboard's Teardown button, which posts no host list and therefore means the whole cluster — expect it to show a refusal in the error banner while a reserved host is up. Use `--host <other-node>` to clear just the node you meant.
+
+Two things a reserved host does '''not''' protect against:
+* '''2-node deploys always span both hosts''', so any 2-node work needs `--force` and will take the reserved host's service down. That's intended — it should be a decision, not a surprise.
+* '''Raw `docker run` over SSH bypasses the orchestrator entirely''' and never sees this guard. `tests/ab_test.py` does its own check for that reason; anything hand-rolled won't.
+
+Which host is reserved is a property of the machine, not of any deployment — see the comments in `cluster_config.yaml` itself.
+
 == Deploying ==
 
 Use the dashboard or run `dgx-config deploy --model MODEL --nodes N`.
+
+'''Where it lands if you don't say:''' a 1-node deploy with no `--head` goes to `cluster_config.yaml`'s `default_deploy_target` (the scratch node). A 2-node deploy still puts the head on the first host listed under `hosts:`, so the head node stays the same across topologies. Pass `--head <node>` to override either. Add `--force` if the target is reserved and you mean it.
 
 Not sure a model/topology combo is valid, or want to sanity-check what will actually get sent before committing? Add `--dry-run` — prints the exact `docker run` command(s), no SSH connection made, nothing touched:
 
 dgx-config deploy --model MODEL --nodes N --dry-run
 
+Note that `--dry-run` is '''not''' exempt from the reserved-host check. It reports what a real deploy would do, so it reports the refusal a real deploy would hit rather than printing a command that would in fact be blocked.
+
 === Topology & Memory Guards ===
 When selecting a model in the dashboard, invalid topologies are automatically hidden based on the model's recipe (e.g., hiding 1-Node options for models whose recipe only defines a `2_node` topology) to prevent Out-Of-Memory (OOM) errors. If a valid 1-Node topology is selected, a secondary dropdown appears allowing you to target either `spark-4` or `spark-3`.
+
+Be aware that this dropdown auto-syncs to whichever host is currently serving, which is not necessarily the one you want to deploy to — if the serving host is reserved, the selector will keep landing on it and the deploy will be refused. Change it by hand, or use the CLI, which defaults to the scratch node.
 
 == Air-Gapped & Offline Operations ==
 
@@ -45,9 +63,17 @@ python3 cache_cluster_assets.py
 
 == Teardown ==
 
-Click "Teardown Runtimes" or run `dgx-config teardown`.
+Click "Teardown Runtimes", or run teardown with an explicit scope:
 
-'''Note:''' This is graceful, not instant. It sends SIGTERM to the engine and Ray inside each container, then `docker stop` (with a grace period), and only falls back to `docker rm -f` for anything still standing — this protects in-progress JIT compiles from corruption, which a hard kill can leave half-written. Expect it to take up to roughly a minute on a 2-node cluster; the dashboard's Teardown button shows live phase progress for the duration rather than a static "in progress" label. It also sweeps orphaned shared-memory segments left behind by Ray/vLLM on both hosts as its final step. While teardown (or a deploy) is running, the other dashboard controls lock to prevent a conflicting operation starting mid-flight.
+dgx-config teardown --host spark-3
+dgx-config teardown --host spark-3,spark-4
+dgx-config teardown --all
+
+'''There is no argument-free teardown any more.''' A bare `dgx-config teardown` exits with a usage error rather than clearing the cluster. That's deliberate: destroying every runtime should be something you typed on purpose, not something you got by default. An unrecognised host name is also an error listing the valid names, rather than a silent no-op that reports a clean teardown of nothing.
+
+'''Note:''' This is graceful, not instant. It sends SIGTERM to the engine and Ray inside each container, then `docker stop` (with a grace period), and only falls back to `docker rm -f` for anything still standing — this protects in-progress JIT compiles from corruption, which a hard kill can leave half-written. Expect it to take up to roughly a minute on a 2-node cluster; the dashboard's Teardown button shows live phase progress for the duration rather than a static "in progress" label. It also sweeps orphaned shared-memory segments left behind by Ray/vLLM on the targeted hosts as its final step. While teardown (or a deploy) is running, the other dashboard controls lock to prevent a conflicting operation starting mid-flight.
+
+Tearing down one host leaves the other host's session tracking alone — the dashboard's session stats and the model ledger keep accruing for whatever is still serving, rather than resetting as they used to.
 
 == Performance Benchmarking ==
 
@@ -64,10 +90,12 @@ Skip the manual deploy/benchmark/teardown cycle — `tests/ab_test.py` does the 
 
 python3 tests/ab_test.py --variant-a recipe-one --variant-b recipe-two --prompts all
 
-Either side can be an existing recipe name, an existing recipe with fields overridden, or a fully ad-hoc config — see `tests/AB_TEST_USAGE.md` for the full reference. One thing worth knowing up front: an image with a non-default entrypoint (needs `--a-entrypoint`) can't go through mods, and can't use `--a-nodes 2` — that's a structural limit of the deploy path, not a flag you're missing.
+Either side can be an existing recipe name, an existing recipe with fields overridden, or a fully ad-hoc config — see `docs/AB_TEST_USAGE.md` for the full reference. Two things worth knowing up front: an image with a non-default entrypoint (needs `--a-entrypoint`) can't go through mods, and can't use `--a-nodes 2` — that's a structural limit of the deploy path, not a flag you're missing. And `--host` now defaults to the scratch node and refuses a reserved host outright, with no `--force` of its own.
 
 == If something looks wrong ==
 
 * '''Model dropdown totally empty''' (not just missing one model): a single malformed recipe file can currently break the whole catalog, not just itself. Worth flagging rather than assuming it's just slow to load — see `USERMANUAL.md`'s Troubleshooting section.
 * '''Dashboard frozen — same numbers for a long time:''' a stale backend computation is possible, not just a slow poll. Check `stale`/`stale_for_seconds` at the API level if you can, and flag it rather than assuming it'll clear itself — see `docs/TOMBSTONES.md` #76 for the history.
+* '''Teardown or deploy refused with "marked reserved":''' working as intended — see the Reserved Hosts section above. Re-run with `--force` if you actually mean it, or scope to the other host.
+* '''Dashboard session speed looks wrong while two models are serving:''' only one host is tracked at a time. See `docs/BACKLOG-session-tracker-multi-model.md` — the numbers `benchmark.py` reports are unaffected.
 * '''Everything else:''' `USERMANUAL.md` has the fuller troubleshooting list; this page is deliberately just the fast path.

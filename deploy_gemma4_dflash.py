@@ -20,14 +20,27 @@ matching how every other model on this cluster is already handled via the
 shared HF cache mount -- no reason to special-case this one).
 
 It uses the literal `vllm-standalone` container name (ContainerRole.
-STANDALONE), so the normal `dgx-config teardown` / dashboard teardown
-button still finds and removes it correctly -- but it does NOT get
+STANDALONE), so `dgx-config teardown --host <node>` / the dashboard
+teardown button still find and remove it correctly -- but it does NOT get
 ACTIVE_DEPLOYMENT_STATE tracking or dashboard visibility the way a real
 recipe-driven deploy does, since it never goes through
 _execute_deployment_impl() at all.
 
-VALIDATED PERFORMANCE (2026-09-01, tests/metest.py --stage dflash
---repeats 4, pinned to the exact image/config this script now defaults
+That last point now cuts deeper than it used to. Because this script
+never reaches _execute_deployment_impl(), the orchestrator's own
+reserved-host guard never sees it either -- a raw `docker run` over SSH
+is invisible to a check that lives in execute_deployment(). The
+RESERVED_HOSTS check in main() below is therefore the ONLY thing standing
+between this script and clobbering a reserved host, which is why it runs
+before the pull rather than being left to any deploy path. There is
+deliberately no --force here: forcing work onto a reserved host should be
+an explicit act at the orchestrator, not a flag that ends up saved in
+someone's shell history for a one-off deploy script.
+
+VALIDATED PERFORMANCE (2026-09-01, measured with what was then
+tests/metest.py --stage dflash --repeats 4 -- that script has since been
+generalized and renamed to tests/ab_test.py, where the equivalent is
+`--variant-a gemma4-dflash --repeats 4`; metest.py no longer exists, pinned to the exact image/config this script now defaults
 to -- 4 independent fresh deploys per prompt, not repeated calls against
 one running container):
 
@@ -102,8 +115,10 @@ After a successful deploy, check health/logs the normal way:
     dgx-config logs spark-4
     curl http://<head-ip>:8000/health
 
-And tear down the normal way when you're done:
-    dgx-config teardown
+And tear down when you're done -- note that teardown now requires an
+explicit scope, so name the host this deployed to rather than clearing
+the whole cluster:
+    dgx-config teardown --host <node>
 """
 
 from __future__ import annotations
@@ -123,12 +138,27 @@ _REPO_ROOT = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from common.config import legacy_hosts_dict, load_cluster_config
+from common.config import (
+    default_deploy_target,
+    legacy_hosts_dict,
+    load_cluster_config,
+    reserved_hosts,
+)
 from common.constants import ContainerRole
 from common.ssh import run_ssh
 
 HOSTS = legacy_hosts_dict()
 PRIMARY_HOST = next(iter(HOSTS), None)
+
+# Where this lands when --host isn't given. Previously PRIMARY_HOST, which
+# is also the Ray head node and the telemetry-authoritative serving host --
+# so on a cluster where that node holds something long-lived, a bare run
+# of this script aimed straight at it. DEFAULT_DEPLOY_HOST is
+# cluster_config.yaml's default_deploy_target when set and falls back to
+# PRIMARY_HOST when it isn't, so this is a no-op for any config that
+# hasn't opted in.
+DEFAULT_DEPLOY_HOST = default_deploy_target() or PRIMARY_HOST
+RESERVED_HOSTS = reserved_hosts()
 
 LATEST_DFLASH_IMAGE = "ghcr.io/aeon-7/aeon-vllm-ultimate:latest"  # moving tag -- NOT what the validated numbers above were measured against; see docstring point 3
 VALIDATED_DFLASH_IMAGE = "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-06-18-v0.23.0-dflashfix"  # pinned -- this is what all 16 validated runs actually used
@@ -165,7 +195,11 @@ def wait_for_health(ip: str, port: int, timeout_sec: int, poll_interval: int = 1
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--host", default=None, help="Default: cluster's primary host (%s)" % PRIMARY_HOST)
+    parser.add_argument("--host", default=None,
+                         help="Target host for this deploy. Default: %s (cluster_config.yaml's "
+                              "default_deploy_target, falling back to the primary host). A host marked "
+                              "reserved: true is refused outright -- there is no --force here, by design."
+                              % DEFAULT_DEPLOY_HOST)
     parser.add_argument("--gpu-util", type=float, default=DEFAULT_GPU_UTIL, help=f"Default: {DEFAULT_GPU_UTIL} -- see module docstring point 1 before raising this")
     parser.add_argument("--num-speculative-tokens", type=int, default=DEFAULT_NUM_SPECULATIVE_TOKENS,
                          help=f"Default: {DEFAULT_NUM_SPECULATIVE_TOKENS} (AEON's own documented value). "
@@ -193,9 +227,30 @@ def main() -> int:
         return 2
 
     cfg = load_cluster_config()
-    host = args.host or PRIMARY_HOST
+    host = args.host or DEFAULT_DEPLOY_HOST
     if host not in HOSTS:
         print(f"[!] Unknown host {host!r}. Known hosts: {list(HOSTS)}", file=sys.stderr)
+        return 2
+
+    # See module docstring: this script bypasses the orchestrator entirely,
+    # so its reserved-host guard never fires for us. Check before the pull,
+    # not after -- a refusal should cost nothing, and a multi-GB image pull
+    # onto a host we're about to refuse is pure waste.
+    #
+    # Worth knowing what this protects against concretely: the docker run
+    # below claims the literal `vllm-standalone` name. On a host already
+    # serving something under that name, Docker rejects the name collision
+    # -- so the failure mode was a confusing conflict error rather than
+    # silent data loss. But it is still a deploy aimed at a machine someone
+    # marked hands-off, and the collision only saves you while the resident
+    # container happens to use the same name.
+    if host in RESERVED_HOSTS:
+        print(
+            f"[!] Refusing to deploy to {host!r}: marked reserved in cluster_config.yaml.\n"
+            f"    This script bypasses the orchestrator, so nothing else would have caught this.\n"
+            f"    Pass --host explicitly to target a different node.",
+            file=sys.stderr,
+        )
         return 2
     ip = HOSTS[host]["ip"]
     user = cfg.ssh_user
@@ -283,7 +338,7 @@ def main() -> int:
         print(
             f"[FAIL] never became healthy within {wait_timeout}s. Container is likely still running --\n"
             f"  check what happened: dgx-config logs {host}\n"
-            f"  and tear down if it's stuck: dgx-config teardown",
+            f"  and tear down if it's stuck: dgx-config teardown --host {host}",
             file=sys.stderr,
         )
         return 1
@@ -291,7 +346,7 @@ def main() -> int:
     print(
         f"\n[OK] healthy and serving on {host}:{cfg.ports['vllm_api']}\n"
         f"  logs:     dgx-config logs {host}\n"
-        f"  teardown: dgx-config teardown"
+        f"  teardown: dgx-config teardown --host {host}"
     )
     return 0
 
