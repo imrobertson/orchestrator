@@ -16,7 +16,7 @@ topologies:
     - OMP_NUM_THREADS=16
     - VLLM_CPU_OMP_THREADS=16
     vllm_args: >-
-      --trust-remote-code --kv-cache-dtype fp8 --language-model-only --speculative-config
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder --trust-remote-code --kv-cache-dtype fp8 --language-model-only --speculative-config
       '{"method":"qwen3_next_mtp","num_speculative_tokens":3}' --compilation-config '{"mode":
       0}'
   2_node:
@@ -33,5 +33,5 @@ topologies:
     - NCCL_SOCKET_IFNAME=enp1s0f0np0
     - GLOO_SOCKET_IFNAME=enp1s0f0np0
     vllm_args: >-
-      --distributed-executor-backend ray --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --language-model-only
+      --distributed-executor-backend ray --disable-custom-all-reduce --enable-auto-tool-choice --tool-call-parser qwen3_coder --trust-remote-code --kv-cache-dtype fp8 --language-model-only
       --compilation-config '{"mode": 0}' --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":3}'

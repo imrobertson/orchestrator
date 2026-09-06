@@ -1,0 +1,29 @@
+recipe_version: '1'
+# _TEST: HauhauCS 35B-A3B NVFP4, NO speculative decode.
+# Why: the MTP head (copied verbatim from the reference Qwen3.6-35B-A3B) has 0%
+# draft acceptance against the *uncensored* text weights -- the uncensoring
+# shifted the token distribution enough that the grafted drafter is 100% wrong.
+# It runs at 19.6 tps WITH the broken drafter (overhead only). This variant
+# strips --speculative-config to measure the clean A3B-MoE decode floor.
+hf_path: lyf/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-NVFP4
+image: eugr/spark-vllm-b12x:latest
+gpu_util: 0.75
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+notes: HauhauCS A3B NVFP4, no MTP (grafted MTP head has 0% acceptance vs uncensored weights).
+topologies:
+  1_node:
+    max_model_len: 262144
+    tp_size: 1
+    pp_size: 1
+    env_vars:
+    - OMP_NUM_THREADS=16
+    - VLLM_CPU_OMP_THREADS=16
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    vllm_args: >-
+      --trust-remote-code --kv-cache-dtype fp8 --language-model-only --reasoning-parser qwen3
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder --compilation-config '{"mode": 0}'
+      --max-num-seqs 8

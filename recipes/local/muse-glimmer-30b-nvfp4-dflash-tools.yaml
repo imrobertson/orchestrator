@@ -1,0 +1,52 @@
+recipe_version: '1'
+# _TEST: Muse-Glimmer-30B NVFP4 + DFlash spec decode + tool-calling wired.
+# Why this shape:
+#   - Tool-calling: the stock muse-glimmer-30b-nvfp4 recipe had NO
+#     --enable-auto-tool-choice / --tool-call-parser (would 400 on tool_choice).
+#     Added them. Parser `muse_glimmer` is registered in our vLLM build.
+#     Muse's native output uses role-tagged <|start|>...<|eot|> format; the
+#     muse_glimmer parser + reasoning-parser handle it.
+#   - Spec decode: Muse ships a DFlash block-diffusion drafter
+#     (meta-models/Muse-Glimmer-30B-assistant, 5.11 GB, block_size 16).
+#     Per the vllm recipes card + incoai/z-lab DFlash2 notes, the vLLM flag is
+#     --speculative-config '{"method":"dflash","model":"...","num_speculative_tokens":15}'.
+#     num_speculative_tokens=15 is the fixed value (block_size 16, slot 0
+#     re-presents the last accepted token). dflash IS in our build's spec-method
+#     list (confirmed).
+#   - RISK: DFlash drafter (5.11 GB) + NVFP4 model (25 GB) must both fit in
+#     121 GiB unified on 1 node. Should fit easily.
+#   - RISK: the DFlash drafter is distilled against the BF16 target; pairing
+#     with the NVFP4 target may reduce acceptance. Test empirically.
+#   - Sampling: Muse is a reasoning model; do NOT run greedy. temperature=1.0
+#     top_p=0.95 top_k=64 (per model card). The vLLM server default sampling
+#     should be fine for the OpenAI API; the recipe doesn't override.
+#   - The BF16 recipe (muse-glimmer-30b) already has tool-calling wired
+#     (muse_glimmer parser). This is the NVFP4 equivalent with spec decode added.
+#   - NOT YET TESTED. Deploy: 1_node, head spark-3.
+hf_path: Inferact/Muse-Glimmer-30B-NVFP4-W4A4
+image: eugr/spark-vllm-b12x:latest
+gpu_util: 0.75
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+notes: >-
+  Muse-Glimmer-30B NVFP4 with DFlash spec decode (num_speculative_tokens=15,
+  draft model meta-models/Muse-Glimmer-30B-assistant) + tool-calling wired
+  (muse_glimmer parser). NOT validated. See header for risks.
+topologies:
+  1_node:
+    max_model_len: 131072
+    tp_size: 1
+    pp_size: 1
+    env_vars:
+    - OMP_NUM_THREADS=16
+    - VLLM_CPU_OMP_THREADS=16
+    - VLLM_KV_CACHE_LAYOUT=BLHNC
+    vllm_args: >-
+      --trust-remote-code --kv-cache-dtype fp8 --enable-chunked-prefill
+      --enable-auto-tool-choice --tool-call-parser muse_glimmer
+      --reasoning-parser muse_glimmer --generation-config auto
+      --compilation-config '{"mode": 0}' --max-num-seqs 8
+      --speculative-config '{"method":"dflash","model":"meta-models/Muse-Glimmer-30B-assistant","num_speculative_tokens":15}'

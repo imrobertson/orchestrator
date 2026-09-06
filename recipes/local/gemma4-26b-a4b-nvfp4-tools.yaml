@@ -1,0 +1,20 @@
+recipe_version: '1'
+# _TEST: gemma4-26b-a4b + tool-calling wired. Stock recipe has no tool flags (400s on
+# tool_choice:auto). gemma4 engine parser available in this build. NOTE: this image is
+# eugr/spark-vllm:latest (NOT -b12x) due to the b12x Gemma4Proposer crash (see stock recipe).
+# Downloads on first deploy (~15GB).
+hf_path: nvidia/Gemma-4-26B-A4B-NVFP4
+image: eugr/spark-vllm:latest
+gpu_util: 0.75
+mods: []
+notes: tool-enabled test variant of gemma4-26b-a4b-nvfp4
+topologies:
+  1_node:
+    max_model_len: 32768
+    tp_size: 1
+    pp_size: 1
+    env_vars: []
+    vllm_args: >-
+      --quantization modelopt --kv-cache-dtype fp8 --moe-backend marlin --trust-remote-code
+      --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4
+      --speculative-config '{"method": "mtp", "model": "google/gemma-4-26B-A4B-it-assistant", "num_speculative_tokens": 2}'

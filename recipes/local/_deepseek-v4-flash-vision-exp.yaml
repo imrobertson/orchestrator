@@ -1,0 +1,87 @@
+recipe_version: '1'
+# ============================================================================
+# _TEST RECIPE (not validated -- do not promote). Created 2026-09-06.
+#
+# DeepSeek-V4-Flash-Vision-Exp -- the vision-capable V4-Flash (305B total,
+# ~168 GB checkpoint, MIT, deepseek-ai). Multimodal: adds MoonViT-class vision
+# understanding to V4-Flash while matching it on text agent tasks.
+#
+# WHY 2_NODE: the checkpoint is 48 shards / ~168 GB. A single GB10 node has
+# 121 GiB unified memory, so -- like the text DeepSeek-V4-Flash-0731 -- this
+# is a TENSOR-PARALLEL-2 deploy across the twin Sparks (10.0.14.41 + .43).
+# It is NOT a 1-node candidate.
+#
+# SOURCE / PROVENANCE (community, untrusted -- verified against the official
+# deepseek-ai HF card + recipes.vllm.ai, 2026-09-06):
+#   - Official vLLM run recipe (deepseek-ai/DeepSeek-V4-Flash-Vision-Exp):
+#       vllm/vllm-openai:deepseekv4-flash-vision  (dedicated vision tag)
+#         --kv-cache-dtype fp8 --block-size 256 --tensor-parallel-size 4
+#         --enable-expert-parallel
+#         --tool-call-parser deepseek_v4 --enable-auto-tool-choice
+#         --reasoning-parser deepseek_v4
+#         --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}'
+#         --speculative-config '{"method":"dspark","model":"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","enable_adaptive_verification":true}'
+#     Verified on ONE GB200 NVL4 tray (TP4 + EP). We are GB10 x2 (TP2+EP), so
+#     the image + flag set is the reference; our TP is 2, not 4.
+#   - Image: I use our PROVEN hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d
+#     (the image that runs our validated 2-node text DS-V4-Flash dspark recipe at
+#     42-50 tps). It supports the `deepseek_v4` tokenizer-mode (confirmed in our
+#     working recipe) and the `dspark` spec method (confirmed in our build's
+#     --spec-method list). RISK: this image is unverified against the *vision*
+#     MoonViT encoder. If it lacks the vision path, fall back to the dedicated
+#     `vllm/vllm-openai:deepseekv4-flash-vision` tag.
+#
+# KNOWN RISKS (test in the morning; NOT validated tonight):
+#   1. Vision encoder support in the hazyumps image is UNCONFIRMED. The official
+#      doc uses a purpose-built `deepseekv4-flash-vision` vLLM tag. If the
+#      hazyumps image 400s / fails to load the vision tower, switch `image:`
+#      to that tag and re-test.
+#   2. dspark self-drafting: official recipe sets the draft model = the same
+#      checkpoint ("model" field). This build REJECTS a separate
+#      `--speculative-model` flag (confirmed: our nemotron-3.5 recipe crashed on
+#      exactly that). The vision recipe keeps dspark in `--speculative-config`
+#      only (no --speculative-model), which is the supported path.
+#   3. num_speculative_tokens: official=3. Our text DS-V4-Flash uses 5 (greedy).
+#      Start at 3 (community value for this model); bump to 5 only if acceptance
+#      metrics justify it.
+#   4. Memory: 168 GB across 2 nodes = 84 GB/node + KV. gpu_util 0.80 (matches
+#      our proven text dspark recipe) should fit; drop max_model_len if OOM.
+# ============================================================================
+hf_path: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+image: hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d
+gpu_util: 0.80
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+notes: >-
+  Vision-capable V4-Flash (2-node, TP2+EP). NOT validated. Uses our proven
+  hazyumps GB10 image; fall back to vllm/vllm-openai:deepseekv4-flash-vision if
+  the MoonViT vision tower fails to load. See recipe header for risks.
+topologies:
+  2_node:
+    max_model_len: 131072
+    tp_size: 2
+    pp_size: 1
+    env_vars:
+    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+    - OMP_NUM_THREADS=16
+    - NCCL_CUMEM_ENABLE=0
+    - NCCL_IB_GID_INDEX=3
+    - NCCL_SOCKET_IFNAME=enp1s0f0np0
+    - GLOO_SOCKET_IFNAME=enp1s0f0np0
+    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=7200
+    - VLLM_RPC_TIMEOUT=7200
+    - GLOO_TIMEOUT=7200
+    - TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=7200
+    - TORCH_GLOO_TIMEOUT_SECONDS=7200
+    - NCCL_COMM_TIMEOUT=7200
+    vllm_args: >-
+      --trust-remote-code --kv-cache-dtype fp8 --block-size 256
+      --tokenizer-mode deepseek_v4 --distributed-executor-backend ray
+      --enable-expert-parallel --tool-call-parser deepseek_v4
+      --enable-auto-tool-choice --reasoning-parser deepseek_v4
+      --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}'
+      --max-num-seqs 2 --enable-prefix-caching
+      --speculative-config '{"method":"dspark","model":"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp","num_speculative_tokens":3,"draft_sample_method":"probabilistic","enable_adaptive_verification":true}'

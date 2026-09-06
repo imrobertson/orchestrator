@@ -72,7 +72,12 @@ def run_benchmark_pass(host: str, port: int, model_id: str, prompt: str, max_tok
                     # reasoning_content, not content. Counting only `content`
                     # means TTFT never fires during the reasoning block, and
                     # a fully-reasoning response reports decode_tps == 0.0.
-                    if delta.get("content") or delta.get("reasoning_content"):
+                    # Qwen3.5/3.6 (and other thinking models) stream their chain-of-thought
+                    # into a separate 'reasoning' delta key (NOT 'reasoning_content').
+                    # Omitting it makes first-token detection never fire for
+                    # overthinking models -> decode_tps reports 0.0. Added 'reasoning'
+                    # 2026-09-05 (sweep: Qwen3.8-27B + 35B-A3B both reported 0.0 before).
+                    if any(delta.get(k) for k in ("content", "reasoning_content", "reasoning")):
                         if first_token_time is None:
                             first_token_time = time.perf_counter()
                         chunk_count += 1
