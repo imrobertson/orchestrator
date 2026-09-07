@@ -1,0 +1,127 @@
+recipe_version: '1'
+# GLM-5.3-Flash NVFP4 (RedHatAI) on 2-node TP2
+#
+# 320B total / 18B active MoE, hybrid KDA-linear-attention + DeepSeek-sparse-MLA,
+# 1M native context. Weight-only NVFP4 from RedHatAI (W4A4 compressed-tensors) —
+# the current default checkpoint. LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt
+# token corruption (vLLM #54150); RedHatAI is uncorrupted and loads ~2x faster
+# (11 large shards vs 120 small).
+#
+# Performance targets on 2x DGX Spark (community benchmarks):
+#   - fp8 KV + MTP-4: ~21.8 tok/s, 507K KV pool (tonyd2wild)
+#   - fp8 KV + DFlash2: 46.9 tok/s, 74.1% acceptance, 581K KV (tonyd2wild)
+#   - 4-node TP4: 68.5 tok/s (sibling repo, not tested on 2-node)
+#   - TTFT: ~0.24 s (greedy, no spec)
+#
+# Sources:
+#   - Nvidia forum: tonyd2wild TP2 deploy with 7 day-0 bugs fixed:
+#     github.com/tonyd2wild/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark
+#   - RedHatAI official vLLM serving (MTP, glm47 parser):
+#     huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4
+#   - LibertAIDAI NVFP4 quant (corrupted — DO NOT USE):
+#     huggingface.co/LibertAIDAI/GLM-5.3-Flash-NVFP4
+#
+# IMAGE: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8
+#   Built on vllm/vllm-openai:glm53-flash-arm64-cu130 (base vLLM 0.1.dev20051)
+#   with 5 patches that are required for GLM-5.3 on SM121:
+#   1. SM90 NoPE sparse-MLA extended to SM121 (FlashInfer FA2 kernel)
+#      — the stock SM120 backend requires pe_dim=64; GLM's NoPE has pe_dim=0
+#   2. FlashInfer upgraded to 0.6.18 nightly (0.6.17 produces NaN on 64–256-row
+#      batches on SM121, which covers normal prompt sizes)
+#   3. NCCL pinned to 2.30.7 (nightly silently downgraded to 2.29.7, breaks IB)
+#   4. nvidia-cutlass-dsl pinned to 4.6.2 (nightly left mixed 4.7.0/4.6.2,
+#      CuTeDSL warmup ICE at ~91% model load)
+#   5. PDL disabled on SM12x + top-k indexer hardening (uninitialized kpool
+#      → NaN lottery, vLLM #51562 class issue)
+#
+# PATCH STATUS:
+#   All 5 patches are baked into the sm121-v8 image. No overlay mounts needed.
+#   The image is pullable from GHCR with zero auth.
+#
+# WEIGHTS: huggingface-cli download RedHatAI/GLM-5.3-Flash-NVFP4
+#   --local-dir /var/tmp/glm-5.3-flash-nvfp4
+#   Download to BOTH spark-3 and spark-4 (or NFS-export from head).
+#   ~169 GB (11 safetensors files). ~14 min total boot (10 min weights + ~2.5 min).
+#
+# MAX CONTEXT NOTE:
+#   At fp8 KV + gmu 0.85, the KV pool is ~507K tokens (with MTP active) to
+#   ~700K+ (without MTP). With max_model_len 524288 and max_num_seqs 2, two
+#   full-length concurrent requests would need ~1M tokens — exceeds the fp8
+#   budget. For 512K context, max ~1 concurrent full-length request. For
+#   max_num_seqs 4, use max_model_len 262144 (262K) instead.
+#
+# DEPLOY SEQUENCE:
+#   Worker first (spark-4), confirm it's Up, THEN head (spark-3). Never let
+#   a new rank rendezvous with a dying one. Full teardown of both before
+#   either relaunch. Capture docker logs before rm -f.
+#
+# KNOWN GB10/SM121 issues (all resolved by the image):
+#   - decode-time top-k hard-kills past ~24K (Patch 1: FA2 kernel)
+#   - FlashInfer 0.6.17 NaN on 64–256-row batches (Patch 2: 0.6.18 nightly)
+#   - NCCL 2.29.x IB failure (Patch 3: pinned 2.30.7)
+#   - CuTeDSL ICE at 91% load (Patch 4: cutlass-dsl 4.6.2)
+#   - PDL race + uninitialized kpool (Patch 5: PDL disabled, indexer hardened)
+hf_path: RedHatAI/GLM-5.3-Flash-NVFP4
+image: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8
+gpu_util: 0.85
+notes: |
+  LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt token corruption (vLLM #54150) — use RedHatAI/GLM-5.3-Flash-NVFP4 instead.
+  KV pool ~507K at fp8 + gmu 0.85 with MTP active; two concurrent 512K requests exceeds budget — max 1 full-length at a time.
+  Not applicable: Tombstone #38 (Marlin MXFP4 KeyError) only affects mixed-precision activations; this is weight-only NVFP4.
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+topologies:
+  2_node:
+    # Tensor-parallel 2 across two GB10 (128 GB unified each, CX-7 twin 200GbE).
+    #
+    # KV cache: fp8 (~5.95 bytes/token vs 11.9 for bf16). At gmu 0.85, ~7.2 GB
+    # available for KV → ~507K tokens with MTP active, ~700K+ without MTP.
+    #
+    # --block-size 2304: Community-verified (tonyd2wild). The block aligner
+    #   picks 2176 on this backend; DeepGEMM paged-MQA on arch-12 fp8 accepts
+    #   only 64-entry pool pages. 2304 is a multiple of both 256 (kpool·64) and
+    #   128 (MLA alignment), and the aligner pads the mamba page ~6% to match.
+    #
+    # --moe-backend marlin: Verified on sm_121 by tonyd2wild. FLASHINFER_CUTLASS
+    #   also runs but marlin was kept for the validated final config.
+    #
+    # --speculative-config with MTP-5: GLM-5.3's native MTP draft head.
+    #   Zero extra VRAM beyond the main model. num_spec=5 matches RedHatAI's
+    #   official config; tonyd2wild measured mean acceptance 37–47%.
+    #
+    # --tool-call-parser glm47: GLM-5.x uses a different tool format than
+    #   GLM-4.x. Using `glm` silently swallows the tool call output (returns
+    #   finish_reason=stop with tool_calls=null). glm47 correctly parses the
+    #   GLM-4.5+ format.
+    #
+    # --reasoning-parser glm45: extracts chain-of-thought into the reasoning
+    #   field. Disable per-request with chat_template_kwargs: {"enable_thinking": false}.
+    #
+    # --enable-prefix-caching: RedHatAI recommends this for GLM-5.3.
+    max_model_len: 524288
+    tp_size: 2
+    pp_size: 1
+    env_vars:
+    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
+    - OMP_NUM_THREADS=16
+    - NCCL_CUMEM_ENABLE=0
+    - NCCL_IB_GID_INDEX=3
+    - NCCL_SOCKET_IFNAME=enp1s0f0np0
+    - GLOO_SOCKET_IFNAME=enp1s0f0np0
+    - VLLM_ENGINE_INITIALIZATION_TIMEOUT=7200
+    - VLLM_RPC_TIMEOUT=7200
+    - GLOO_TIMEOUT=7200
+    - TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=7200
+    - TORCH_GLOO_TIMEOUT_SECONDS=7200
+    - NCCL_COMM_TIMEOUT=7200
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    vllm_args: >-
+      --trust-remote-code --kv-cache-dtype fp8
+      --distributed-executor-backend ray --tool-call-parser glm47
+      --enable-auto-tool-choice --reasoning-parser glm45 --block-size 2304
+      --moe-backend marlin
+      --max-num-seqs 2
+      --speculative-config '{"method":"mtp","num_speculative_tokens":5}'
