@@ -4312,6 +4312,26 @@ def interactive_menu():
         if confirm == 'y':
             print(f"[+] Launching deployment sequence for {selected_model}...")
             res = execute_deployment(selected_model, nodes, head, user_id, wait=do_wait, run_benchmark=do_bench)
+
+            # execute_deployment() defaults force=False and this menu never
+            # passed it, so a reserved-host refusal used to be a dead end --
+            # the operator could not force from here at all and had to drop
+            # to `dgx-config deploy --force` directly. This mirrors the
+            # dashboard's per-action confirm dialog: show the server's own
+            # refusal message (names the host and what's running on it),
+            # require an explicit y/N, and force only this one retry -- no
+            # persistent flag, same reasoning as openForceDialog() in
+            # index.html.
+            if res.get("status") == "error" and res.get("code") == "reserved_host":
+                print(f"\n[!] {res.get('message', 'Refused: target host is reserved.')}")
+                force_choice = input("Proceed anyway and tear down the reserved host? (y/N): ").strip().lower()
+                if force_choice == 'y':
+                    print(f"[+] Re-launching with --force...")
+                    res = execute_deployment(selected_model, nodes, head, user_id, wait=do_wait, run_benchmark=do_bench, force=True)
+                else:
+                    print("[-] Deploy cancelled. Reserved host untouched.")
+                    return
+
             print(json.dumps(res, indent=2))
     except (IndexError, ValueError) as e:
         print(f"[-] Invalid selection: {e}")

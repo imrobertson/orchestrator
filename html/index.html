@@ -1568,7 +1568,23 @@
             nodes = recipe?.topologies?.['2_node'] ? 2 : 1;
         }
 
-        const head = document.getElementById('headSelect').value;
+        // headSelect is hidden (display:none) for a 2-node deploy -- see
+        // updateDeployTargetControls()'s showHead -- but the <select>
+        // element still carries whatever value it last had from a 1-node
+        // selection, defaulting to default_deploy_target (the scratch
+        // node) the moment it's built. Reading it unconditionally and
+        // always sending it as 'head' meant a 2-node deploy silently sent
+        // an explicit override every time: resolve_deploy_head() on the
+        // server treats any truthy head as "the operator asked for this
+        // host" and skips its own PRIMARY_HOST-for-2-node default
+        // entirely. That's how a 2-node deploy could end up headed on the
+        // scratch node instead of PRIMARY_HOST with no error and no
+        // visible cause. Only send head when the picker is actually the
+        // thing the operator used to choose a target -- i.e. not 2-node --
+        // and let the server apply its own topology-aware default
+        // otherwise.
+        const headSelectValue = document.getElementById('headSelect').value;
+        const head = nodes === 2 ? null : headSelectValue;
         const user_id = document.getElementById('userIdInput').value;
         const checkEl = document.getElementById('runBenchmarkCheck');
         const run_benchmark = checkEl ? checkEl.checked : false;
