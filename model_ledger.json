@@ -526,8 +526,56 @@
         "engine_init_sec": 14.21,
         "rank_count": 1,
         "unaccounted_sec": 6.347933000000012
+      },
+      {
+        "run_id": "1788711428-spark-4-3b113e7cf1e8",
+        "ts": 1788711428.0,
+        "outcome": "ready",
+        "config_hash": "a267042400f42967",
+        "total_sec": 253.590519,
+        "pre_load_sec": 27.237138,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 165.16,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 55.96,
+        "rank_count": 1,
+        "unaccounted_sec": 5.2333810000000085
+      },
+      {
+        "run_id": "1788728573-spark-4-11922b89714c",
+        "ts": 1788728573.0,
+        "outcome": "ready",
+        "config_hash": "a267042400f42967",
+        "total_sec": 323.870307,
+        "pre_load_sec": 37.84321,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 193.8,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 86.97,
+        "rank_count": 1,
+        "unaccounted_sec": 5.257097000000044
       }
-    ]
+    ],
+    "lifetime": {
+      "in": 3365704,
+      "out": 26097,
+      "draft": 26596,
+      "accepted": 17337
+    },
+    "last_seen_raw": {
+      "p": 16575125.0,
+      "g": 107249.0,
+      "d": 108062.0,
+      "a": 71335.0
+    }
   },
   "llama-3.3-70b::2_node": {
     "runs": [
@@ -1223,6 +1271,154 @@
         "engine_init_sec": 160.21,
         "rank_count": 3,
         "unaccounted_sec": 16.719902000000047
+      }
+    ]
+  },
+  "qwen-3.8-27b-nvfp4::2_node": {
+    "cached": [],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 392377,
+      "out": 14709,
+      "draft": 22291,
+      "accepted": 10276
+    },
+    "last_seen_raw": {
+      "p": 39065678.0,
+      "g": 480834.0,
+      "d": 690617.0,
+      "a": 343062.0
+    }
+  },
+  "gemma4-26b-a4b-nvfp4-tools::1_node": {
+    "runs": [
+      {
+        "run_id": "1788691469-spark-3-43189d737f71",
+        "ts": 1788691469.0,
+        "outcome": "ready",
+        "config_hash": "d3290352b9a20f99",
+        "total_sec": 228.857293,
+        "pre_load_sec": 29.803461,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 136.32000000000002,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": 0.5700000000000001,
+        "compile_stage_confidence": "reported_cache_possible",
+        "engine_init_sec": 52.98,
+        "rank_count": 1,
+        "unaccounted_sec": 9.183831999999995
+      }
+    ]
+  },
+  "qwen-3.6-35b-a3b-nvfp4::1_node": {
+    "cached": [
+      282
+    ],
+    "compiled": [],
+    "downloaded": [],
+    "lifetime": {
+      "in": 0,
+      "out": 0,
+      "draft": 0,
+      "accepted": 0
+    },
+    "runs": [
+      {
+        "run_id": "1788721779-spark-3-f224b9a15791",
+        "ts": 1788721779.0,
+        "outcome": "crashed",
+        "config_hash": "6dbd383e948a3cd3",
+        "total_sec": 92.205334,
+        "pre_load_sec": 29.369344,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": null,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": null,
+        "rank_count": 1,
+        "unaccounted_sec": 62.835989999999995
+      }
+    ]
+  },
+  "_qwen-3.6-35b-a3b-nvfp4-nothink::1_node": {
+    "runs": [
+      {
+        "run_id": "1788726408-spark-3-3199ab7e06be",
+        "ts": 1788726408.0,
+        "outcome": "crashed",
+        "config_hash": "5e88994bfe9613d2",
+        "total_sec": 207.760375,
+        "pre_load_sec": 31.249965,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 165.98,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": null,
+        "rank_count": 1,
+        "unaccounted_sec": 10.530410000000018
+      },
+      {
+        "run_id": "1788727067-spark-3-a5cffe19a3e8",
+        "ts": 1788727067.0,
+        "outcome": "crashed",
+        "config_hash": "f2cabdaa9ea4b750",
+        "total_sec": 287.105037,
+        "pre_load_sec": 24.574802,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 155.91,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 100.06,
+        "rank_count": 1,
+        "unaccounted_sec": 6.560234999999977
+      },
+      {
+        "run_id": "1788730133-spark-4-b45c8ada8b22",
+        "ts": 1788730133.0,
+        "outcome": "ready",
+        "config_hash": "f2cabdaa9ea4b750",
+        "total_sec": 275.278059,
+        "pre_load_sec": 27.607615,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 193.0,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 49.29,
+        "rank_count": 1,
+        "unaccounted_sec": 5.3804439999999545
+      },
+      {
+        "run_id": "1788732653-spark-4-b5a5772a3066",
+        "ts": 1788732653.0,
+        "outcome": "crashed",
+        "config_hash": "f2cabdaa9ea4b750",
+        "total_sec": 208.840794,
+        "pre_load_sec": 35.118084,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 164.75,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": null,
+        "rank_count": 1,
+        "unaccounted_sec": 8.972709999999978
       }
     ]
   }

@@ -1,0 +1,20 @@
+00:41:27 === SWEEP2 START ===
+00:41:27 === _qwen-3.6-35b-a3b-nvfp4 (base (n=3, moe auto)) ===
+00:41:27   teardown spark-3
+00:41:49   deploy _qwen-3.6-35b-a3b-nvfp4
+00:46:46   bench tps=68.6 ttft=0.11s
+00:47:01   agentic tool_ok=True coding=5/5 budget_reasoning=514
+00:47:01   recorded base (n=3, moe auto) tps=68.6 tool_ok=True coding=5/5
+00:47:01 === _qwen-3.6-35b-a3b-nvfp4-latency (moe-backend=latency + sm_121a) ===
+00:47:01   teardown spark-3
+00:47:24   deploy _qwen-3.6-35b-a3b-nvfp4-latency
+00:52:22   bench tps=62.8 ttft=0.12s
+00:52:37   agentic tool_ok=True coding=5/5 budget_reasoning=513
+00:52:37   recorded moe-backend=latency + sm_121a tps=62.8 tool_ok=True coding=5/5
+00:52:37 === _qwen-3.6-35b-a3b-nvfp4-mtp6 (MTP n=6 (deeper draft)) ===
+00:52:37   teardown spark-3
+00:52:59   deploy _qwen-3.6-35b-a3b-nvfp4-mtp6
+00:58:37   bench tps=55.9 ttft=0.12s
+00:58:53   agentic tool_ok=True coding=0/5 budget_reasoning=823
+00:58:53   recorded MTP n=6 (deeper draft) tps=55.9 tool_ok=True coding=0/5
+00:58:53 === SWEEP2 DONE ===
