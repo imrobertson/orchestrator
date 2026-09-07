@@ -81,6 +81,31 @@ image: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8
 # eugr/spark-vllm* and the nvcr default image (neither sets an
 # ENTRYPOINT). Quotes are required: bare `entrypoint:` parses as null.
 entrypoint: ""
+# Glm5NextProcessor.from_pretrained() (this image's custom GLM5-Next
+# processor code) does a bare `open(os.path.join(model_path,
+# "processor_config.json"))` -- no hub resolution, no cached_file(), just a
+# local directory read. hf_path above is a repo id string, exactly what
+# every other recipe passes to --model; this processor cannot resolve one
+# no matter what's cached, so a plain deploy fails with FileNotFoundError
+# on 'RedHatAI/GLM-5.3-Flash-NVFP4/processor_config.json' before the engine
+# ever loads a weight.
+#
+# model_path_override + extra_mounts together fix this: stage the weights
+# as a real directory on every target host (both spark-3 and spark-4, per
+# this recipe's own WEIGHTS section above and tonyd2wild's launcher), bind
+# it into the container at the path below, and point --model at that
+# container path instead of the repo id. hf_path above is UNCHANGED and
+# still what the ledger/dashboard/HF-cache bookkeeping treats as this
+# recipe's identity -- only the literal --model argv changes.
+#
+# REQUIRED MANUAL STEP before this recipe can deploy, on BOTH spark-3 and
+# spark-4 (the orchestrator does not do this automatically -- there is no
+# mods/prefetch hook for a path outside the shared HF cache mount):
+#   huggingface-cli download RedHatAI/GLM-5.3-Flash-NVFP4 \
+#     --local-dir /var/tmp/glm-5.3-flash-nvfp4
+model_path_override: /models/glm-5.3-flash-nvfp4
+extra_mounts:
+- /var/tmp/glm-5.3-flash-nvfp4:/models/glm-5.3-flash-nvfp4
 gpu_util: 0.85
 notes: |
   LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt token corruption (vLLM #54150) — use RedHatAI/GLM-5.3-Flash-NVFP4 instead.

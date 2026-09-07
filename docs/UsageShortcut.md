@@ -12,12 +12,13 @@ Go to `http://maestro:5000` or use `dgx-config menu` in the terminal.
 * '''Model status is now per host.''' Each host's `READY` reflects that host's own `/health`, not the cluster's. Before 2026-09-06 a non-serving host inherited the serving host's readiness, so a still-compiling (or dead) model on the second node displayed as READY — if you are reading old screenshots or old notes, that is why they disagree. See `docs/TOMBSTONES.md` #130.
 * '''User ID / Auditor Tracking:''' The input box defaults to `dashboard_user`. Type your identifier here to inject your identity into the Docker execution context. This is self-reported, not authenticated — it helps distinguish who ran what in casual review, but don't treat it as a verified audit trail.
 * '''Version Badge:''' The header, next to Server Time (shown in UTC), displays the currently-running orchestrator version. Useful for confirming a fix actually deployed rather than assuming it did.
+* '''Auto-run benchmark checkbox only appears when it can still do something.''' The checkbox is only shown while nothing is deployed or loading — that's the sole window where checking it does anything, since its value is captured once, at the moment Deploy is clicked. Once a deploy is sent, the checkbox is replaced by a status line ("Waiting for model to become ready — benchmark will run automatically...") reflecting whatever was actually decided; checking or unchecking anything during that window has no effect on the in-flight launch. See `docs/TOMBSTONES.md` #137.
 
 == Essential Secrets & Key Management ==
 
 To perform operations, your credentials must be configured.
 
-* '''HuggingFace Token:''' Ensure `~/docker/orchestrator/.secrets` exists and contains `HF_TOKEN="your_token"` to prevent authentication errors when pulling gated models. Alternatively, `export HF_TOKEN="your_token"` in your terminal before using the CLI.
+* '''HuggingFace Token:''' Ensure `~/docker/orchestrator/.secrets` exists and contains `HF_TOKEN="your_token"` to prevent authentication errors when pulling gated models. Alternatively, `export HF_TOKEN="your_token"` in your terminal before using the CLI. Note this file lives on `maestro` only — the Spark hosts (`spark-3`/`spark-4`) have no `~/docker/orchestrator` directory at all. If you need a token in a command run directly on a Spark host (e.g. a manual `docker run` for weight-staging), copy the value across explicitly rather than referencing the file path — it won't resolve.
 * '''SSH Keys:''' If operating directly on `maestro` (bypassing Tailscale SSO), authorize your personal SSH key once so the orchestrator can reach the Spark hosts on your behalf:
 
 dgx-config authorize-key --key ~/.ssh/id_ed25519.pub
@@ -27,10 +28,11 @@ dgx-config authorize-key --key ~/.ssh/id_ed25519.pub
 
 A host can be marked `reserved: true` in `cluster_config.yaml` when it carries something that must not be disturbed by routine work — a resident agent, a shared endpoint the team depends on. '''Deploy and teardown both refuse to touch a reserved host unless you explicitly override.''' How you override depends on which surface you're on:
 
-* '''CLI:''' pass `--force`. The refusal message names the host and what is recorded as running on it, and tells you this.
+* '''CLI (non-interactive):''' pass `--force` to `dgx-config deploy`/`dgx-config teardown` directly. The refusal message names the host and what is recorded as running on it, and tells you this.
+* '''CLI (`dgx-config menu`):''' hitting a reserved-host refusal from the interactive menu now prints that same server refusal message and asks a plain y/N before retrying with the override — you don't need to already know to drop to the non-interactive `--force` form. Before this, the menu had no path past the refusal at all and just printed the raw error. See `docs/TOMBSTONES.md` #135.
 * '''Dashboard:''' you don't arm anything in advance. Click Deploy or Teardown normally; if the operation would disturb a reserved host, a dialog appears showing the server's own refusal message, and you must tick a confirmation box before the '''Proceed anyway''' button enables. Cancel, click the backdrop, or press Escape to back out.
 
-'''There is deliberately no persistent "force" checkbox on the dashboard form.''' A checkbox has state — tick it for one intentional override, forget it, and the next deploy hours later (possibly by someone else at the same always-on dashboard) quietly skips the guard too. The dialog holds the override for exactly one request and cannot outlive it. See `docs/TOMBSTONES.md` #131 for the full reasoning.
+'''There is deliberately no persistent "force" checkbox or flag on any surface.''' A checkbox has state — tick it for one intentional override, forget it, and the next deploy hours later (possibly by someone else) quietly skips the guard too. Every override — dashboard dialog, menu retry, or `--force` — holds for exactly one request and cannot outlive it. See `docs/TOMBSTONES.md` #131 for the full reasoning.
 
 The dashboard's Teardown button now has a '''scope selector''' next to it (`All hosts`, or a single named host). Scoped teardown is the point of this whole feature: cycle the scratch node while a resident model keeps serving on the reserved one. Picking a single non-reserved host means no dialog at all. `All hosts` includes the reserved host by definition, so expect the confirmation every time.
 
@@ -38,7 +40,7 @@ Two things a reserved host does '''not''' protect against:
 * '''2-node deploys always span both hosts''', so any 2-node work needs the override and will take the reserved host's service down. That's intended — it should be a decision, not a surprise. The dashboard warns about this under the topology selector before you click, and the confirmation dialog says so explicitly.
 * '''Raw `docker run` over SSH bypasses the orchestrator entirely''' and never sees this guard. `tests/ab_test.py` does its own check for that reason; anything hand-rolled won't.
 
-Which host is reserved is a property of the machine, not of any deployment — see the comments in `cluster_config.yaml` itself.
+Which host is reserved is a property of the machine, not of any deployment — see the comments in `cluster_config.yaml` itself. If you swap which host is reserved, also update `default_deploy_target` to point at the OTHER host — leaving it pointed at a now-reserved host is a self-contradicting config (the field exists specifically so the reserved/authoritative node is never also the default fallback target) and has been observed to crash the daemon at startup rather than merely misbehave. Confirm via the orchestrator log (`docker logs dgx-orchestrator-api`) after any such change, not just the dashboard's "API disconnected" symptom.
 
 == Deploying ==
 
@@ -46,13 +48,19 @@ Use the dashboard or run `dgx-config deploy --model MODEL --nodes N`.
 
 '''Where it lands if you don't say:''' a 1-node deploy with no `--head` goes to `cluster_config.yaml`'s `default_deploy_target` (the scratch node). A 2-node deploy still puts the head on the first host listed under `hosts:`, so the head node stays the same across topologies. Pass `--head <node>` to override either. Add `--force` if the target is reserved and you mean it.
 
-The dashboard's Target dropdown follows the same default — it is built from the live host inventory and starts on `default_deploy_target`, not on a hardcoded node. Reserved hosts are labelled as such in the dropdown itself.
+'''`HOSTS`/`PRIMARY_HOST`/`RESERVED_HOSTS` are computed once, at daemon startup''' — editing `cluster_config.yaml` does not take effect until the `dgx-orchestrator-api` container is restarted. If a host-order or reserved-flag change in the file doesn't seem to be respected, check the daemon actually restarted after the edit before assuming the config itself is wrong.
+
+The dashboard's Target dropdown follows the same default — it is built from the live host inventory and starts on `default_deploy_target`, not on a hardcoded node. Reserved hosts are labelled as such in the dropdown itself. Note this dropdown is only meaningful for a '''1-node''' deploy: for 2-node, the head is always `PRIMARY_HOST` (or your explicit `--head`), and the dashboard no longer sends whatever the (hidden, for 2-node) target dropdown happens to hold — see `docs/TOMBSTONES.md` #134 if you're wondering why an older build sometimes put the head on the wrong node with no error.
 
 Not sure a model/topology combo is valid, or want to sanity-check what will actually get sent before committing? Add `--dry-run` — prints the exact `docker run` command(s), no SSH connection made, nothing touched:
 
 dgx-config deploy --model MODEL --nodes N --dry-run
 
 Note that `--dry-run` is '''not''' exempt from the reserved-host check. It reports what a real deploy would do, so it reports the refusal a real deploy would hit rather than printing a command that would in fact be blocked.
+
+'''Some recipes need more than `hf_path`/`image`/`vllm_args` to launch correctly.''' Two escape hatches exist in the recipe schema for images that don't fit the usual conventions:
+* `entrypoint:` — set to `""` (with the quotes) if the recipe's `notes` or header comments say the image needs its ENTRYPOINT neutralized. This is required for any image built on the official `vllm/vllm-openai` base, which sets `ENTRYPOINT ["vllm","serve"]` — without it, the orchestrator's own argv gets silently appended to that instead of replacing it, and the failure looks unrelated to entrypoints at all (see `docs/TOMBSTONES.md` #133).
+* `model_path_override:` / `extra_mounts:` — present on a recipe when its image's model-loading code needs a real local directory rather than an HF repo id. If a recipe's header mentions a `huggingface-cli download ... --local-dir` step, that step is a real prerequisite, not a suggestion — the deploy will fail with a `FileNotFoundError` inside the container if you skip it. Run it on '''every''' target host before deploying; there is currently no automated pre-flight check that catches a missing or partial download (see `docs/TOMBSTONES.md` #133).
 
 === Topology & Memory Guards ===
 When selecting a model in the dashboard, invalid topologies are automatically hidden based on the model's recipe (e.g., hiding 1-Node options for models whose recipe only defines a `2_node` topology) to prevent Out-Of-Memory (OOM) errors. A '''Target''' dropdown, listing hosts from the live inventory, is shown for '''every''' 1-node deploy — including recipes that define only a `1_node` topology and therefore show no topology picker at all. (Until 2026-09-06 it was not: the Target picker was nested inside the row the topology logic hid, so on a single-topology recipe there was no way to choose a host and the deploy silently used `default_deploy_target`. If you hit that, you weren't missing a control — you weren't given one. See `docs/TOMBSTONES.md` #132.)
@@ -67,6 +75,8 @@ To deploy models without internet connectivity, you must pre-cache the assets an
 
 cd ~/docker/orchestrator
 python3 cache_cluster_assets.py
+
+Note: as of 2026-09-07, this prefetcher only knows about the shared HF cache mount pattern. A recipe using `model_path_override`/`extra_mounts` to stage weights at a separate local directory (see Deploying, above) is NOT covered by this script — stage those manually per that recipe's own instructions.
 
 2. '''Toggle Offline Mode:''' In the Web Dashboard, click the green '''"🌐 ONLINE MODE"''' badge to toggle to '''"🔒 OFFLINE MODE"'''. This injects `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` into all ''new'' deployments, forcing them to load strictly from the local NVMe cache. (Note: This does not affect models that are already running).
 
@@ -93,6 +103,8 @@ python3 benchmark.py
 
 All runs are automatically appended to `benchmark_ledger.csv` with precise Time-To-First-Token (TTFT) and Decode speed metrics. The tool is hardened against vLLM Multi-Token Prediction (MTP) stream buffering to ensure mathematical accuracy.
 
+'''If a deploy's "auto-run benchmark when ready" doesn't seem to have fired,''' check `benchmark_ledger.csv` for an entry near the deploy's timestamp before assuming the feature is broken. Two known, distinct causes: (1) the checkbox was checked after the deploy was already sent — see the Dashboard Usage Notes above, this is expected behavior, not a bug; (2) `wait_for_cluster_ready()`'s timeout (`tuning.deploy_wait_timeout_sec`, 900s by default) can expire silently if a model takes longer than that to boot, skipping the benchmark trigger with no visible error. If it's (2), the manual "Run Benchmark Suite Now" button (appears once the dashboard shows the cluster as ready) gets you the numbers regardless.
+
 == A/B Testing Two Recipes ==
 
 Skip the manual deploy/benchmark/teardown cycle — `tests/ab_test.py` does the whole thing for one or two variants automatically, logs everything regardless of pass/fail, and prints a side-by-side comparison if you gave it two:
@@ -105,7 +117,8 @@ Either side can be an existing recipe name, an existing recipe with fields overr
 
 * '''Model dropdown totally empty''' (not just missing one model): a single malformed recipe file can currently break the whole catalog, not just itself. Worth flagging rather than assuming it's just slow to load — see `USERMANUAL.md`'s Troubleshooting section.
 * '''Dashboard frozen — same numbers for a long time:''' a stale backend computation is possible, not just a slow poll. Check `stale`/`stale_for_seconds` at the API level if you can, and flag it rather than assuming it'll clear itself — see `docs/TOMBSTONES.md` #76 for the history.
-* '''Teardown or deploy refused with "marked reserved":''' working as intended — see the Reserved Hosts section above. Confirm in the dialog if you actually mean it, or scope to the other host.
-* '''"This exact configuration has not been confirmed to launch successfully yet" on a recipe you've definitely launched:''' if the launches were all from the CLI, or all onto the non-first-listed host, that marker was genuinely never recorded — a real bug, fixed 2026-09-06. Launch history written before that date is incomplete rather than merely sparse. Deploy it once more and the marker will populate. See `docs/TOMBSTONES.md` #129.
+* '''Teardown or deploy refused with "marked reserved":''' working as intended — see the Reserved Hosts section above. Confirm in the dialog (or the menu's y/N prompt, or `--force`) if you actually mean it, or scope to the other host.
+* '''"This exact configuration has not been confirmed to launch successfully yet" on a recipe you've definitely launched:''' if the launches were all from the CLI, or all onto the non-first-listed host, that marker was genuinely never recorded — a real bug, fixed 2026-09-06. Launch history written before that date is incomplete rather than merely sparse. Deploy it once more and the marker will populate. See `docs/TOMBSTONES.md` #129. Separately: the recipe config-hash schema was bumped twice more on 2026-09-07 (entrypoint, then model_path_override/extra_mounts) — every recipe's launch history reset again at that point, for the same reason and just as harmlessly. See `docs/TOMBSTONES.md` #133.
+* '''A community-image recipe fails at container startup with an error that doesn't match its own flags''' (e.g. an unrelated-looking argparse error, or a `FileNotFoundError` inside the container for a path that should exist): check whether the recipe's `image` is built on the official `vllm/vllm-openai` base or has custom model-loading code — these have been confirmed to need `entrypoint: ""` and/or `model_path_override`/`extra_mounts` respectively. See `docs/TOMBSTONES.md` #133 for the full diagnostic story.
 * '''Dashboard session speed looks wrong while two models are serving:''' only one host is tracked at a time. See `docs/BACKLOG-session-tracker-multi-model.md` — the numbers `benchmark.py` reports are unaffected.
 * '''Everything else:''' `USERMANUAL.md` has the fuller troubleshooting list; this page is deliberately just the fast path.

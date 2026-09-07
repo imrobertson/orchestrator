@@ -3930,6 +3930,22 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     entrypoint_override = model_config.get("entrypoint")
     entrypoint_flag = [] if entrypoint_override is None else ["--entrypoint", entrypoint_override]
 
+    # Optional --model override (RecipeConfig.model_path_override) and
+    # additional bind mounts (RecipeConfig.extra_mounts). Together these
+    # exist for images whose custom loading code bypasses the HF hub cache
+    # mechanism and requires a real local directory -- hf_path alone (a
+    # repo id string) cannot satisfy that no matter what's cached. hf_path
+    # remains this recipe's identity for the ledger, _record_hf_path(), and
+    # the catalog display; model_effective is ONLY what reaches --model.
+    #
+    # extra_mount_flags is host-symmetric by design (see RecipeConfig.
+    # extra_mounts) and applied identically in both the 1-node and 2-node
+    # branches, alongside vol_mount/compat_mount.
+    model_effective = model_config.get("model_path_override") or hf_path
+    extra_mount_flags = []
+    for mount in model_config.get("extra_mounts", []):
+        extra_mount_flags.extend(["-v", mount])
+
     # Task MC: resolve this recipe's mods (Task MA/MB) against image_tag,
     # per target host, right before that host's docker run -- see
     # _resolve_host_image_tag() above. build_catalog_response() deliberately
@@ -4008,7 +4024,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
 
         container_args = [
             "python3", "-m", "vllm.entrypoints.openai.api_server",
-            "--model", hf_path,
+            "--model", model_effective,
             "--gpu-memory-utilization", str(gpu_util),
             "--max-model-len", str(max_model_len)
         ] + vllm_args_list
@@ -4031,7 +4047,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             "--gpus", "all",
             "-v", vol_mount,
             "-v", compat_mount
-        ] + jit_mounts + env_flags + entrypoint_flag + [host_image_tag] + container_args
+        ] + jit_mounts + extra_mount_flags + env_flags + entrypoint_flag + [host_image_tag] + container_args
 
         res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
         if dry_run: docker_run_commands[head] = docker_cmd
@@ -4075,7 +4091,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             if use_ray:
                 container_args = [
                     "python3", "-m", "vllm.entrypoints.openai.api_server",
-                    "--model", hf_path,
+                    "--model", model_effective,
                     "--tensor-parallel-size", str(tp_size),
                     "--pipeline-parallel-size", str(pp_size),
                     "--gpu-memory-utilization", str(gpu_util),
@@ -4084,7 +4100,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             else:
                 container_args = [
                     "python3", "-m", "vllm.entrypoints.openai.api_server",
-                    "--model", hf_path,
+                    "--model", model_effective,
                     "--tensor-parallel-size", str(tp_size),
                     "--pipeline-parallel-size", str(pp_size),
                     "--nnodes", str(nodes),
@@ -4132,7 +4148,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                 "--gpus", "all",
                 "-v", vol_mount,
                 "-v", compat_mount
-            ] + jit_mounts + env_flags + entrypoint_flag + [host_image_tag] + entrypoint_cmd
+            ] + jit_mounts + extra_mount_flags + env_flags + entrypoint_flag + [host_image_tag] + entrypoint_cmd
 
             res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
             if dry_run: docker_run_commands[host] = docker_cmd

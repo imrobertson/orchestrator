@@ -185,6 +185,54 @@ class RecipeConfig(BaseModel):
     # was a repo-root standalone script (deploy_gemma4_dflash.py), which
     # cannot do 2-node and cannot use mods.
     entrypoint: Optional[str] = None
+    # Literal value passed to `--model`, when it must differ from hf_path.
+    #
+    #   None (absent) -- --model gets hf_path, exactly as before this field
+    #     existed. This is every recipe today.
+    #   any str        -- --model gets THIS value instead. hf_path is still
+    #     used everywhere else (ledger, _record_hf_path(), HF cache-mount
+    #     bookkeeping, the catalog's displayed model identity) -- this field
+    #     changes ONLY the literal argv, not what model the recipe is
+    #     considered to be.
+    #
+    # Why this exists: some custom model-loading code bypasses the HF hub
+    # cache mechanism entirely and does a bare `open(os.path.join(model_path,
+    # "processor_config.json"))` -- no hub resolution, no cached_file(), just
+    # a local directory read. Passing such code a repo id string (what every
+    # other recipe's hf_path already is, and what --model always carried
+    # before this field existed) can never satisfy that open() regardless of
+    # HF cache state -- it isn't hub-aware at all. The only way to launch
+    # that code is a real local path, staged onto every target host in
+    # advance (see extra_mounts below) and pointed at from inside the
+    # container by this field.
+    #
+    # Deliberately NOT unioned with hf_path into one field: hf_path is this
+    # recipe's identity (what it downloads, what the ledger and dashboard
+    # call it), model_path_override is a launch-mechanics detail some images
+    # need and most don't. Collapsing them would mean the dashboard
+    # displaying a raw container filesystem path as "the model" instead of
+    # the HF repo id every other recipe shows.
+    model_path_override: Optional[str] = None
+    # Additional `-v host_path:container_path[:ro]` bind mounts, applied
+    # identically on every target host. Exists for the same case as
+    # model_path_override above: staged local weights need to actually be
+    # visible inside the container at the path model_path_override points
+    # to, and the orchestrator's only other mount is the shared HF cache
+    # (volume_mount, per-host in cluster_config.yaml). That mount is
+    # per-host because different hosts can have different cache locations;
+    # extra_mounts is recipe-level and host-symmetric because it exists to
+    # satisfy a launch requirement of THIS recipe's image, not a per-host
+    # cluster property -- every recipe using it documents staging the same
+    # host-side path identically on every node (mirroring how the community
+    # launcher this pattern comes from stages weights).
+    #
+    # Each string is passed through to docker run verbatim -- this
+    # orchestrator already trusts recipe YAML content (hf_path, image,
+    # vllm_args) to the same degree; this is not a new trust boundary.
+    # Sorted before hashing (like env_vars): bind mounts don't overwrite
+    # each other the way mods do, so reordering them changes nothing about
+    # what launches.
+    extra_mounts: list[str] = Field(default_factory=list)
     gpu_util: float
     capability: CapabilityConfig = Field(default_factory=CapabilityConfig)
     # Each entry is a bare directory name, resolved against the repo-root
@@ -248,7 +296,10 @@ class RecipeConfig(BaseModel):
 #        recipes differing only in it launch genuinely different processes
 #        and must not share a "this configuration launched successfully"
 #        record.
-_CONFIG_HASH_SCHEMA = 3
+#   4 -- model_path_override and extra_mounts included. The former changes
+#        the literal --model argv; the latter changes what's visible in the
+#        container filesystem. Both decide what actually launches.
+_CONFIG_HASH_SCHEMA = 4
 
 
 def _canonicalize_vllm_args(raw: str):
@@ -350,6 +401,8 @@ def build_config_payload(recipe: RecipeConfig, topo_key: str) -> dict:
         "hf_path": recipe.hf_path,
         "image": recipe.image,
         "entrypoint": recipe.entrypoint,
+        "model_path_override": recipe.model_path_override,
+        "extra_mounts": sorted(recipe.extra_mounts),
         "gpu_util": recipe.gpu_util,
         "max_model_len": topo.max_model_len,
         "tp_size": topo.tp_size,
@@ -443,6 +496,15 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
         executable the container runs. None (no flag) and "" (image
         ENTRYPOINT neutralized) are different launches and hash
         differently, which is correct: they are.
+      - model_path_override -- reaches the literal --model argv value when
+        set, overriding hf_path for launch purposes only (hf_path remains
+        the recipe's identity everywhere else). None vs. any string are
+        different launches.
+      - extra_mounts, SORTED. Additional bind mounts change what's visible
+        in the container filesystem, which some images' custom loading
+        code depends on directly. Sorted rather than order-preserved like
+        mods: bind mounts don't overwrite each other, so reordering them
+        doesn't change what launches.
 
     Deliberately EXCLUDED:
       - capability -- authoring metadata, still never reaches the container.
@@ -458,18 +520,12 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
         against the raw, as-loaded RecipeConfig/TopologyConfig (i.e. via
         load_recipes()), never against the enriched catalog dict.
 
-    NOTE ON MIGRATION: this is schema 3. Every config_hash recorded under
-    schema 1 or 2 is now unreachable, so all existing launch_history
+    NOTE ON MIGRATION: this is schema 4. Every config_hash recorded under
+    schema 1, 2, or 3 is now unreachable, so all existing launch_history
     entries orphan and their recipes revert to showing as never-launched.
-    That is tolerable rather than correct this time, and the distinction
-    matters: unlike the 1->2 bump (where schema 1 genuinely could not
-    distinguish two recipes differing only in mods, so some records
-    attested to a configuration never actually launched), every schema-2
-    record was accurate for the recipes that existed under it. Nothing in
-    the current catalog sets entrypoint, so no schema-2 hash was WRONG --
-    they are simply no longer computable. Expect the whole catalog to show
-    "not confirmed to launch successfully yet" once, and to repopulate on
-    next deploy.
+    Tolerable rather than correcting, same as the 2->3 bump: nothing in the
+    current catalog sets model_path_override or extra_mounts, so no
+    schema-3 record was WRONG, they are simply no longer computable.
     """
     canonical = json.dumps(
         build_config_payload(recipe, topo_key), sort_keys=True, separators=(",", ":")
@@ -632,6 +688,10 @@ def build_catalog_response() -> dict:
             # field existed.
             if recipe.entrypoint is not None:
                 model_entry["entrypoint"] = recipe.entrypoint
+            if recipe.model_path_override is not None:
+                model_entry["model_path_override"] = recipe.model_path_override
+            if recipe.extra_mounts:
+                model_entry["extra_mounts"] = list(recipe.extra_mounts)
             if recipe.notes is not None:
                 model_entry["notes"] = recipe.notes
 
