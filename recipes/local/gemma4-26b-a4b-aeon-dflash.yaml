@@ -1,0 +1,150 @@
+recipe_version: '1'
+# Gemma 4 26B-A4B (AEON-7 uncensored NVFP4) + DFlash speculative decoding.
+#
+# This recipe is the schema-native replacement for deploy_gemma4_dflash.py.
+# That script exists ONLY because the recipe schema had no --entrypoint
+# override: AEON's image ships `ENTRYPOINT bash`, and
+# _execute_deployment_impl() appends its argv to whatever an image's
+# default entrypoint is, so a recipe would have launched
+# `bash python3 -m vllm.entrypoints.openai.api_server ...` and done
+# nothing useful. The `entrypoint:` field below removes that constraint.
+#
+# WHAT THIS BUYS over the standalone script: ACTIVE_DEPLOYMENT_STATE
+# tracking, dashboard visibility, config_hash launch history, the
+# reserved-host guard (the script bypasses execute_deployment() entirely
+# and had to re-implement its own check), mods support, and scoped
+# teardown by role name rather than a hand-rolled container.
+#
+# NOT NVIDIA'S CHECKPOINT. AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4 is
+# quantized from an "uncensored" finetune (TrevorJS/gemma-4-26B-A4B-it-
+# uncensored) via compressed-tensors NVFP4 (llmcompressor) -- a different
+# format from the ModelOpt NVFP4 the official recipe uses, with its own
+# content-moderation posture. mods/gemma4-nvfp4 (Task ME) targets a
+# different bug in a different naming convention and does NOT apply here;
+# mods stays [] deliberately.
+#
+# VALIDATED PERFORMANCE (2026-09-01, 4 independent fresh deploys per
+# prompt -- not repeated calls against one container):
+#
+#     prompt       mean warm tok/s   range    vs. mtp (n=4, same prompts)
+#     coding       103.4             0.8      mtp: 67.3   -- dflash +54%
+#     extraction   202.8             1.2      mtp: 72.9   -- dflash +178%
+#     creative      54.2             0.6      mtp: 54.6   -- tied
+#     default       49.3             0.7      mtp: ~52 (n=1) -- roughly tied
+#
+# Workload-dependent, not a flat speedup. DFlash is the decisive choice
+# for coding/extraction; it merely ties MTP on general prose. If the use
+# case is closer to creative/general-purpose, prefer
+# recipes/local/gemma4-26b-a4b-nvfp4.yaml -- same speed, official NVIDIA
+# weights, no content-moderation caveat.
+#
+# The 202.8 extraction number is real and reproducible but the LEADING
+# HYPOTHESIS for why it exceeds AEON's own published ceiling (~158) is
+# that this specific synthetic prompt emits short, highly predictable
+# JSON -- close to a best case for speculative acceptance. Not a
+# confirmed root cause. Re-measure on a harder real-world extraction
+# prompt before treating it as representative of extraction generally.
+#
+# IMAGE IS PINNED, deliberately. AEON's ':latest' has moved at least
+# twice since their 144 tok/s claim and now serves their whole model
+# fleet off one shared image. ':latest' was tested here exactly once,
+# against the 'default' prompt only (51.8 tok/s vs the pinned tag's
+# 49.3) -- never against coding/extraction/creative. Do not assume it
+# reproduces the table above.
+hf_path: AEON-7/Gemma-4-26B-A4B-it-Uncensored-NVFP4
+image: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-06-18-v0.23.0-dflashfix
+# Neutralizes this image's `ENTRYPOINT bash`, so the orchestrator's argv
+# (`python3 -m vllm.entrypoints.openai.api_server ...`) runs verbatim
+# rather than being handed to bash as arguments.
+#
+# "" is meaningful and DISTINCT from omitting this field. Omitted means
+# "pass no --entrypoint flag at all", which is correct for every image
+# that sets no ENTRYPOINT (eugr/spark-vllm*, the nvcr default). The
+# quotes are required -- a bare `entrypoint:` parses as null, i.e. as if
+# the field were absent.
+#
+# UNVERIFIED ASSUMPTION, flag this if the deploy fails at launch: the
+# validated standalone script used `--entrypoint vllm` + `serve <path>`,
+# NOT the module path. The recipe schema hardcodes the
+# `python3 -m vllm.entrypoints.openai.api_server` prefix and has no field
+# to change it, so this recipe assumes that module path is present and
+# equivalent inside AEON's image. Every vLLM install ships it, so this is
+# very likely fine -- but it is inference, not something observed on this
+# image. Confirm before trusting:
+#   docker run --rm --entrypoint "" <image> python3 -c "import vllm.entrypoints.openai.api_server"
+entrypoint: ""
+# 0.65, NOT this cluster's usual 0.75/0.85. Validated at exactly this
+# value across all 16 runs above. AEON-7's own production notes for this
+# model on this hardware family (GB10 shared LPDDR5X) report the shared
+# pool page-thrashing above ~0.8, and that even 0.85 stalls the box.
+gpu_util: 0.65
+notes: |
+  AEON-7 uncensored finetune, NOT NVIDIA's official checkpoint -- different quant format (compressed-tensors NVFP4 via llmcompressor) and its own content-moderation posture.
+  DFlash wins decisively on coding (~103 vs 67 tok/s) and extraction (~203 vs 73); ties MTP on general prose (~54 both). Pick per workload, not by default.
+  gpu_util 0.65 is validated and deliberate -- AEON reports page-thrashing above ~0.8 on GB10's shared pool, and stalls at 0.85.
+  Image tag is pinned; AEON's ':latest' has moved twice and was never tested against the coding/extraction/creative prompts.
+  mods/gemma4-nvfp4 does NOT apply to this checkpoint -- different bug, different naming convention.
+capability:
+  task: null
+  context_class: null
+  latency_class: null
+mods: []
+topologies:
+  1_node:
+    # Single-node only, by design. The validated numbers are all 1-node,
+    # tp=1. A 2-node topology here would be an untested claim, not a
+    # convenience -- add one only after measuring it.
+    #
+    # --host/--port deliberately OMITTED. The standalone script passed
+    # them as `0.0.0.0` and cfg.ports["vllm_api"], read from
+    # cluster_config.yaml. A recipe cannot read cluster_config, so
+    # hardcoding 8000 here would duplicate a value that is configured
+    # elsewhere. vLLM's own defaults are 0.0.0.0:8000, identical to what
+    # the script computed -- so this is not a behavioural deviation from
+    # the validated config as long as ports.vllm_api stays 8000. If that
+    # port is ever changed, note that no recipe in this catalog passes
+    # --port, so they would all need revisiting together.
+    #
+    # --tensor-parallel-size 1 IS passed explicitly: unlike the 2-node
+    # branch, _execute_deployment_impl()'s 1-node path does not inject
+    # tp/pp at all, so tp_size below is inert for this topology and the
+    # flag has to come through vllm_args.
+    #
+    # --num-speculative-tokens 10 is AEON's own documented value and what
+    # every validated number above was measured with. Changing it means
+    # running a plausible variant, not the validated config.
+    max_model_len: 32768
+    tp_size: 1
+    pp_size: 1
+    env_vars:
+    - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+    - TORCH_MATMUL_PRECISION=high
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    - VLLM_TEST_FORCE_FP8_MARLIN=0
+    - VLLM_USE_FLASHINFER_SAMPLER=1
+    # Deliberately NOT set: VLLM_USE_FLASHINFER_MOE_FP4=0 and
+    # VLLM_NVFP4_GEMM_BACKEND=flashinfer-cutlass. The standalone script
+    # carried these behind an opt-in --force-flashinfer-moe flag, off by
+    # default: this image's own envs.py reports the latter as an
+    # unrecognized variable (confirmed in its boot log), and a sibling
+    # AEON model's docs suggest the auto-selected VLLM_CUTLASS backend
+    # may already be the intended default rather than something to
+    # correct. If you want to test them, make it a separate recipe file
+    # so the config_hash distinguishes the two.
+    vllm_args: >-
+      --served-model-name gemma4-aeon-uncensored
+      --tensor-parallel-size 1
+      --dtype auto
+      --quantization compressed-tensors
+      --linear-backend flashinfer_cutlass
+      --moe-backend cutlass
+      --attention-backend triton_attn
+      --max-num-seqs 32
+      --max-num-batched-tokens 16384
+      --enable-chunked-prefill
+      --enable-prefix-caching
+      --trust-remote-code
+      --enable-auto-tool-choice
+      --tool-call-parser gemma4
+      --reasoning-parser gemma4
+      --speculative-config '{"method":"dflash","model":"z-lab/gemma-4-26B-A4B-it-DFlash","num_speculative_tokens":10,"attention_backend":"flash_attn"}'

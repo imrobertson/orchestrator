@@ -158,6 +158,33 @@ class RecipeConfig(BaseModel):
     recipe_version: str
     hf_path: str
     image: Optional[str] = None
+    # Value passed to `docker run --entrypoint`. Sits next to `image`
+    # deliberately: an ENTRYPOINT is a property of the IMAGE, not of a
+    # topology, and allowing two topologies of one recipe to disagree about
+    # it would be describing an image that doesn't exist.
+    #
+    #   None (absent) -- no --entrypoint flag is passed at all. Byte-
+    #     identical to the behaviour before this field existed, which is
+    #     what keeps every current recipe launching exactly as it did.
+    #   ""            -- neutralizes the image's own ENTRYPOINT, so the
+    #     argv the orchestrator builds runs verbatim. This is what an image
+    #     built on the official vllm/vllm-openai base needs, because that
+    #     base sets ENTRYPOINT ["vllm","serve"] and docker APPENDS our argv
+    #     to it rather than replacing it.
+    #   any other str -- used as the executable.
+    #
+    # NOTE the empty string is meaningful and distinct from None: every
+    # test against this field must be `is not None`, never truthiness.
+    #
+    # Why this exists: without it, a recipe whose image sets an ENTRYPOINT
+    # could not be deployed through the shared path at all. A 2-node ray
+    # deploy launches its containers with CMD ["ray","start",...,"--block"];
+    # under ENTRYPOINT ["vllm","serve"] that becomes `vllm serve ray start
+    # ... --block`, and vLLM's argparse prefix-matches --block to
+    # --block-size and dies demanding a value. The only prior escape hatch
+    # was a repo-root standalone script (deploy_gemma4_dflash.py), which
+    # cannot do 2-node and cannot use mods.
+    entrypoint: Optional[str] = None
     gpu_util: float
     capability: CapabilityConfig = Field(default_factory=CapabilityConfig)
     # Each entry is a bare directory name, resolved against the repo-root
@@ -216,7 +243,12 @@ class RecipeConfig(BaseModel):
 #        excluded.
 #   2 -- vllm_args canonicalized (flag order and whitespace no longer
 #        significant); mods included, order-significant.
-_CONFIG_HASH_SCHEMA = 2
+#   3 -- entrypoint included. It reaches `docker run --entrypoint` and
+#        therefore decides which executable the container runs at all; two
+#        recipes differing only in it launch genuinely different processes
+#        and must not share a "this configuration launched successfully"
+#        record.
+_CONFIG_HASH_SCHEMA = 3
 
 
 def _canonicalize_vllm_args(raw: str):
@@ -317,6 +349,7 @@ def build_config_payload(recipe: RecipeConfig, topo_key: str) -> dict:
         "_schema": _CONFIG_HASH_SCHEMA,
         "hf_path": recipe.hf_path,
         "image": recipe.image,
+        "entrypoint": recipe.entrypoint,
         "gpu_util": recipe.gpu_util,
         "max_model_len": topo.max_model_len,
         "tp_size": topo.tp_size,
@@ -406,6 +439,10 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
         a later mod can overwrite an earlier one, so sorting would merge two
         genuinely different images. This is the one field where reordering
         is a real change.
+      - entrypoint -- reaches `docker run --entrypoint` and decides which
+        executable the container runs. None (no flag) and "" (image
+        ENTRYPOINT neutralized) are different launches and hash
+        differently, which is correct: they are.
 
     Deliberately EXCLUDED:
       - capability -- authoring metadata, still never reaches the container.
@@ -421,12 +458,18 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
         against the raw, as-loaded RecipeConfig/TopologyConfig (i.e. via
         load_recipes()), never against the enriched catalog dict.
 
-    NOTE ON MIGRATION: this is schema 2. Every config_hash recorded under
-    schema 1 is now unreachable, so all existing launch_history entries
-    orphan and their recipes revert to showing as never-launched. That is
-    correct rather than merely tolerable -- schema 1 could not distinguish
-    two recipes differing only in mods, so some of those records attest to
-    a configuration that was never actually launched.
+    NOTE ON MIGRATION: this is schema 3. Every config_hash recorded under
+    schema 1 or 2 is now unreachable, so all existing launch_history
+    entries orphan and their recipes revert to showing as never-launched.
+    That is tolerable rather than correct this time, and the distinction
+    matters: unlike the 1->2 bump (where schema 1 genuinely could not
+    distinguish two recipes differing only in mods, so some records
+    attested to a configuration never actually launched), every schema-2
+    record was accurate for the recipes that existed under it. Nothing in
+    the current catalog sets entrypoint, so no schema-2 hash was WRONG --
+    they are simply no longer computable. Expect the whole catalog to show
+    "not confirmed to launch successfully yet" once, and to repopulate on
+    next deploy.
     """
     canonical = json.dumps(
         build_config_payload(recipe, topo_key), sort_keys=True, separators=(",", ":")
@@ -582,6 +625,13 @@ def build_catalog_response() -> dict:
             model_entry: dict = {"hf_path": recipe.hf_path, "gpu_util": recipe.gpu_util}
             if recipe.image is not None:
                 model_entry["image"] = recipe.image
+            # `is not None`, NOT truthiness: "" is a meaningful value here
+            # (neutralize the image's ENTRYPOINT) and must survive into the
+            # catalog. Recipes that don't set it omit the key entirely,
+            # keeping the catalog response byte-identical to before this
+            # field existed.
+            if recipe.entrypoint is not None:
+                model_entry["entrypoint"] = recipe.entrypoint
             if recipe.notes is not None:
                 model_entry["notes"] = recipe.notes
 

@@ -63,6 +63,24 @@ recipe_version: '1'
 #   - PDL race + uninitialized kpool (Patch 5: PDL disabled, indexer hardened)
 hf_path: RedHatAI/GLM-5.3-Flash-NVFP4
 image: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8
+# Neutralizes this image's own ENTRYPOINT. Required, not cosmetic.
+#
+# The image is built on vllm/vllm-openai, which sets
+# ENTRYPOINT ["vllm","serve"]. Docker APPENDS a container CMD to an
+# ENTRYPOINT rather than replacing it, so the orchestrator's 2-node
+# ray container -- CMD ["ray","start","--head","--port=6379",
+# "--num-gpus=1","--block"] -- actually launched as
+# `vllm serve ray start ... --block`. vLLM's argparse prefix-matched
+# --block to --block-size (an unambiguous prefix) and died with
+# "argument --block-size: expected one argument". That reads like a
+# fault in the --block-size 2304 line below and is nothing to do with
+# it -- that flag never got parsed at all.
+#
+# "" is meaningful and DISTINCT from omitting this field. Omitted
+# means "pass no --entrypoint flag", which is correct for
+# eugr/spark-vllm* and the nvcr default image (neither sets an
+# ENTRYPOINT). Quotes are required: bare `entrypoint:` parses as null.
+entrypoint: ""
 gpu_util: 0.85
 notes: |
   LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt token corruption (vLLM #54150) — use RedHatAI/GLM-5.3-Flash-NVFP4 instead.

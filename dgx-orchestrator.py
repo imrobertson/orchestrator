@@ -19,7 +19,7 @@ import datetime
 # is what actually answers "did my push/pull/restart take" now -- it's
 # derived, not typed, so it can't be forgotten the way this slug already
 # has been.
-ORCHESTRATOR_VERSION_SLUG = "2026-09-06-per-host-readiness-disk-pending-launch"
+ORCHESTRATOR_VERSION_SLUG = "2026-09-07-recipe-entrypoint-override-menu-force"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
@@ -3898,6 +3898,28 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     image_tag = model_config.get("image", default_img)
     compat_mount = "/dev/null:/etc/ld.so.conf.d/00-cuda-compat.conf"
 
+    # Optional `docker run --entrypoint` override (RecipeConfig.entrypoint).
+    # Built once here and spliced into both the 1-node and 2-node docker_cmd
+    # constructions below, immediately before the image argument -- docker
+    # requires --entrypoint to precede the image, and the argv after the
+    # image is the CMD it receives.
+    #
+    # Uses a sentinel + `is not None` rather than truthiness because "" is
+    # the meaningful "neutralize the image's own ENTRYPOINT" value, not an
+    # absent one. A recipe that doesn't set entrypoint yields [], leaving
+    # the docker command byte-identical to before this field existed.
+    #
+    # This matters for the whole container, not just the vLLM invocation:
+    # in the 2-node ray path the containers are launched with CMD
+    # ["ray","start",...,"--block"], so an image with ENTRYPOINT
+    # ["vllm","serve"] (the official vllm/vllm-openai base) runs
+    # `vllm serve ray start ... --block` -- and vLLM's argparse
+    # prefix-matches --block to --block-size and dies demanding a value.
+    # The later `docker exec ... bash -c` that starts vLLM on the head is
+    # unaffected either way, since docker exec does not apply ENTRYPOINT.
+    entrypoint_override = model_config.get("entrypoint")
+    entrypoint_flag = [] if entrypoint_override is None else ["--entrypoint", entrypoint_override]
+
     # Task MC: resolve this recipe's mods (Task MA/MB) against image_tag,
     # per target host, right before that host's docker run -- see
     # _resolve_host_image_tag() above. build_catalog_response() deliberately
@@ -3999,7 +4021,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             "--gpus", "all",
             "-v", vol_mount,
             "-v", compat_mount
-        ] + jit_mounts + env_flags + [host_image_tag] + container_args
+        ] + jit_mounts + env_flags + entrypoint_flag + [host_image_tag] + container_args
 
         res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
         if dry_run: docker_run_commands[head] = docker_cmd
@@ -4100,7 +4122,7 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
                 "--gpus", "all",
                 "-v", vol_mount,
                 "-v", compat_mount
-            ] + jit_mounts + env_flags + [host_image_tag] + entrypoint_cmd
+            ] + jit_mounts + env_flags + entrypoint_flag + [host_image_tag] + entrypoint_cmd
 
             res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
             if dry_run: docker_run_commands[host] = docker_cmd
