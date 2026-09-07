@@ -19,7 +19,7 @@ import datetime
 # is what actually answers "did my push/pull/restart take" now -- it's
 # derived, not typed, so it can't be forgotten the way this slug already
 # has been.
-ORCHESTRATOR_VERSION_SLUG = "2026-09-06-reserved-hosts-scoped-teardown"
+ORCHESTRATOR_VERSION_SLUG = "2026-09-06-per-host-readiness-disk-pending-launch"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
@@ -140,6 +140,10 @@ HF_PATH_LEDGER_PATH = BASE_DIR / "hf_path_ledger.json"
 # teardown time -- see ACTIVE_DEPLOYMENT_STATE below for why this exists and
 # why it's disk-backed rather than memory-only.
 ACTIVE_DEPLOYMENT_STATE_PATH = BASE_DIR / "active_deployment_state.json"
+# Per-host record of a deploy that has launched but not yet been confirmed
+# healthy. Disk-backed for exactly the same reason as
+# ACTIVE_DEPLOYMENT_STATE_PATH above -- see PENDING_LAUNCH_STATE.
+PENDING_LAUNCH_STATE_PATH = BASE_DIR / "pending_launch_state.json"
 
 # --- Shared JSON state-file I/O ---
 # model_ledger.json, hf_path_ledger.json, and active_deployment_state.json
@@ -254,10 +258,17 @@ def deployment_target_hosts(nodes: int, head: str) -> list:
     """
     return [PRIMARY_HOST, SECONDARY_HOST] if nodes == 2 else [head]
 
-def check_reserved_hosts(target_hosts: list, force: bool, action: str) -> Optional[str]:
+def check_reserved_hosts(target_hosts: list, force: bool, action: str) -> Optional[dict]:
     """
-    Returns an error message if the operation would disturb a reserved
-    host without --force, else None.
+    Returns a refusal RECORD if the operation would disturb a reserved
+    host without force, else None.
+
+    A dict rather than a bare string, so callers can distinguish "refused
+    by reserved-host policy, which the operator may legitimately override"
+    from "this genuinely failed". The API layer maps the former to its own
+    status code (423) and the dashboard offers a confirm dialog on it.
+    Working that out by string-matching the message would break silently
+    the first time the wording changes.
 
     Names what is currently recorded as running there, since "spark-4 is
     reserved" is much less useful than knowing which model is about to be
@@ -273,19 +284,27 @@ def check_reserved_hosts(target_hosts: list, force: bool, action: str) -> Option
 
     state = _load_active_deployment_state()
     detail = []
+    running_by_host = {}
     for h in hit:
         rec = state.get(h) or {}
         running = rec.get("catalog_key")
         topo = rec.get("topo_key")
+        running_by_host[h] = f"{running}/{topo}" if (running and topo) else (running or None)
         if running:
             detail.append(f"{h} (running {running}{'/' + topo if topo else ''})")
         else:
             detail.append(f"{h} (contents unknown)")
-    return (
-        f"Refusing to {action}: {', '.join(detail)} "
-        f"{'is' if len(hit) == 1 else 'are'} marked reserved in cluster_config.yaml. "
-        f"Re-run with --force if this is intended."
-    )
+    return {
+        "code": "reserved_host",
+        "hosts": hit,
+        "running": running_by_host,
+        "action": action,
+        "message": (
+            f"Refusing to {action}: {', '.join(detail)} "
+            f"{'is' if len(hit) == 1 else 'are'} marked reserved in cluster_config.yaml. "
+            f"Re-run with --force if this is intended."
+        ),
+    }
 
 NETWORK_STATE_FILE = BASE_DIR / ".network_mode"
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9?]*[ -/]*[@-~])')
@@ -802,12 +821,107 @@ TEARDOWN_STATE_LOCK = threading.Lock()
 # a pending record here describing what it's waiting to see confirmed
 # healthy, and _compute_cluster_status_impl() -- which already polls
 # cluster_ready/matched_model/topo every 4s for the dashboard regardless --
-# consumes it the moment a matching model+topo reports healthy. A deploy
-# that gets torn down or overwritten before that happens just leaves the
-# pending record to age out (see PENDING_LAUNCH_STALE_SEC) with nothing
-# recorded, which is the correct outcome, not a bug to special-case.
-PENDING_LAUNCH_STATE: dict = {"pending": None}
+# consumes it the moment that host reports healthy. A deploy that gets torn
+# down or overwritten before that happens just leaves the pending record to
+# age out (see PENDING_LAUNCH_STALE_SEC) with nothing recorded, which is the
+# correct outcome, not a bug to special-case.
+#
+# DISK-BACKED, AND KEYED BY HOST. Both of those are corrections to the
+# original design, and both were producing silently missing ledger data:
+#
+#   1. Memory-only was the identical mistake ACTIVE_DEPLOYMENT_STATE's
+#      comment below already documents having made and fixed. A deploy run
+#      through `dgx-config` is a SEPARATE PROCESS from the long-running
+#      daemon -- it wrote "pending" into its own module global and exited
+#      microseconds later. The daemon's status poll, which is the only
+#      thing that ever consumes a pending record, never saw it. Net effect:
+#      every CLI-initiated deploy silently failed to record launch success,
+#      so the dashboard's "This exact configuration has not been confirmed
+#      to launch successfully yet" warning stayed up permanently for any
+#      recipe only ever deployed from the CLI, no matter how many times it
+#      launched cleanly. Only dashboard deploys (same process as the
+#      daemon) ever ledgered.
+#
+#   2. A single global "pending" slot assumed the cluster runs one thing at
+#      a time. It was consumed by comparing against the SERVING host's
+#      model -- and serving_host is just the first host in cluster_config
+#      order with a STANDALONE/HEAD container. With a resident agent on the
+#      reserved host, that is always the reserved host, so a deploy onto
+#      the other node could never match its own pending record and would
+#      age out unrecorded after 3h. Keyed per host, each deploy's
+#      confirmation is checked against the host it actually landed on.
+#
+# The record is written for the HEAD host only (not every host in
+# target_hosts): a 2-node deploy has one thing to confirm healthy, not two,
+# and writing both would record the same launch success twice.
 PENDING_LAUNCH_LOCK = threading.Lock()
+
+def _load_pending_launch_state() -> dict:
+    return _read_json_state(PENDING_LAUNCH_STATE_PATH) or {}
+
+def _set_pending_launch(host: str, model: str, topo_key: str, config_hash: Optional[str]) -> None:
+    with PENDING_LAUNCH_LOCK:
+        data = _load_pending_launch_state()
+        data[host] = {
+            "model": model,
+            "topo_key": topo_key,
+            "config_hash": config_hash,
+            "started_ts": time.time(),
+        }
+        _write_json_state(PENDING_LAUNCH_STATE_PATH, data)
+
+def _clear_pending_launch(hosts: list) -> None:
+    with PENDING_LAUNCH_LOCK:
+        data = _load_pending_launch_state()
+        changed = False
+        for h in hosts:
+            if data.pop(h, None) is not None:
+                changed = True
+        if changed:
+            _write_json_state(PENDING_LAUNCH_STATE_PATH, data)
+
+def _consume_pending_launches(hosts_status: dict) -> None:
+    """
+    Promote any pending launch record whose host is now confirmed READY
+    into model_ledger.json's launch_history.
+
+    Called from the status poll rather than from execute_deployment(),
+    because confirmation requires a real post-deploy health pass and the
+    common case (a plain Deploy click, or a CLI deploy without --wait)
+    returns long before that. See PENDING_LAUNCH_STATE above.
+
+    Reads the already-computed per-host status rather than probing
+    anything itself, so it adds no SSH and no HTTP to the poll.
+    """
+    pending_all = _load_pending_launch_state()
+    if not pending_all:
+        return
+
+    now = time.time()
+    settled = []
+    for host, pending in pending_all.items():
+        if not isinstance(pending, dict) or "started_ts" not in pending:
+            settled.append(host)  # malformed; drop rather than retry forever
+            continue
+        if now - pending["started_ts"] > PENDING_LAUNCH_STALE_SEC:
+            settled.append(host)
+            continue
+
+        hs = hosts_status.get(host) or {}
+        if hs.get("model_status") != "READY":
+            continue
+        # active_recipe_key is only non-None when ACTIVE_DEPLOYMENT_STATE
+        # holds an exact record corroborated by live container discovery,
+        # so this is "the recipe this deploy launched is the one running on
+        # this host, and this host is healthy" -- not a name resemblance.
+        if hs.get("active_recipe_key") != pending.get("model"):
+            continue
+
+        _record_launch_success(pending["model"], pending["topo_key"], pending["config_hash"])
+        settled.append(host)
+
+    if settled:
+        _clear_pending_launch(settled)
 
 # --- Active Deployment State (hash-based, disk-backed) ---
 # The dashboard needs to know, per host, exactly which recipe is running --
@@ -2497,7 +2611,7 @@ def _config_hash_for(model: str, topo_key: str) -> Optional[str]:
         return None
 
 
-def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool, container_info: dict, serving_host: str, catalog_models: dict) -> tuple:
+def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool, container_info: dict, serving_host: str, catalog_models: dict, host_health: dict = None) -> tuple:
     ip = meta["ip"]
     user = None
     telemetry = get_lightweight_telemetry(ip, user)
@@ -2528,8 +2642,34 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
         host, catalog_models, loaded_model, active_container=active_container
     )
 
+    # --- Per-host readiness -------------------------------------------
+    #
+    # `cluster_ready` is the health of ONE host: serving_host, which is
+    # just the first host in cluster_config order holding a STANDALONE or
+    # HEAD container. Every readiness decision below used to key off that
+    # single boolean, which silently encoded "the cluster runs exactly one
+    # deployment at a time".
+    #
+    # Reserved hosts and scoped teardown exist specifically to break that
+    # assumption -- a resident agent on one Spark while the other is used
+    # for testing. Under that arrangement the old code was wrong in both
+    # directions at once: the test node was reported READY purely because
+    # the agent node was healthy (so a still-compiling model showed READY,
+    # and a genuinely dead one did too), while run-log archival and phase
+    # recording were gated on `host == serving_host` and so NEVER fired for
+    # the test node at all. That is the missing-ledger-data half of the
+    # same bug PENDING_LAUNCH_STATE documents.
+    #
+    # self_ready is this host's own /health. host_ready adds the one case
+    # where inheriting is correct: a 2-node Ray WORKER serves no API of its
+    # own, and its readiness genuinely IS the head's. Everything else is
+    # now measured, not assumed.
+    health_map = host_health or {}
+    self_ready = bool(health_map.get(host))
+    host_ready = self_ready or (active_container == ContainerRole.WORKER and cluster_ready)
+
     eta_seconds = 0
-    eta_display = "Ready" if cluster_ready else "N/A"
+    eta_display = "Ready" if host_ready else "N/A"
     topo_key = "2_node" if active_container in [ContainerRole.HEAD, ContainerRole.WORKER] else "1_node"
 
     if is_crashed:
@@ -2573,7 +2713,7 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
         eta_display = "Requires Teardown"
         eta_seconds = 0
     elif active_container != "None" and container_state == "running":
-        if cluster_ready and host == serving_host:
+        if self_ready:
             model_status = "READY"
             time_res = run_ssh(ip, user, ["docker", "inspect", active_container, "--format", "{{.State.StartedAt}}"], timeout=5)
             if time_res.returncode == 0 and time_res.stdout.strip():
@@ -2634,7 +2774,10 @@ def _finalize_host_status(host: str, meta: dict, info: dict, cluster_ready: bool
                         inductor_cache_disabled=_inductor_cache_disabled_for(matched_key, topo_key),
                     )
                     record_run_phases(matched_key, topo_key, archive_entry)
-        elif cluster_ready:
+        elif host_ready:
+            # Reached only by a 2-node WORKER, per host_ready's definition
+            # above. Previously this branch also caught any non-serving
+            # host whenever the serving host happened to be healthy.
             model_status = "READY"
         else:
             model_status = detect_model_stage(ip, user, active_container)
@@ -2732,7 +2875,27 @@ def _compute_cluster_status_impl() -> dict:
             break
     serving_ip = HOSTS[serving_host]["ip"]
 
-    cluster_ready = check_vllm_health(serving_ip)
+    # Probe /health on EVERY host holding a serving-capable container, not
+    # only serving_host. A 2-node WORKER exposes no API and is deliberately
+    # not probed (it inherits the head's readiness in
+    # _finalize_host_status); anything else with a container gets measured
+    # on its own terms so two independent 1-node deploys stop reporting
+    # each other's health. Runs on WORKER_POOL alongside everything else in
+    # this poll -- check_vllm_health has a 2s socket timeout, so the added
+    # wall cost is bounded and parallel, not serial.
+    health_hosts = [
+        h for h in HOSTS
+        if container_info.get(h, {}).get("active_container") in (ContainerRole.STANDALONE, ContainerRole.HEAD)
+    ]
+    health_futures = [WORKER_POOL.submit(check_vllm_health, HOSTS[h]["ip"]) for h in health_hosts]
+    health_results = _collect_bounded(health_futures, health_hosts, call_deadline, "Per-host health probe")
+    host_health = {h: bool(v) for h, v in health_results.items()}
+
+    # cluster_ready keeps its existing meaning -- "the serving host is
+    # up" -- because that is what the benchmark button, session tracking
+    # and the live-metrics endpoint all key off. It is now read out of the
+    # same probe rather than being a second independent request.
+    cluster_ready = host_health.get(serving_host, False)
     vllm_metrics = get_vllm_metrics(serving_ip) if cluster_ready else {"tps": 0.0, "running_requests": 0, "waiting_requests": 0}
 
     # catalog_models must load before we resolve the session-tracker key --
@@ -2774,31 +2937,10 @@ def _compute_cluster_status_impl() -> dict:
     if cluster_ready:
         SESSION_TRACKER.update(vllm_metrics, matched_model, topo)
 
-    # Consume any pending launch-confirmation record. See PENDING_LAUNCH_STATE's
-    # comment for why this happens here (in the already-running status poll)
-    # rather than synchronously in execute_deployment(). This must never
-    # raise or block status polling -- wrapped defensively.
-    try:
-        with PENDING_LAUNCH_LOCK:
-            pending = PENDING_LAUNCH_STATE.get("pending")
-        if pending is not None:
-            age = time.time() - pending["started_ts"]
-            if age > PENDING_LAUNCH_STALE_SEC:
-                with PENDING_LAUNCH_LOCK:
-                    if PENDING_LAUNCH_STATE.get("pending") is pending:
-                        PENDING_LAUNCH_STATE["pending"] = None
-            elif cluster_ready and pending["model"] == matched_model and pending["topo_key"] == topo:
-                _record_launch_success(pending["model"], pending["topo_key"], pending["config_hash"])
-                with PENDING_LAUNCH_LOCK:
-                    if PENDING_LAUNCH_STATE.get("pending") is pending:
-                        PENDING_LAUNCH_STATE["pending"] = None
-    except Exception as exc:
-        # This block should never actually raise -- it's arithmetic and
-        # dict lookups on data this same process wrote. If it does, that's
-        # a genuine bug (e.g. a future refactor of PENDING_LAUNCH_STATE's
-        # shape) and silently eating it here would just mean launch-success
-        # telemetry quietly stops recording with zero indication why.
-        print(f"[!] _compute_cluster_status_impl: pending launch-confirmation consumption failed unexpectedly - {exc}")
+    # Pending launch-confirmation records used to be consumed here, against
+    # the SERVING host's model. That is now done per host, after phase 2
+    # populates each host's own model_status/active_recipe_key -- see
+    # _consume_pending_launches() and PENDING_LAUNCH_STATE.
 
     with BENCHMARK_STATE_LOCK:
         is_benchmarking = BENCHMARK_STATE["running"]
@@ -2826,6 +2968,16 @@ def _compute_cluster_status_impl() -> dict:
         "network_mode": "Working in OFFLINE mode" if offline_mode else "Working in ONLINE mode",
         "cluster_ready": cluster_ready,
         "serving_host": serving_host,
+        # Reserved-host policy, so the dashboard can render the same rules
+        # the CLI enforces instead of hardcoding a host list that silently
+        # disagrees with cluster_config.yaml. Without these, index.html had
+        # spark-4 hardcoded as its default 1-node target while the backend
+        # had already moved that default to spark-3 AND started refusing
+        # spark-4 outright -- so the dashboard's out-of-the-box deploy was
+        # aimed at the one host guaranteed to reject it.
+        "reserved_hosts": list(RESERVED_HOSTS),
+        "default_deploy_host": DEFAULT_DEPLOY_HOST,
+        "primary_host": PRIMARY_HOST,
         "system_tps": vllm_metrics["tps"],
         "running_requests": vllm_metrics["running_requests"],
         "waiting_requests": vllm_metrics["waiting_requests"],
@@ -2839,7 +2991,7 @@ def _compute_cluster_status_impl() -> dict:
     }
 
     futures_phase2 = [
-        WORKER_POOL.submit(_finalize_host_status, host, meta, container_info.get(host, {}), cluster_ready, container_info, serving_host, catalog_models)
+        WORKER_POOL.submit(_finalize_host_status, host, meta, container_info.get(host, {}), cluster_ready, container_info, serving_host, catalog_models, host_health)
         for host, meta in HOSTS.items()
     ]
     phase2_results = _collect_bounded(futures_phase2, host_order, call_deadline, "Phase 2 finalize")
@@ -2856,6 +3008,25 @@ def _compute_cluster_status_impl() -> dict:
         else:
             _, host_status = result
             status_data["hosts"][host] = host_status
+
+    # Annotated in one place rather than in each of _finalize_host_status's
+    # several return paths (plus the timeout fallback above), so a new
+    # early-return there can't silently ship a host card with no alias or
+    # reserved flag.
+    for host_name, host_status in status_data["hosts"].items():
+        host_status["alias"] = HOSTS.get(host_name, {}).get("alias")
+        host_status["reserved"] = host_name in RESERVED_HOSTS
+
+    # Promote any deploy that has now been confirmed healthy into
+    # model_ledger.json's launch_history. Runs here, after phase 2, because
+    # it reads each host's own model_status/active_recipe_key. Must never
+    # raise or block status polling -- wrapped defensively, and loudly,
+    # since a silent failure here means launch-success telemetry quietly
+    # stops recording with no indication why.
+    try:
+        _consume_pending_launches(status_data["hosts"])
+    except Exception as exc:
+        print(f"[!] _compute_cluster_status_impl: pending launch-confirmation consumption failed unexpectedly - {exc}")
 
     # Strictly guarded worker state mirroring
     #
@@ -3399,6 +3570,10 @@ def _execute_teardown_impl(target_hosts: list = None) -> dict:
         # to show a stale exact record that teardown was already trying to
         # invalidate.
         _clear_active_deployment(hosts_to_clean)
+        # Same reasoning: a torn-down host has nothing left to confirm
+        # healthy, so its pending record must not survive to be matched
+        # against whatever gets deployed there next.
+        _clear_pending_launch(hosts_to_clean)
 
 def resolve_teardown_hosts(host_arg: Optional[str], all_hosts: bool) -> tuple:
     """
@@ -3452,7 +3627,7 @@ def execute_teardown(target_hosts: list = None, force: bool = False) -> dict:
     """
     blocked = check_reserved_hosts(target_hosts, force, "tear down")
     if blocked:
-        return {"status": "error", "message": blocked}
+        return {"status": "error", **blocked}
 
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
     if not acquired: return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
@@ -3504,7 +3679,7 @@ def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bo
         f"deploy {model!r} ({nodes}-node)"
     )
     if blocked:
-        return {"status": "error", "message": blocked}
+        return {"status": "error", **blocked}
 
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
     if not acquired: return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
@@ -3998,15 +4173,15 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         recipe = load_recipes().get(model)
         if recipe is not None:
             cfg_hash = compute_config_hash(recipe, topo_key)
-            with PENDING_LAUNCH_LOCK:
-                PENDING_LAUNCH_STATE["pending"] = {
-                    "model": model,
-                    "topo_key": topo_key,
-                    "config_hash": cfg_hash,
-                    "started_ts": time.time(),
-                }
             for h in target_hosts:
                 _set_active_deployment(h, model, topo_key, cfg_hash)
+            # Head only: a 2-node deploy is one thing to confirm healthy,
+            # not two, and the worker exposes no /health to confirm it
+            # against. Written to disk (not a module global) so a deploy
+            # issued from `dgx-config` -- a separate process that exits
+            # immediately -- is still visible to the daemon's status poll,
+            # which is the only thing that ever promotes it.
+            _set_pending_launch(head, model, topo_key, cfg_hash)
     except Exception as exc:
         # PENDING_LAUNCH_STATE staying unset here is genuinely fine
         # (it's just a launch-success telemetry marker, as noted
@@ -4218,6 +4393,17 @@ if HAS_FASTAPI:
     def api_deploy(req: DeployRequest):
         head = resolve_deploy_head(req.head, req.nodes)
         res = execute_deployment(req.model, req.nodes, head, req.user_id, wait=req.wait, run_benchmark=req.run_benchmark, dry_run=req.dry_run, force=req.force)
+        # 423 Locked, distinct from the generic 400 below, so the dashboard
+        # can tell "refused by reserved-host policy -- the operator may
+        # legitimately override this" apart from "the deploy failed". Only
+        # the former gets a confirm dialog; a genuine failure must never be
+        # something you can click past. The refusal happens before the
+        # cluster lock and before any SSH (see execute_deployment), so an
+        # unforced attempt is free and side-effect-free -- which is what
+        # makes it safe for the dashboard to try first and ask second,
+        # rather than pre-judging with its own copy of the host list.
+        if res.get("code") == "reserved_host":
+            raise HTTPException(status_code=423, detail=res)
         if res.get("status") not in ("success", "dry_run"): raise HTTPException(status_code=400, detail=res.get("message", "Deployment failed"))
         return res
 
@@ -4252,6 +4438,13 @@ if HAS_FASTAPI:
         # it prints the raw results dict instead of discarding it. This
         # brings /api/teardown in line with api_deploy()/api_benchmark()
         # above, which already both check their result's status.
+        if isinstance(results, dict) and results.get("code") == "reserved_host":
+            # Checked BEFORE the generic error branch below: both come back
+            # as status=error, but only this one is an override the
+            # operator is entitled to make. 409 here would be
+            # indistinguishable from "cluster busy", which is not
+            # something anyone should be able to force past.
+            raise HTTPException(status_code=423, detail=results)
         if isinstance(results, dict) and results.get("status") == "error":
             raise HTTPException(status_code=409, detail=results.get("message", "Teardown could not start."))
         failed = {h: r for h, r in results.items() if isinstance(r, str) and r.lower().startswith("error")}

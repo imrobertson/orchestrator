@@ -46,6 +46,263 @@ fixed today, recorded here rather than silently:
     that's exactly what let #76 hide undetected as long as it did).
 -->
 
+<!--
+Reconciliation note (2026-09-06, second session same day): #129-#131 added,
+appended above #128 per usual (newest/highest on top). All three come from
+the same session and share a root cause with #127/#128 -- code written when
+the cluster ran exactly one deployment at a time, meeting a cluster that no
+longer does. Numbering 27-131 confirmed contiguous by the same exhaustive
+"### N." scan method the 2026-08-31 note below established.
+-->
+
+### 131. The dashboard predated reserved hosts in three separate places, and each one silently steered the operator onto the host the backend was about to refuse
+
+**Trap:** `reserved:` / `default_deploy_target:` landed in `cluster_config.yaml`
+and were enforced in `dgx-orchestrator.py`, but `html/index.html` was not
+touched. It carried its own hardcoded copy of the host inventory and its own
+assumption that the cluster serves one thing at a time. Three distinct
+failures, all pointing the same direction:
+
+1. **The target picker was hardcoded, spark-4 first, and therefore
+   default-selected.** `cluster_config.yaml` sets
+   `default_deploy_target: spark-3` and marks `spark-4` reserved. So the
+   dashboard's out-of-the-box 1-node deploy was aimed at the one host
+   guaranteed to reject it, while the CLI -- reading the same config
+   correctly -- defaulted to the scratch node. Two surfaces, opposite
+   defaults, one config.
+
+2. **The picker was re-pinned to `serving_host` on every 4s status poll:**
+
+   ```javascript
+   if (data.serving_host) {
+       currentServingHost = data.serving_host;
+       const headSelect = document.getElementById('headSelect');
+       if (headSelect && headSelect.value !== currentServingHost && ...) {
+           headSelect.value = currentServingHost;
+       }
+   }
+   ```
+
+   `serving_host` is the first host in `cluster_config.yaml` order with a
+   `STANDALONE`/`HEAD` container -- i.e. always the reserved host once
+   something resident is running there. Selecting the scratch node visibly
+   reverted within four seconds. The deploy then went to the reserved host
+   and was refused, which read as "the dropdown is broken" rather than as
+   the two separate correct behaviours it actually was.
+
+3. **Recipe detection took the first host with a record and stopped:**
+
+   ```javascript
+   for (const [host, info] of Object.entries(data.hosts)) {
+       if (info.active_recipe_key) { detectedActiveRecipeKey = info.active_recipe_key; break; }
+   }
+   ```
+
+   Object key order is `HOSTS` order, so the first-listed host always won.
+   With a resident agent there, a deploy on the other node **could never
+   appear in the model dropdown**, no matter how many polls ran or how many
+   times the operator tabbed away and back (which resets
+   `lastSyncedActiveModel` and re-runs the identical wrong detection). This
+   is the user-visible symptom that started the session; the reported
+   suspicion that ledgering was also broken turned out to be a *separate*
+   real bug -- see #129.
+
+Separately, the **Teardown button was dead**. It posts no host list, which
+`execute_teardown()` reads as the whole cluster, which includes the reserved
+host, so `check_reserved_hosts()` refused it every time. There was no way to
+express a scoped teardown from the dashboard at all, despite scoped teardown
+being the entire point of the reserved-host work.
+
+**Fix:** `/api/status` now emits the policy (`reserved_hosts`,
+`default_deploy_host`, `primary_host`, plus per-host `alias` and `reserved`),
+and the dashboard renders it instead of carrying a second copy:
+
+- All three host pickers are built from `/api/status`, guarded by a
+  signature so a poll only touches the DOM when the host set actually
+  changes -- otherwise the rebuild would clobber the operator's selection
+  every 4s, which is the same bug class as (2).
+- Auto-follow of `serving_host` stops permanently once the operator touches
+  the picker (`headSelectTouched`), and never lands on a reserved host.
+- `detectActiveRecipeKey()` prefers the host the operator is pointed at,
+  then `serving_host`, then falls back to the old iteration order. The
+  backend cannot pick for us -- under two independent 1-node deploys there
+  is no "the" active deploy to report.
+- A teardown scope selector sits inline with the button (`All hosts` /
+  per-host), posting `{hosts: [...] | null}`. `null` preserves the original
+  body-less semantics.
+
+**On the override mechanism, which was a deliberate choice, not the obvious
+one.** The ask was a `--force` checkbox on the deploy form. Built instead as
+a per-action confirm dialog, because a checkbox has *state*: tick it for one
+intentional override, forget it, and the next deploy -- hours later, possibly
+by someone else at the same always-on dashboard -- silently skips the guard
+too. The dialog holds the override for exactly one request and cannot outlive
+it. `force` is never read from persistent UI state anywhere in `index.html`;
+it is set only on the retry.
+
+The dialog is raised by the server's own refusal, never by a client-side
+prediction of one. `check_reserved_hosts()` was retyped from
+`Optional[str]` to `Optional[dict]` carrying `code`/`hosts`/`running`/
+`message`, and both endpoints map that code to **HTTP 423**, checked *before*
+their generic 400/409. Two reasons this matters:
+
+- The refusal text is generated server-side from `ACTIVE_DEPLOYMENT_STATE`
+  and names what is running there -- "spark-4 (running hermes-agent/1_node)",
+  not just "spark-4 is reserved". The dashboard cannot produce that itself.
+- Only a policy refusal gets a dialog. 409 on teardown already means "cluster
+  busy", which is *not* something anyone should be able to click past.
+  String-matching the message to tell the two apart would have broken the
+  first time the wording changed.
+
+The unforced attempt is free, which is what makes "try first, ask second"
+safe here rather than reckless: `check_reserved_hosts()` runs before
+`CLUSTER_OP_LOCK` and before any SSH, so a refusal costs one round-trip and
+touches nothing.
+
+---
+
+### 130. Host readiness was a single cluster-wide boolean, so a non-serving host reported a stranger's health and never archived a single run
+
+**Trap:** `_finalize_host_status()` took `cluster_ready` -- the health of
+*one* host, `serving_host` -- and used it for every readiness decision on
+every host:
+
+```python
+if cluster_ready and host == serving_host:
+    model_status = "READY"
+    ...  # archive_run_log() + record_run_phases() live in here
+elif cluster_ready:
+    model_status = "READY"
+```
+
+`serving_host` is just the first host in `cluster_config.yaml` order holding
+a `STANDALONE`/`HEAD` container. That encoded, without ever stating it, "the
+cluster runs exactly one deployment at a time". Reserved hosts and scoped
+teardown exist specifically to break that assumption -- a resident agent on
+one Spark while the other is under test -- and under that arrangement the
+code was wrong in *both* directions simultaneously:
+
+- The test node was reported `READY` purely because the agent node was
+  healthy. A model still compiling showed READY. So did one that had died.
+- Run-log archival and `record_run_phases()` were gated on
+  `host == serving_host`, so **they never fired for the test node at all**.
+  Every run on the non-first-listed host produced no archive, no phase data,
+  and no `runs[]` entry -- silently, with the dashboard cheerfully showing
+  it as READY the whole time.
+
+The second half is the more expensive one. It is the missing-ledger-data
+counterpart to #129, and between them the two bugs meant a scoped
+single-host workflow -- the workflow the reserved-host feature was built to
+enable -- recorded almost nothing.
+
+**Fix:** `_compute_cluster_status_impl()` now probes `/health` on every host
+holding a serving-capable container, in parallel on the existing
+`WORKER_POOL` via `_collect_bounded()`. `cluster_ready` is read out of that
+same map rather than issuing its own request, so it keeps its existing
+meaning (benchmark button, session tracking, live-metrics endpoint) at one
+fewer HTTP call than before.
+
+`_finalize_host_status()` takes the map and derives:
+
+```python
+self_ready = bool(health_map.get(host))
+host_ready = self_ready or (active_container == ContainerRole.WORKER and cluster_ready)
+```
+
+`self_ready` gates READY and archival. `host_ready` adds back the one case
+where inheriting is genuinely correct: a 2-node Ray `WORKER` serves no API of
+its own, so its readiness really *is* the head's. Everything else is now
+measured rather than assumed.
+
+Note the worker clause is load-bearing, not defensive. Gating purely on
+`self_ready` would have dropped a 2-node worker into `detect_model_stage()`,
+which does an SSH + `docker logs` call and can return a `CRASHED`-prefixed
+string -- which would then have suppressed the head→worker mirror fixed in
+#128 and shown a healthy worker as crashed during normal 2-node operation.
+A tighter-looking condition would have been a regression.
+
+---
+
+### 129. Pending launch-confirmation state lived in memory, so no CLI deploy ever recorded a launch success -- the exact mistake ACTIVE_DEPLOYMENT_STATE's own comment documents having already made
+
+**Trap:** `PENDING_LAUNCH_STATE: dict = {"pending": None}` -- a module
+global. `execute_deployment()` writes a pending record; the daemon's 4s
+status poll is the only thing that ever consumes it and promotes it into
+`model_ledger.json`'s `launch_history`.
+
+A deploy issued through `dgx-config` is a **separate process** from the
+long-running daemon. It wrote the pending record into its own module global
+and exited microseconds later. The daemon never saw it. Net effect: **every
+CLI-initiated deploy silently failed to record launch success.** The
+dashboard's "This exact configuration has not been confirmed to launch
+successfully yet" warning stayed up permanently for any recipe only ever
+deployed from the CLI, however many times it had launched cleanly. Only
+dashboard deploys -- same process as the daemon -- ever ledgered.
+
+This is not a novel bug. It is the identical mistake, in the identical shape,
+that `ACTIVE_DEPLOYMENT_STATE`'s own module comment (see #80) documents
+having made and fixed:
+
+> An earlier version of this DID cache the dict in a module-level global
+> [...] which broke the moment a deploy or teardown ran through a *different
+> process* than the long-running daemon [...] The CLI process wrote the
+> correct record to disk and exited; the daemon's own in-memory copy never
+> saw that write.
+
+`PENDING_LAUNCH_STATE` sits **eighteen lines above that comment** in the same
+file and was left memory-only, on the stated reasoning that it is "fine to
+lose". That reasoning is sound for a crash or a restart. It is not sound for
+the ordinary CLI path, where the process *always* exits before the record can
+possibly be consumed -- there, "fine to lose" means "never recorded".
+
+**A second, independent defect in the same state.** The single global
+`"pending"` slot was consumed by comparing against the *serving* host's
+model:
+
+```python
+elif cluster_ready and pending["model"] == matched_model and pending["topo_key"] == topo:
+```
+
+With a resident agent on the reserved (first-listed) host, `serving_host` is
+always that host. A deploy onto the other node could therefore never match
+its own pending record even from the dashboard, and aged out unrecorded after
+`PENDING_LAUNCH_STALE_SEC` (3h). So the two halves compounded: CLI deploys
+never recorded at all, and dashboard deploys onto the scratch node didn't
+either.
+
+**Fix:** disk-backed at `BASE_DIR / "pending_launch_state.json"` and keyed by
+host, with `_load_pending_launch_state()` / `_set_pending_launch()` /
+`_clear_pending_launch()` / `_consume_pending_launches()` mirroring
+`ACTIVE_DEPLOYMENT_STATE`'s contract exactly -- including no in-memory cache,
+every read straight off disk.
+
+Three details worth recording:
+
+- **The record is written for the HEAD host only**, not for every host in
+  `target_hosts`. A 2-node deploy is one thing to confirm healthy, not two;
+  writing both would have recorded the same launch success twice and inflated
+  `launch_history`'s count.
+- **Consumption moved** out of mid-poll and into a pass after phase 2, where
+  each host's own `model_status`/`active_recipe_key` are available. It reads
+  already-computed status and adds no SSH or HTTP to the poll.
+- **Promotion requires READY *and* a matching `active_recipe_key` on that
+  specific host.** `active_recipe_key` is only non-None when
+  `ACTIVE_DEPLOYMENT_STATE` holds an exact record corroborated by live
+  container discovery, so this is "the recipe this deploy launched is the one
+  running on this host, and this host is healthy" -- not a name resemblance.
+  Cleared on teardown alongside `_clear_active_deployment()`.
+
+**Consequence for the backlog, recorded here because it is easy to miss:**
+`launch_history` written before 2026-09-06 is *incomplete*, not merely
+sparse. `ROADMAP.md`'s "Per-recipe/topology validation status marker" entry
+proposes auto-promoting recipes from `unconfirmed` to `validated` off exactly
+this data. Doing that against pre-fix history would systematically
+under-promote every recipe that was only ever deployed from the CLI or onto
+the non-first-listed host -- and would look like a working feature while
+doing it.
+
+---
+
 ### 128. Head→worker state mirroring assumed the cluster only ever ran one deployment
 
 **Trap:** `_compute_cluster_status_impl()` mirrors the head host's model state

@@ -74,6 +74,11 @@
         .badge.offline { background: #7f1d1d; color: #f87171; }
         .badge.loading { background: #78350f; color: #fbbf24; }
         .badge.none { background: #334155; color: var(--text-muted); }
+        /* Reserved is a property of the NODE, not of what's deployed on it
+           -- see cluster_config.yaml's `reserved:` comment. Styled as a
+           standing marker rather than a status, since it does not change
+           with the container's lifecycle. */
+        .badge.reserved { background: #422006; color: #fbbf24; border: 1px solid #78350f; }
         
         .metric-row { display: flex; justify-content: space-between; margin: 4px 0; font-size: 13px; color: #cbd5e1; }
         .metric-val { font-family: monospace; color: var(--accent); font-size: 12px; text-align: right; }
@@ -109,6 +114,19 @@
             font-size: 13px;
             min-height: 38px;
         }
+
+        /* Advisory line under the target selector. Purely informational --
+           it arms nothing and changes no request. The actual protection is
+           the server-side guard and the confirm dialog it triggers; this
+           just removes the surprise. */
+        .target-hint {
+            font-size: 11px;
+            font-family: monospace;
+            color: #fbbf24;
+            margin: -4px 0 10px 0;
+            line-height: 1.4;
+        }
+        .target-hint.hidden { display: none; }
 
         /* Recipe Metadata Strip */
         .recipe-meta-strip {
@@ -177,6 +195,13 @@
         .btn-action { background: #0891b2; margin-bottom: 10px; }
         .btn-action:hover:not(:disabled) { background: #0e7490; }
 
+        /* Teardown scope sits inline with its button: the scope is part of
+           the action, not a separate setting, and a full-width select above
+           the button read as unrelated configuration. */
+        .teardown-row { display: flex; gap: 8px; align-items: stretch; margin-top: 6px; }
+        .teardown-row select { margin: 0; width: auto; flex: 0 0 42%; font-size: 12px; }
+        .teardown-row .btn-danger { margin-top: 0; flex: 1 1 auto; }
+
         /* Small inline button for the log panel -- distinct from .btn,
            which is full-width and meant for the primary deploy/teardown
            actions. This one sits inline next to the host selector. */
@@ -217,6 +242,94 @@
             min-height: 14px;
             color: #fbbf24;
         }
+
+        /* --- Reserved-host confirm dialog -------------------------------
+           Deliberately NOT a persistent "force" checkbox on the form. A
+           checkbox has state: it can be ticked for one intentional
+           override and then silently left armed, so the NEXT deploy --
+           possibly hours later, possibly by someone else at the same
+           dashboard -- quietly skips the guard too. This dialog holds the
+           override for exactly one request and cannot outlive it.
+
+           It is raised by the server's own 423 refusal, never by a
+           client-side guess, so the text below is the same sentence the
+           CLI prints, naming the same host and the same model recorded as
+           running on it. */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(2, 6, 23, 0.78);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        .modal-overlay.open { display: flex; }
+        .modal-box {
+            background: var(--bg-card);
+            border: 1px solid #78350f;
+            border-radius: 10px;
+            max-width: 540px;
+            width: 100%;
+            padding: 20px;
+            box-shadow: 0 20px 40px -10px rgba(0,0,0,0.6);
+        }
+        .modal-box h3 {
+            margin: 0 0 12px 0;
+            font-size: 16px;
+            color: #fbbf24;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .modal-message {
+            font-size: 13px;
+            line-height: 1.5;
+            color: #e2e8f0;
+            background: var(--bg-dark);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-bottom: 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .modal-consequence {
+            font-size: 12px;
+            color: var(--text-muted);
+            line-height: 1.5;
+            margin-bottom: 14px;
+        }
+        .modal-consequence strong { color: #f87171; }
+        .modal-confirm-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            background: var(--bg-dark);
+            border: 1px solid #78350f;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 16px;
+            cursor: pointer;
+        }
+        .modal-confirm-row input {
+            width: auto;
+            margin: 2px 0 0 0;
+            min-height: auto;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .modal-confirm-row span {
+            font-size: 13px;
+            color: var(--text-main);
+            line-height: 1.4;
+        }
+        .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+        .modal-actions .btn { width: auto; min-width: 120px; }
+        .btn-cancel { background: #334155; }
+        .btn-cancel:hover:not(:disabled) { background: #475569; }
 
         /* Logs Section */
         .log-section {
@@ -273,6 +386,10 @@
             header { flex-direction: column; align-items: flex-start; }
             .clock { align-self: flex-start; margin-top: 5px; }
             .recipe-meta-strip { grid-template-columns: 1fr 1fr !important; gap: 8px; }
+            .teardown-row { flex-direction: column; }
+            .teardown-row select { flex: 1 1 auto; width: 100%; }
+            .modal-actions { flex-direction: column-reverse; }
+            .modal-actions .btn { width: 100%; }
         }
     </style>
 </head>
@@ -314,12 +431,16 @@
                 </div>
                 <div id="headSelectContainer">
                     <label>Target (1-Node):</label>
-                    <select id="headSelect">
-                        <option value="spark-4">spark-4 (9dbe)</option>
-                        <option value="spark-3">spark-3 (6e63)</option>
-                    </select>
+                    <!-- Populated from /api/status. Previously hardcoded to
+                         spark-4/spark-3 with spark-4 first and therefore
+                         default-selected -- which silently disagreed with
+                         cluster_config.yaml's default_deploy_target the
+                         moment that field was introduced. -->
+                    <select id="headSelect" onchange="onHeadSelectChanged()"></select>
                 </div>
             </div>
+
+            <div id="targetHint" class="target-hint hidden"></div>
 
             <!-- Recipe Metadata Strip -->
             <div id="recipeMetaCard" class="recipe-meta-strip">
@@ -398,7 +519,10 @@
             
             <div style="margin-top: auto;">
                 <button id="deployBtn" class="btn" onclick="triggerDeploy()">Deploy Model</button>
-                <button id="teardownBtn" class="btn btn-danger" onclick="triggerTeardown()">Teardown Runtimes</button>
+                <div class="teardown-row">
+                    <select id="teardownScopeSelect" title="Which hosts to tear down. Scoped teardown is what lets a resident model on one node survive while you cycle the other."></select>
+                    <button id="teardownBtn" class="btn btn-danger" onclick="triggerTeardown()">Teardown Runtimes</button>
+                </div>
                 <div id="teardownStatusLine" class="teardown-status-line"></div>
                 <div id="statusToast" class="status-toast"></div>
             </div>
@@ -408,24 +532,39 @@
     <div class="log-section">
         <div class="card log-card">
             <div class="log-header-row">
-                <h2>Live Logs (<span id="logHostLabel">spark-4</span>) <span class="log-tz-label">timestamps: UTC</span></h2>
+                <h2>Live Logs (<span id="logHostLabel">--</span>) <span class="log-tz-label">timestamps: UTC</span></h2>
                 <div class="log-header-controls">
                     <button id="copyLogsBtn" class="btn-copy-logs" onclick="copyLogs()" title="Copy the currently displayed logs to clipboard">📋 Copy</button>
-                    <select id="logHostSelect" onchange="updateLogHost()">
-                        <option value="spark-4">spark-4 Node</option>
-                        <option value="spark-3">spark-3 Node</option>
-                    </select>
+                    <select id="logHostSelect" onchange="updateLogHost()"></select>
                 </div>
             </div>
             <pre id="logBox">Loading logs...</pre>
         </div>
     </div>
 
+    <!-- Reserved-host override dialog. See .modal-overlay CSS above for why
+         this is a per-action dialog rather than a form checkbox. -->
+    <div id="forceDialogOverlay" class="modal-overlay" onclick="onForceDialogBackdrop(event)">
+        <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="forceDialogTitle">
+            <h3 id="forceDialogTitle">⚠ Reserved host</h3>
+            <div id="forceDialogMessage" class="modal-message"></div>
+            <div id="forceDialogConsequence" class="modal-consequence"></div>
+            <label class="modal-confirm-row" for="forceConfirmCheck">
+                <input type="checkbox" id="forceConfirmCheck" onchange="onForceConfirmToggled()">
+                <span id="forceConfirmLabel">I understand this will disturb the reserved host.</span>
+            </label>
+            <div class="modal-actions">
+                <button class="btn btn-cancel" onclick="closeForceDialog(false)">Cancel</button>
+                <button id="forceDialogOk" class="btn btn-danger" style="margin-top: 0;" disabled onclick="closeForceDialog(true)">Proceed anyway</button>
+            </div>
+        </div>
+    </div>
+
 <script>
     const API_PORT = 5001;
     const API_BASE = `http://${window.location.hostname}:${API_PORT}/api`;
-    let currentLogHost = 'spark-4';
-    let currentServingHost = 'spark-4';
+    let currentLogHost = null;
+    let currentServingHost = null;
     let currentOfflineState = false;
     let globalCatalog = {};
     let lastSyncedActiveModel = null;
@@ -435,6 +574,26 @@
     let isTearingDown = false;
     let teardownMessage = '';
     let isDeploying = false;
+
+    // Reserved-host policy, mirrored from /api/status rather than
+    // hardcoded. The dashboard used to carry its own copy of the host list
+    // (spark-4 first, and therefore the default 1-node target) which went
+    // stale the moment cluster_config.yaml grew default_deploy_target and
+    // reserved -- pointing the default deploy at the one host that would
+    // then refuse it. These are display/default hints only; the guard
+    // itself is entirely server-side.
+    let reservedHosts = [];
+    let defaultDeployHost = null;
+    let hostSelectorSignature = null;
+
+    // Once the operator picks a target by hand, stop moving it under them.
+    // Without this the 4s poll re-pinned headSelect to serving_host on
+    // every tick -- and serving_host is just the first host in
+    // cluster_config order with a STANDALONE/HEAD container, i.e. always
+    // the reserved node once something resident is running there. Picking
+    // the other node visibly "didn't take": it reverted within 4 seconds
+    // and the deploy went to the reserved host and was refused.
+    let headSelectTouched = false;
 
     // ---- ETA monotonic clamp -------------------------------------------
     //
@@ -561,6 +720,205 @@
         }, 6000);
     }
 
+    // ---- Error-detail helpers -------------------------------------------
+    // FastAPI wraps everything in {"detail": ...}, but `detail` is a string
+    // for the generic failures and an object for the structured
+    // reserved-host refusal (see dgx-orchestrator.py's check_reserved_hosts).
+    // Both shapes need handling everywhere an error is surfaced.
+    async function readErrorDetail(response) {
+        try {
+            const data = await response.json();
+            return data && data.detail !== undefined ? data.detail : data;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function detailToMessage(detail, fallback) {
+        if (detail === null || detail === undefined) return fallback;
+        if (typeof detail === 'string') return detail;
+        if (detail.message) return detail.message;
+        try { return JSON.stringify(detail); } catch (e) { return fallback; }
+    }
+    // ---- end error-detail helpers ---------------------------------------
+
+    // ---- Reserved-host confirm dialog -----------------------------------
+    //
+    // Raised ONLY in response to an HTTP 423 from the server, never from a
+    // client-side prediction. Two reasons that matters:
+    //
+    //   1. The refusal text is generated server-side and names what
+    //      ACTIVE_DEPLOYMENT_STATE records as running on the reserved host
+    //      -- "spark-4 (running hermes-agent/1_node)", not just "spark-4 is
+    //      reserved". The dashboard has no way to produce that itself.
+    //   2. It cannot drift. A client-side copy of the reserved list would
+    //      go stale against cluster_config.yaml exactly the way the
+    //      hardcoded host dropdown already did.
+    //
+    // The unforced attempt is free: check_reserved_hosts() runs before the
+    // cluster lock and before any SSH, so a refusal costs one round-trip
+    // and touches nothing.
+    let forceDialogResolver = null;
+
+    function openForceDialog(detail, consequenceHtml, confirmLabel) {
+        return new Promise((resolve) => {
+            forceDialogResolver = resolve;
+            document.getElementById('forceDialogMessage').textContent =
+                detailToMessage(detail, 'This operation targets a host marked reserved in cluster_config.yaml.');
+            document.getElementById('forceDialogConsequence').innerHTML = consequenceHtml || '';
+            document.getElementById('forceConfirmLabel').textContent =
+                confirmLabel || 'I understand this will disturb the reserved host.';
+
+            const chk = document.getElementById('forceConfirmCheck');
+            chk.checked = false;
+            document.getElementById('forceDialogOk').disabled = true;
+            document.getElementById('forceDialogOverlay').classList.add('open');
+            chk.focus();
+        });
+    }
+
+    function onForceConfirmToggled() {
+        document.getElementById('forceDialogOk').disabled =
+            !document.getElementById('forceConfirmCheck').checked;
+    }
+
+    function closeForceDialog(result) {
+        // Reset before resolving: the caller may immediately fire another
+        // request, and a checkbox left ticked here would be visible for a
+        // frame on the next open, which is exactly the "was it already
+        // armed?" ambiguity this dialog exists to remove.
+        const chk = document.getElementById('forceConfirmCheck');
+        if (chk) chk.checked = false;
+        document.getElementById('forceDialogOk').disabled = true;
+        document.getElementById('forceDialogOverlay').classList.remove('open');
+
+        const resolve = forceDialogResolver;
+        forceDialogResolver = null;
+        if (resolve) resolve(result === true);
+    }
+
+    function onForceDialogBackdrop(event) {
+        // Backdrop click cancels; clicks inside the box must not.
+        if (event.target === document.getElementById('forceDialogOverlay')) {
+            closeForceDialog(false);
+        }
+    }
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && forceDialogResolver) closeForceDialog(false);
+    });
+    // ---- end reserved-host confirm dialog -------------------------------
+
+    function hostLabel(host, info) {
+        const alias = (info && info.alias) || '';
+        // cluster_config.yaml aliases look like "spark-9dbe" against host
+        // "spark-4"; show only the distinguishing tail, and fall back to
+        // the bare host name for any alias that doesn't fit that shape.
+        let short = '';
+        if (alias && alias !== host) {
+            const tail = alias.split('-').pop();
+            if (tail && tail !== host) short = tail;
+        }
+        let label = short ? `${host} (${short})` : host;
+        if (info && info.reserved) label += ' — reserved';
+        return label;
+    }
+
+    // Rebuilds the three host pickers from /api/status. Guarded by a
+    // signature so it only touches the DOM when the host set actually
+    // changes -- otherwise it would clobber the operator's selection on
+    // every 4s poll, which is the same class of bug as the serving_host
+    // re-pin described above.
+    function syncHostSelectors(data) {
+        const hosts = Object.keys(data.hosts || {});
+        if (!hosts.length) return;
+
+        const signature = hosts
+            .map(h => `${h}:${data.hosts[h].alias || ''}:${data.hosts[h].reserved ? 1 : 0}`)
+            .join('|');
+        if (signature === hostSelectorSignature) return;
+        const firstBuild = hostSelectorSignature === null;
+        hostSelectorSignature = signature;
+
+        const headSelect = document.getElementById('headSelect');
+        const prevHead = headSelect.value;
+        headSelect.innerHTML = hosts
+            .map(h => `<option value="${h}">${hostLabel(h, data.hosts[h])}</option>`)
+            .join('');
+        if (prevHead && hosts.includes(prevHead)) {
+            headSelect.value = prevHead;
+        } else if (defaultDeployHost && hosts.includes(defaultDeployHost)) {
+            // cluster_config.yaml's default_deploy_target, which is
+            // validated server-side to be active and NOT reserved.
+            headSelect.value = defaultDeployHost;
+        }
+
+        const logSelect = document.getElementById('logHostSelect');
+        const prevLog = logSelect.value;
+        logSelect.innerHTML = hosts
+            .map(h => `<option value="${h}">${hostLabel(h, data.hosts[h])}</option>`)
+            .join('');
+        logSelect.value = (prevLog && hosts.includes(prevLog))
+            ? prevLog
+            : (headSelect.value || hosts[0]);
+        if (firstBuild || currentLogHost === null || !hosts.includes(currentLogHost)) {
+            currentLogHost = logSelect.value;
+            document.getElementById('logHostLabel').innerText = currentLogHost;
+            fetchLogs();
+        }
+
+        const scopeSelect = document.getElementById('teardownScopeSelect');
+        const prevScope = scopeSelect.value;
+        // "" is the whole cluster, preserving the body-less semantics the
+        // Teardown button has always had. Per-host options exist because
+        // scoped teardown is the point of the reserved-host work: cycling
+        // one node while a resident model keeps serving on the other.
+        scopeSelect.innerHTML = '<option value="">All hosts</option>' + hosts
+            .map(h => `<option value="${h}">Only ${hostLabel(h, data.hosts[h])}</option>`)
+            .join('');
+        if (prevScope !== null && (prevScope === '' || hosts.includes(prevScope))) {
+            scopeSelect.value = prevScope;
+        }
+    }
+
+    function onHeadSelectChanged() {
+        headSelectTouched = true;
+        updateTargetHint();
+    }
+
+    // Advisory only. Says nothing the server won't say more precisely on
+    // refusal; it just says it before the click rather than after.
+    function updateTargetHint() {
+        const hint = document.getElementById('targetHint');
+        if (!hint) return;
+
+        const nodesSelect = document.getElementById('nodesSelect');
+        const model = document.getElementById('modelSelect').value;
+        const recipe = globalCatalog[model];
+        const nodes = nodesSelect.value || (recipe?.topologies?.['2_node'] ? '2' : '1');
+
+        let affected = [];
+        if (nodes === '2') {
+            // A 2-node deploy always spans the whole cluster, so it hits
+            // every reserved host regardless of the target picker (which
+            // is hidden for 2-node anyway).
+            affected = reservedHosts.slice();
+        } else {
+            const target = document.getElementById('headSelect').value;
+            if (target && reservedHosts.includes(target)) affected = [target];
+        }
+
+        if (!affected.length) {
+            hint.classList.add('hidden');
+            hint.textContent = '';
+            return;
+        }
+        hint.classList.remove('hidden');
+        hint.textContent = nodes === '2'
+            ? `⚠ 2-node spans the whole cluster, including reserved ${affected.join(', ')} — you'll be asked to confirm.`
+            : `⚠ ${affected.join(', ')} is reserved — you'll be asked to confirm.`;
+    }
+
     function updateBenchmarkControl(clusterReady) {
         const container = document.getElementById('benchmarkControlContainer');
         if (!container) return;
@@ -632,7 +990,7 @@
         // harmless on its own, but leaving it open invites exactly the
         // "click Deploy on a different model while teardown is still
         // running" mistake this whole thing exists to prevent.
-        ['modelSelect', 'nodesSelect', 'headSelect', 'userIdInput'].forEach(id => {
+        ['modelSelect', 'nodesSelect', 'headSelect', 'userIdInput', 'teardownScopeSelect'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.disabled = busy;
         });
@@ -658,6 +1016,33 @@
         return d.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
     }
 
+    // Which recipe should the model dropdown snap to?
+    //
+    // This used to take the first host in data.hosts with an
+    // active_recipe_key and stop. Object key order is cluster_config.yaml
+    // order, so with anything resident on the first-listed host that host
+    // ALWAYS won -- and the dropdown would silently ignore a deploy on the
+    // other node no matter how many times you re-polled or tabbed away and
+    // back. Preferring the host the operator is actually pointed at fixes
+    // that without needing the backend to guess which deploy is "the"
+    // interesting one, which under independent 1-node deploys it cannot
+    // know.
+    function detectActiveRecipeKey(data) {
+        const hosts = data.hosts || {};
+        const preference = [];
+
+        const target = document.getElementById('headSelect').value;
+        if (target) preference.push(target);
+        if (data.serving_host) preference.push(data.serving_host);
+        preference.push(...Object.keys(hosts));
+
+        for (const host of preference) {
+            const info = hosts[host];
+            if (info && info.active_recipe_key) return info.active_recipe_key;
+        }
+        return null;
+    }
+
     async function fetchStatus() {
         try {
             const res = await fetch(`${API_BASE}/status`);
@@ -671,19 +1056,23 @@
             isTearingDown = data.is_tearing_down || false;
             teardownMessage = data.teardown_message || '';
 
+            reservedHosts = Array.isArray(data.reserved_hosts) ? data.reserved_hosts : [];
+            defaultDeployHost = data.default_deploy_host || null;
+            syncHostSelectors(data);
+
             // Keep the head/target selector in sync with whatever's
-            // actually serving, not just its hardcoded default option.
-            // Without this, triggerBenchmarkNow() (and a fresh Deploy
-            // form) silently reads spark-4 forever for any recipe whose
-            // topologyRow is hidden (single-topology models -- see
-            // updateTopologyOptions()), since the user has no visible
-            // control to ever change it. Benchmark in particular targets
-            // "the active container", so it should always reflect reality
-            // regardless of whether the picker happens to be visible.
+            // actually serving -- but only until the operator picks a
+            // target themselves, and never onto a reserved host. The
+            // original unconditional version made the picker unusable the
+            // moment a resident model occupied the first-listed host: it
+            // snapped back every 4 seconds.
             if (data.serving_host) {
                 currentServingHost = data.serving_host;
                 const headSelect = document.getElementById('headSelect');
-                if (headSelect && headSelect.value !== currentServingHost
+                if (headSelect
+                        && !headSelectTouched
+                        && !reservedHosts.includes(currentServingHost)
+                        && headSelect.value !== currentServingHost
                         && headSelect.querySelector(`option[value="${currentServingHost}"]`)) {
                     headSelect.value = currentServingHost;
                 }
@@ -727,13 +1116,7 @@
             // entry happened to iterate first, regardless of what was
             // actually launched. See dgx-orchestrator.py's
             // ACTIVE_DEPLOYMENT_STATE module comment for the full story.
-            let detectedActiveRecipeKey = null;
-            for (const [host, info] of Object.entries(data.hosts)) {
-                if (info.active_recipe_key) {
-                    detectedActiveRecipeKey = info.active_recipe_key;
-                    break;
-                }
-            }
+            const detectedActiveRecipeKey = detectActiveRecipeKey(data);
 
             if (detectedActiveRecipeKey && globalCatalog[detectedActiveRecipeKey]) {
                 if (detectedActiveRecipeKey !== lastSyncedActiveModel) {
@@ -749,6 +1132,7 @@
             }
 
             updateRecipeMetadata();
+            updateTargetHint();
             updateBenchmarkControl(data.cluster_ready);
             applyOperationLocks();
 
@@ -758,6 +1142,7 @@
             for (const [host, info] of Object.entries(data.hosts)) {
                 const nodeStatus = info.docker_status || info.status || 'OFFLINE';
                 const statusBadge = nodeStatus === 'ONLINE' ? '<span class="badge online">ONLINE</span>' : '<span class="badge offline">OFFLINE</span>';
+                const reservedBadge = info.reserved ? '<span class="badge reserved" title="Marked reserved in cluster_config.yaml. Deploy and teardown both require an explicit confirmation to touch this host.">RESERVED</span>' : '';
                 
                 let modelBadgeClass = 'none';
                 const modelStatusStr = info.model_status || 'NONE';
@@ -801,8 +1186,9 @@
 
                 grid.innerHTML += `
                     <div class="card">
-                        <h3 style="margin: 0 0 10px 0; font-size: 15px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 8px;">
-                            ${host} ${statusBadge}
+                        <h3 style="margin: 0 0 10px 0; font-size: 15px; display: flex; justify-content: space-between; align-items: center; gap: 6px; border-bottom: 1px solid var(--border-color); padding-bottom: 8px;">
+                            <span>${host}</span>
+                            <span style="display: flex; gap: 5px; align-items: center;">${reservedBadge}${statusBadge}</span>
                         </h3>
                         <div class="metric-row"><span>Docker Daemon:</span><span class="metric-val">${nodeStatus}</span></div>
                         <div class="metric-row"><span>Container:</span><span class="metric-val">${runtimeDisplay}</span></div>
@@ -907,6 +1293,7 @@
             headContainer.style.visibility = 'visible';
         }
         updateRecipeMetadata();
+        updateTargetHint();
     }
 
     function updateRecipeMetadata() {
@@ -990,6 +1377,13 @@
         // correctly reads as "untested" the moment the selected recipe's
         // fields differ from whatever configuration actually last passed a
         // health check -- not just whatever last ran under this filename.
+        //
+        // NOTE: this line was previously stuck on "not confirmed" for any
+        // recipe only ever deployed from the CLI. That was not a display
+        // bug -- the launch-success record genuinely was never written,
+        // because the pending-confirmation state lived in memory in the
+        // short-lived CLI process. See dgx-orchestrator.py's
+        // PENDING_LAUNCH_STATE comment.
         const launchLine = document.getElementById('lastLaunchLine');
         const lastTs = top.last_launch_success_ts;
         const launchCount = top.last_launch_success_count || 0;
@@ -1023,6 +1417,7 @@
     }
 
     async function fetchLogs() {
+        if (!currentLogHost) return;
         try {
             const res = await fetch(`${API_BASE}/logs/${currentLogHost}?tail=150`);
             const data = await res.json();
@@ -1108,6 +1503,14 @@
         }, 1500);
     }
 
+    function postJson(path, payload) {
+        return fetch(`${API_BASE}${path}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        });
+    }
+
     async function triggerDeploy() {
         if (isTearingDown) {
             showStatusToast('Cannot deploy while a teardown is in progress.', true);
@@ -1128,7 +1531,8 @@
         const checkEl = document.getElementById('runBenchmarkCheck');
         const run_benchmark = checkEl ? checkEl.checked : false;
 
-        if(!confirm(`Deploy ${model} on ${nodes} node(s)?${run_benchmark ? '\n(Auto-benchmark enabled)' : ''}`)) return;
+        const targetLabel = nodes === 2 ? 'both nodes' : head;
+        if(!confirm(`Deploy ${model} on ${nodes} node(s) → ${targetLabel}?${run_benchmark ? '\n(Auto-benchmark enabled)' : ''}`)) return;
 
         // Immediate lock, before the request even goes out -- closes the
         // double-click window and blocks Teardown/benchmark controls for
@@ -1136,27 +1540,33 @@
         isDeploying = true;
         applyOperationLocks();
 
+        // force is NEVER read from persistent UI state. It is set only on
+        // the retry below, only for this one request, and only after the
+        // operator has ticked a box in a dialog that names the host and
+        // what is running on it.
+        const payload = { model, nodes, head, user_id, wait: run_benchmark, run_benchmark, force: false };
+
         try {
-            const response = await fetch(`${API_BASE}/deploy`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    model, 
-                    nodes, 
-                    head, 
-                    user_id,
-                    wait: run_benchmark,
-                    run_benchmark
-                })
-            });
-            
+            let response = await postJson('/deploy', payload);
+
+            if (response.status === 423) {
+                const detail = await readErrorDetail(response);
+                const consequence = nodes === 2
+                    ? 'A 2-node deploy spans the entire cluster, so it will <strong>tear down whatever is running on the reserved host</strong> before launching. There is no partial version of this.'
+                    : 'Deploying tears the target host down first, so this will <strong>destroy whatever is currently running there</strong>.';
+                const proceed = await openForceDialog(
+                    detail, consequence, 'Yes — tear down the reserved host and deploy anyway.'
+                );
+                if (!proceed) {
+                    showStatusToast('Deploy cancelled. Reserved host untouched.');
+                    return;
+                }
+                response = await postJson('/deploy', Object.assign({}, payload, { force: true }));
+            }
+
             if (!response.ok) {
-                let errMsg = response.statusText;
-                try {
-                    const errData = await response.json();
-                    errMsg = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
-                } catch(jsonErr) {}
-                showStatusToast(`Deployment Error: ${errMsg}`, true);
+                const detail = await readErrorDetail(response);
+                showStatusToast(`Deployment Error: ${detailToMessage(detail, response.statusText)}`, true);
             } else {
                 showStatusToast(run_benchmark ? '✓ Deployment & benchmark sequence initiated' : '✓ Deployment sequence initiated');
             }
@@ -1184,19 +1594,11 @@
 
         try {
             showStatusToast('✓ Initiating benchmark ...');
-            const response = await fetch(`${API_BASE}/benchmark`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ head, nodes, model })
-            });
+            const response = await postJson('/benchmark', { head, nodes, model });
             
             if (!response.ok) {
-                let errMsg = response.statusText;
-                try {
-                    const errData = await response.json();
-                    errMsg = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
-                } catch(jErr) {}
-                showStatusToast(`Benchmark Error: ${errMsg}`, true);
+                const detail = await readErrorDetail(response);
+                showStatusToast(`Benchmark Error: ${detailToMessage(detail, response.statusText)}`, true);
             } else {
                 showStatusToast('✓ Benchmark running in background');
                 fetchStatus();
@@ -1211,7 +1613,10 @@
             showStatusToast('Cannot teardown while a deployment is in progress.', true);
             return;
         }
-        if(!confirm('Are you sure you want to teardown all active runtimes across the cluster?')) return;
+
+        const scope = document.getElementById('teardownScopeSelect').value;
+        const scopeLabel = scope ? scope : 'ALL hosts';
+        if(!confirm(`Teardown active runtimes on ${scopeLabel}?`)) return;
 
         // Immediate client-side feedback before the first status poll can
         // pick up server-side state, and closes the double-click window.
@@ -1224,21 +1629,43 @@
         teardownMessage = 'Sending teardown request...';
         applyOperationLocks();
 
+        // hosts: null preserves the original whole-cluster semantics of the
+        // body-less POST this button used to send.
+        const payload = { hosts: scope ? [scope] : null, force: false };
+
         try {
-            const response = await fetch(`${API_BASE}/teardown`, {method: 'POST'});
+            let response = await postJson('/teardown', payload);
+
+            if (response.status === 423) {
+                const detail = await readErrorDetail(response);
+                const consequence = scope
+                    ? 'This host is reserved because something on it is meant to keep running. Tearing it down <strong>stops that model</strong>.'
+                    : 'A whole-cluster teardown includes the reserved host, so this <strong>stops the resident model along with everything else</strong>. To leave it alone, pick a single host in the scope selector instead.';
+                const proceed = await openForceDialog(
+                    detail, consequence, 'Yes — tear down the reserved host too.'
+                );
+                if (!proceed) {
+                    showStatusToast('Teardown cancelled. Reserved host untouched.');
+                    return;
+                }
+                response = await postJson('/teardown', Object.assign({}, payload, { force: true }));
+            }
+
             if (!response.ok) {
-                let errMsg = response.statusText;
-                try {
-                    const errData = await response.json();
-                    errMsg = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
-                } catch(jErr) {}
-                showStatusToast(`Teardown Error: ${errMsg}`, true);
+                const detail = await readErrorDetail(response);
+                showStatusToast(`Teardown Error: ${detailToMessage(detail, response.statusText)}`, true);
             } else {
-                showStatusToast('✓ Teardown complete');
+                showStatusToast(`✓ Teardown complete (${scopeLabel})`);
             }
         } catch(e) {
             showStatusToast('Teardown request failed.', true);
         } finally {
+            // A cancelled or refused teardown never started, so the local
+            // optimistic flag has to be released here -- the server-side
+            // is_tearing_down was never set and will never clear it.
+            isTearingDown = false;
+            teardownMessage = '';
+            applyOperationLocks();
             // The POST resolving means the backend's teardown phases are
             // already done and TEARDOWN_STATE is back to idle -- poll
             // immediately rather than waiting up to 4s for the next timer
@@ -1258,7 +1685,6 @@
     initYamlWrapPref();
     fetchCatalog();
     fetchStatus();
-    fetchLogs();
     setInterval(fetchCatalog, 15000);
     setInterval(fetchStatus, 4000);
     setInterval(fetchLogs, 5000);

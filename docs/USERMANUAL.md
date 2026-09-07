@@ -13,13 +13,13 @@ The dashboard is the easiest way to visualize cluster health and manage models.
 
 === Dashboard Features ===
 * '''Header bar:''' live cluster-wide throughput (<code>SPEED: X tok/s</code>) and request concurrency (<code>THREADS: X active (Y queued)</code>) whenever a model is serving, plus server time (UTC — a log-comparison reference, not a wall clock), a version badge showing the running <code>ORCHESTRATOR_VERSION</code> (useful for confirming a fix you just deployed actually landed), and an '''ONLINE MODE''' / '''OFFLINE MODE''' indicator.
-* '''Per-host panels (<code>spark-4</code>, <code>spark-3</code>):''' Docker daemon status, active container name and state, currently loaded model, model status, an ETA while a model is still loading, and live '''TEMP''' / '''GPU''' / '''MEM''' readings. Model status is one of: <code>READY</code>, a warmup/loading stage, <code>CRASHED</code> (the engine process itself has died — shown in red, with a reason where one could be determined; check that host's logs), <code>ORPHANED</code> (a worker whose head crashed out from under it — needs a teardown), or <code>NONE</code>.
+* '''Per-host panels (<code>spark-4</code>, <code>spark-3</code>):''' Docker daemon status, active container name and state, currently loaded model, model status, an ETA while a model is still loading, and live '''TEMP''' / '''GPU''' / '''MEM''' readings. Model status is one of: <code>READY</code>, a warmup/loading stage, <code>CRASHED</code> (the engine process itself has died — shown in red, with a reason where one could be determined; check that host's logs), <code>ORPHANED</code> (a worker whose head crashed out from under it — needs a teardown), or <code>NONE</code>. A host also shows a '''RESERVED''' badge when <code>cluster_config.yaml</code> marks it so. '''Model status is evaluated per host''' against that host's own health endpoint — before 2026-09-06 a non-serving host inherited the serving host's readiness, so a still-loading or dead model on the second node displayed as <code>READY</code>; if older notes or screenshots disagree with what you see now, that is why (see <code>docs/TOMBSTONES.md</code> #130).
 * '''Deploy a Model (Model Deployer panel):'''
 # Select a model from the '''Select Model''' dropdown — populated live from the current recipe catalog, not a fixed list (see the catalog note below the table).
-# Choose the '''Topology''' (1-Node or 2-Node) and, for a 1-node deploy, the '''Target''' host.
+# Choose the '''Topology''' (1-Node or 2-Node) and, for a 1-node deploy, the '''Target''' host. The target list is built from the live host inventory and starts on <code>cluster_config.yaml</code>'s <code>default_deploy_target</code>; reserved hosts are labelled as such. It follows whichever host is currently serving only until you pick one yourself, and never auto-selects a reserved host.
 # Enter a '''User ID / Auditor''' — a self-reported label for tracking who deployed what, not an authenticated identity.
 # Click '''Deploy Model'''.
-* '''Teardown:''' Click the red '''Teardown Runtimes''' button to gracefully stop and remove active models on both hosts and free up GPU memory. This is a multi-phase operation (SIGTERM the engine, gracefully stop each container, then force-remove anything still standing) that can take up to roughly a minute on a 2-node cluster — the button shows live phase progress for the duration rather than a static "in progress" label. While a teardown (or a deploy) is running, the other controls on the panel — Deploy, the benchmark toggle/button, and the model/topology/host fields — lock to prevent starting a conflicting operation mid-flight.
+* '''Teardown:''' Pick a scope in the selector beside the red '''Teardown Runtimes''' button — '''All hosts''', or a single named host — then click it to gracefully stop and remove the active models there and free up GPU memory. Scoping to one host is what lets a resident model on the other keep serving. If the scope includes a reserved host (which '''All hosts''' always does), a confirmation dialog appears first; see "Reserved Hosts" below. This is a multi-phase operation (SIGTERM the engine, gracefully stop each container, then force-remove anything still standing) that can take up to roughly a minute on a 2-node cluster — the button shows live phase progress for the duration rather than a static "in progress" label. While a teardown (or a deploy) is running, the other controls on the panel — Deploy, the benchmark toggle/button, and the model/topology/host fields — lock to prevent starting a conflicting operation mid-flight.
 * '''Live Logs:''' The full-width bottom panel shows a live terminal trace of the selected host's container logs. Health-check and metrics-polling lines are filtered out automatically so this stays readable during normal operation.
 
 === Understanding the ETA display ===
@@ -45,14 +45,21 @@ dgx-config status
 dgx-config deploy --model qwen-2.5-coder-32b --nodes 2
 </syntaxhighlight>
 Useful extra flags:
-:* <code>--head spark-3</code> — pick the target host for a 1-node deploy (default <code>spark-4</code>).
+:* <code>--head spark-3</code> — pick the target host for a 1-node deploy. Defaults to <code>cluster_config.yaml</code>'s <code>default_deploy_target</code> (the scratch node), '''not''' to a fixed host. A 2-node deploy ignores this and always puts the head on the first host listed under <code>hosts:</code>, so the head node stays consistent across topologies.
+:* <code>--force</code> — proceed even though a target host is marked <code>reserved</code>. See "Reserved Hosts" below; without it, the deploy is refused before any SSH happens.
 :* <code>--wait</code> — block until the model passes its HTTP health check instead of returning immediately. Recommended for scripted deploys where the next step depends on the model actually being ready.
 :* <code>--benchmark</code> — after <code>--wait</code> succeeds, automatically run a 3-pass benchmark and save results to <code>benchmark_results.txt</code> / <code>benchmark_ledger.csv</code>.
 :* <code>--dry-run</code> — print the exact <code>docker run</code> command(s) this deploy would send, without contacting either host or changing anything. See "Previewing a deploy" below.
 * '''Clear the Cluster (Teardown):'''
 <syntaxhighlight lang="bash">
-dgx-config teardown
+dgx-config teardown --host spark-3
+dgx-config teardown --host spark-3,spark-4
+dgx-config teardown --all
 </syntaxhighlight>
+'''Teardown requires an explicit scope.''' A bare <code>dgx-config teardown</code> exits with a usage error rather than clearing the cluster — destroying every runtime should be something you typed on purpose, not something you got by default. An unrecognised host name is an error listing the valid names, not a silent no-op reporting a clean teardown of nothing. Add <code>--force</code> if the scope includes a reserved host (<code>--all</code> always does).
+
+Scoping to one host leaves the other host's session tracking alone — the dashboard's session stats and the model ledger keep accruing for whatever is still serving.
+
 Graceful, not instant — see the dashboard Teardown bullet above for what's actually happening during the wait.
 * '''Check Container Logs:'''
 <syntaxhighlight lang="bash">
@@ -92,6 +99,25 @@ Every deploy now persists a crashed worker's Ray session logs (see Troubleshooti
 dgx-config correct-ledger --dry-run
 </syntaxhighlight>
 With no arguments, auto-detects the currently-serving model/topology and live <code>/metrics</code> values and previews the correction. Refuses to overwrite with a smaller value than what's currently recorded unless you pass <code>--force</code>. Backs up the whole ledger file (timestamped) before any real write. See Troubleshooting for the incident that prompted this.
+
+=== Reserved Hosts ===
+
+A host can be marked <code>reserved: true</code> in <code>cluster_config.yaml</code> when it carries something that must not be disturbed by routine work — a resident agent, a shared endpoint the team depends on. '''Deploy and teardown both refuse to touch a reserved host unless you explicitly override.'''
+
+Being reserved is a property of the '''machine''', not of whatever happens to be deployed on it — unlike <code>role</code>, which describes a host's part in one particular topology.
+
+How you override depends on the surface:
+
+* '''CLI:''' pass <code>--force</code> to <code>deploy</code> or <code>teardown</code>. The refusal message names the host and what is recorded as running on it, so you can see what you're about to destroy before deciding.
+* '''Dashboard:''' nothing is armed in advance. Click Deploy or Teardown normally; if the operation would disturb a reserved host, a dialog shows that same server-side refusal message and requires you to tick a confirmation box before '''Proceed anyway''' enables. Cancel, click the backdrop, or press Escape to back out.
+
+There is deliberately '''no persistent "force" checkbox''' on the dashboard. A checkbox holds state — ticked once for a legitimate override and then forgotten, it would silently skip the guard on the next deploy hours later, possibly for someone else at the same always-on dashboard. The dialog holds the override for exactly one request. See <code>docs/TOMBSTONES.md</code> #131.
+
+Two things reserving a host does '''not''' do:
+* '''It does not make 2-node deploys safe.''' A 2-node deploy always spans both hosts, so it needs the override and will take the reserved host's service down. That is intended — a decision, not a surprise.
+* '''It does not cover raw <code>docker run</code> over SSH''', which bypasses the orchestrator entirely and never sees the guard.
+
+<code>--dry-run</code> is '''not''' exempt from the check. It reports what a real deploy would do, so it reports the refusal a real deploy would hit rather than printing a command that would in fact be blocked.
 
 === Previewing a deploy (<code>--dry-run</code>) ===
 Before deploying something unfamiliar, or if you're not sure a model/topology combination will actually work, run:
@@ -177,7 +203,7 @@ stock vLLM API server. <code>--variant-b</code> is optional — give only
 <code>--variant-a</code> to profile a single recipe on its own.
 
 '''Full flag reference and worked examples for every mode:''' see
-<code>tests/AB_TEST_USAGE.md</code>. This section is deliberately just
+<code>docs/AB_TEST_USAGE.md</code>. This section is deliberately just
 the pointer — that document covers the override flags, the built-in
 Gemma4 comparison presets, the prompt-preset sweep, and the entrypoint
 constraint (a structural limit of the deploy path itself, not something
@@ -268,7 +294,7 @@ ssh tetrel@10.0.14.43 "sudo systemctl start docker"
 (Use <code>10.0.14.41</code> for <code>spark-3</code>.)
 
 * '''"Out of Memory" (OOM) Errors:'''
-If a deployment fails instantly, it usually means the previous model wasn't cleaned up properly. Run <code>dgx-config teardown</code> to flush the GPUs before trying again.
+If a deployment fails instantly, it usually means the previous model wasn't cleaned up properly. Run <code>dgx-config teardown --host <node></code> (or <code>--all</code>) to flush the GPUs before trying again — teardown takes an explicit scope and a bare invocation is a usage error.
 
 * '''A model shows as "CRASHED" or "ORPHANED":'''
 <code>CRASHED</code> means the engine process itself has died — check that host's logs (<code>dgx-config logs --host spark-4</code>) for the actual error, which is usually near the very end. <code>ORPHANED</code> specifically means a worker node's head counterpart crashed, leaving the worker alive but with nothing to serve — this needs a teardown, not a wait. Note that in a 2-node deploy, Docker reporting a container as "running" doesn't guarantee the model engine inside it is actually alive — the container can stay up (it's running the cluster coordination process) even after the model-serving process inside has crashed. The dashboard/CLI status logic accounts for this by reading the container's own logs rather than trusting container state alone, but if something ever looks "stuck" in a loading state for far longer than its estimate with no error shown, check the logs directly rather than assuming it's still working.

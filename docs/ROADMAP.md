@@ -520,6 +520,23 @@ UI: selectable, same as any other model.
   successful launch could auto-promote from `unconfirmed` to `validated`
   without a human touching the YAML at all, keeping the marker honest and
   low-maintenance rather than another thing to remember to update by hand.
+- **Caveat added 2026-09-06: the launch history this would promote off is
+  INCOMPLETE for everything written before that date, not merely sparse.**
+  `PENDING_LAUNCH_STATE` was memory-only until then, so a deploy issued
+  through `dgx-config` -- a separate process from the daemon that is the
+  only thing that ever consumes a pending record -- never recorded a launch
+  success at all. Independently, the single global pending slot was matched
+  against the *serving* host's model, so a deploy onto any other host could
+  not match its own record either and aged out after
+  `PENDING_LAUNCH_STALE_SEC`. Both fixed (`TOMBSTONES.md` #129; the
+  per-host readiness half is #130), but the historical data is already
+  written. Auto-promoting off it would systematically leave CLI-only and
+  scratch-node-only recipes stuck at `unconfirmed` -- **while looking
+  exactly like a working feature**, which is the failure mode this entry
+  elsewhere calls out as worse than the inverse. Decide explicitly whether
+  to treat pre-2026-09-06 history as a floor (absence proves nothing) or to
+  discount it entirely and let the marker rebuild from post-fix launches.
+  Do not treat it as ground truth.
 - Surface the status as a visible badge/color next to each model in the
   dashboard dropdown and in `dgx-config status`'s catalog listing --
   something a person glances at before clicking Deploy, not something
