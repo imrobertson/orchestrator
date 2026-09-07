@@ -22,7 +22,7 @@ gpu_util_ceiling: 0.75
 #
 # Omit it entirely and everything falls back to the first active host,
 # i.e. the behaviour before this field existed.
-default_deploy_target: spark-3
+default_deploy_target: spark-4
 
 # Cluster-wide offline-mode switches. Set to 1 to force offline mode across
 # all models; toggled at runtime by /api/toggle-network. Moved here from
