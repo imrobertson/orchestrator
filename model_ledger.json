@@ -172,8 +172,8 @@
         "count": 11
       },
       "6dac0d37cd5c9096": {
-        "last_success_ts": 1788375582.2691207,
-        "count": 2
+        "last_success_ts": 1788799195.658343,
+        "count": 3
       }
     },
     "last_seen_raw": {
@@ -198,6 +198,24 @@
         "engine_init_sec": 31.48,
         "rank_count": 3,
         "unaccounted_sec": 56.155148999999994
+      },
+      {
+        "run_id": "1788798803-spark-3-c90944d786db",
+        "ts": 1788798803.0,
+        "outcome": "ready",
+        "config_hash": "6dac0d37cd5c9096",
+        "total_sec": 387.625074,
+        "pre_load_sec": 134.901317,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 164.82999999999998,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 31.3,
+        "rank_count": 3,
+        "unaccounted_sec": 56.59375699999998
       }
     ]
   },
@@ -500,6 +518,10 @@
       "024319b1c39a95d4": {
         "last_success_ts": 1788355195.2798572,
         "count": 1
+      },
+      "6c1b11350dd75caa": {
+        "last_success_ts": 1788748101.5415318,
+        "count": 1
       }
     },
     "last_seen_raw": {
@@ -507,7 +529,27 @@
       "g": 768.0,
       "d": 722.0,
       "a": 407.0
-    }
+    },
+    "runs": [
+      {
+        "run_id": "1788747859-spark-3-607df01385bc",
+        "ts": 1788747859.0,
+        "outcome": "ready",
+        "config_hash": "6c1b11350dd75caa",
+        "total_sec": 238.690692,
+        "pre_load_sec": 31.33355,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 144.95,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": 0.5,
+        "compile_stage_confidence": "reported_cache_possible",
+        "engine_init_sec": 52.29,
+        "rank_count": 1,
+        "unaccounted_sec": 9.61714200000003
+      }
+    ]
   },
   "qwen-3.8-27b-nvfp4::1_node": {
     "runs": [
@@ -1478,6 +1520,18 @@
         "last_success_ts": 1788747032.5710511,
         "count": 2
       }
+    },
+    "lifetime": {
+      "in": 9937855,
+      "out": 72960,
+      "draft": 77551,
+      "accepted": 47160
+    },
+    "last_seen_raw": {
+      "p": 9937855.0,
+      "g": 72960.0,
+      "d": 77551.0,
+      "a": 47160.0
     }
   }
 }
