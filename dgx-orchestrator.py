@@ -2870,7 +2870,17 @@ def _compute_cluster_status_impl() -> dict:
 
     serving_host = PRIMARY_HOST
     for host in HOSTS:
-        if container_info.get(host, {}).get("active_container") in (ContainerRole.STANDALONE, ContainerRole.HEAD):
+        info = container_info.get(host, {})
+        # is_crashed excludes EXITED/dead containers from consideration --
+        # active_container alone is set from the container NAME regardless
+        # of state (see _discover_host_container), so an earlier-listed
+        # host with a stale crashed container previously shadowed a
+        # later-listed host that was genuinely serving. serving_host then
+        # drove cluster_ready via host_health.get(serving_host), which
+        # health-checked the crashed host instead -- reporting the whole
+        # cluster not-ready (no benchmark button, auto-benchmark never
+        # firing) while a real deploy sat healthy one host over.
+        if info.get("active_container") in (ContainerRole.STANDALONE, ContainerRole.HEAD) and not info.get("is_crashed"):
             serving_host = host
             break
     serving_ip = HOSTS[serving_host]["ip"]

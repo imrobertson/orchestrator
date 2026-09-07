@@ -571,6 +571,21 @@
     let lastSyncedActiveModel = null;
     let latestSessionStats = null;
     let isBenchmarking = false;
+    // Set the instant a deploy request is actually sent, cleared once the
+    // cluster reports ready (or the deploy fails outright / a teardown
+    // clears the slate). This is deliberately NOT the same window as
+    // isDeploying: isDeploying only covers the fetch() call itself, which
+    // returns almost immediately when run_benchmark is unchecked (the
+    // server only blocks on wait_for_cluster_ready when wait=true is
+    // sent). Auto-run-benchmark is a value captured ONCE, at the moment
+    // the /deploy payload is built -- ticking the checkbox at any point
+    // afterward, including the entire loading window while the model is
+    // still booting, has zero effect on that already-sent request. The
+    // checkbox being visible and interactive throughout that window is
+    // what invited checking it "too late" and concluding auto-run was
+    // broken, when the request had simply already gone out without it.
+    let awaitingReady = false;
+    let pendingAutoBenchmark = false;
     let savedBenchmarkCheckState = false;
     let isTearingDown = false;
     let teardownMessage = '';
@@ -943,6 +958,10 @@
         if (!container) return;
 
         if (clusterReady) {
+            // Reached ready -- whatever was decided at deploy time is now
+            // moot either way, so clear the window regardless of which
+            // branch fires next.
+            awaitingReady = false;
             if (isBenchmarking) {
                 container.innerHTML = `
                     <button class="btn btn-action" style="background: #475569; cursor: not-allowed;" disabled>
@@ -956,7 +975,22 @@
                     </button>
                 `;
             }
+        } else if (awaitingReady) {
+            // A deploy has already been sent and is loading. The
+            // auto-benchmark choice for THIS launch was locked into that
+            // request's payload the moment it was sent -- showing an
+            // interactive checkbox here would suggest changing your mind
+            // still does something, when it can't. Show what was actually
+            // decided instead.
+            container.innerHTML = `
+                <div style="color: #94a3b8; font-size: 13px; padding: 6px 0;">
+                    ⏳ Waiting for model to become ready${pendingAutoBenchmark ? ' — benchmark will run automatically' : ''}...
+                </div>
+            `;
         } else {
+            // Idle: nothing deployed, nothing loading. This is the only
+            // window where checking this box actually does anything --
+            // the next click of Deploy is what reads it.
             const currentCheck = document.getElementById('runBenchmarkCheck');
             if (currentCheck) {
                 savedBenchmarkCheckState = currentCheck.checked;
@@ -1598,6 +1632,16 @@
         isDeploying = true;
         applyOperationLocks();
 
+        // Locked in NOW, not when the response comes back: run_benchmark's
+        // value in `payload` is what actually gets sent below, and nothing
+        // that happens to the checkbox after this point can change that.
+        // See updateBenchmarkControl()'s awaitingReady branch -- this is
+        // the flag that swaps the (now-inert) checkbox for a status line
+        // for the rest of this launch's loading window.
+        awaitingReady = true;
+        pendingAutoBenchmark = run_benchmark;
+        updateBenchmarkControl(false);
+
         // force is NEVER read from persistent UI state. It is set only on
         // the retry below, only for this one request, and only after the
         // operator has ticked a box in a dialog that names the host and
@@ -1616,6 +1660,10 @@
                     detail, consequence, 'Yes — tear down the reserved host and deploy anyway.'
                 );
                 if (!proceed) {
+                    // Never actually sent -- nothing is loading, so the
+                    // checkbox goes back to being meaningful immediately.
+                    awaitingReady = false;
+                    updateBenchmarkControl(false);
                     showStatusToast('Deploy cancelled. Reserved host untouched.');
                     return;
                 }
@@ -1623,6 +1671,11 @@
             }
 
             if (!response.ok) {
+                // Deploy never actually launched -- nothing is loading,
+                // so restore the checkbox rather than leaving the status
+                // line up for a launch that didn't happen.
+                awaitingReady = false;
+                updateBenchmarkControl(false);
                 const detail = await readErrorDetail(response);
                 showStatusToast(`Deployment Error: ${detailToMessage(detail, response.statusText)}`, true);
             } else {
@@ -1633,6 +1686,10 @@
                 showStatusToast(run_benchmark ? '✓ Deployment & benchmark sequence initiated' : '✓ Deployment sequence initiated');
             }
         } catch(e) {
+            // Request never landed -- same reasoning as the !response.ok
+            // branch above.
+            awaitingReady = false;
+            updateBenchmarkControl(false);
             showStatusToast(`Deployment failed: ${e.message || 'Server connection lost'}`, true);
         } finally {
             isDeploying = false;
@@ -1727,7 +1784,15 @@
             // is_tearing_down was never set and will never clear it.
             isTearingDown = false;
             teardownMessage = '';
+            // Whatever was loading before this teardown is gone now,
+            // reached ready or not -- if it never got there (a stuck or
+            // crashed boot), this is the only place that clears the
+            // "waiting for model to become ready" status line, since
+            // updateBenchmarkControl() only ever clears it via cluster_ready
+            // going true.
+            awaitingReady = false;
             applyOperationLocks();
+            updateBenchmarkControl(false);
             // The POST resolving means the backend's teardown phases are
             // already done and TEARDOWN_STATE is back to idle -- poll
             // immediately rather than waiting up to 4s for the next timer
