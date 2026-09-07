@@ -138,7 +138,7 @@ topologies:
     - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     vllm_args: >-
       --trust-remote-code --kv-cache-dtype fp8
-      --distributed-executor-backend ray --tool-call-parser glm47
+      --tool-call-parser glm47
       --enable-auto-tool-choice --reasoning-parser glm45 --block-size 2304
       --moe-backend marlin
       --max-num-seqs 2
