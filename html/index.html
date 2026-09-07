@@ -419,13 +419,13 @@
             <h2>Model Deployer</h2>
             
             <label>Select Model:</label>
-            <select id="modelSelect" onfocus="fetchCatalog()" onchange="updateTopologyOptions()"></select>
+            <select id="modelSelect" onfocus="fetchCatalog()" onchange="onModelSelectChanged()"></select>
             
             <!-- Conditional Topology Row -->
             <div id="topologyRow" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
                 <div id="topoSelectContainer">
                     <label>Topology:</label>
-                    <select id="nodesSelect" onchange="updateHeadNodeVisibility()">
+                    <select id="nodesSelect" onchange="updateDeployTargetControls()">
                         <!-- Populated Dynamically -->
                     </select>
                 </div>
@@ -519,6 +519,7 @@
             
             <div style="margin-top: auto;">
                 <button id="deployBtn" class="btn" onclick="triggerDeploy()">Deploy Model</button>
+                <label for="teardownScopeSelect" style="margin-top: 10px;">Teardown scope:</label>
                 <div class="teardown-row">
                     <select id="teardownScopeSelect" title="Which hosts to tear down. Scoped teardown is what lets a resident model on one node survive while you cycle the other."></select>
                     <button id="teardownBtn" class="btn btn-danger" onclick="triggerTeardown()">Teardown Runtimes</button>
@@ -594,6 +595,19 @@
     // the other node visibly "didn't take": it reverted within 4 seconds
     // and the deploy went to the reserved host and was refused.
     let headSelectTouched = false;
+
+    // Same reasoning applied to the model picker. The deployer panel doubles
+    // as "what is running" and "what am I about to deploy" -- two questions
+    // that only had the same answer while the cluster ran one thing at a
+    // time. Auto-following what is running is a reasonable default UNTIL the
+    // operator states an intent; after that it is overwriting their input.
+    // Left unguarded this is actively hostile now that recipe detection
+    // prefers the selected target host: choosing a target that already has
+    // something on it would silently rewrite the model selection to whatever
+    // that host is serving, and rebuild the topology options underneath.
+    // Reset after a deploy is issued, at which point what is running and what
+    // was chosen agree again.
+    let modelSelectTouched = false;
 
     // ---- ETA monotonic clamp -------------------------------------------
     //
@@ -886,6 +900,11 @@
         updateTargetHint();
     }
 
+    function onModelSelectChanged() {
+        modelSelectTouched = true;
+        updateTopologyOptions();
+    }
+
     // Advisory only. Says nothing the server won't say more precisely on
     // refusal; it just says it before the click rather than after.
     function updateTargetHint() {
@@ -1119,7 +1138,7 @@
             const detectedActiveRecipeKey = detectActiveRecipeKey(data);
 
             if (detectedActiveRecipeKey && globalCatalog[detectedActiveRecipeKey]) {
-                if (detectedActiveRecipeKey !== lastSyncedActiveModel) {
+                if (!modelSelectTouched && detectedActiveRecipeKey !== lastSyncedActiveModel) {
                     lastSyncedActiveModel = detectedActiveRecipeKey;
                     const modelSelect = document.getElementById('modelSelect');
                     if (modelSelect.value !== detectedActiveRecipeKey) {
@@ -1264,12 +1283,16 @@
             nodesSelect.innerHTML += `<option value="2">2 Node</option>`;
         }
         
-        const topoRow = document.getElementById('topologyRow');
-        if (topoKeys.length <= 1) {
-            topoRow.style.display = 'none';
-        } else {
-            topoRow.style.display = 'grid';
-        }
+        // Visibility of the two pickers is decided together in
+        // updateDeployTargetControls() below -- NOT here. This used to hide
+        // the whole `topologyRow` on a single-topology recipe, and
+        // headSelectContainer is a CHILD of that row, so the Target picker
+        // disappeared along with the topology picker it was the only thing
+        // meant to hide. On a 1-node-only recipe there was then no control
+        // for the deploy target at all and the deploy silently used
+        // default_deploy_target. Harmless while that default was the host
+        // people wanted anyway; a visible wrong answer the moment
+        // cluster_config.yaml set it to the scratch node.
 
         if (currentNodes && nodesSelect.querySelector(`option[value="${currentNodes}"]`)) {
             nodesSelect.value = currentNodes;
@@ -1277,21 +1300,40 @@
             nodesSelect.value = topoKeys[0] === '2_node' ? '2' : '1';
         }
         
-        updateHeadNodeVisibility();
+        updateDeployTargetControls();
     }
 
-    function updateHeadNodeVisibility() {
+    // The topology picker and the target picker answer different questions
+    // and must hide independently. They share a grid row purely for layout,
+    // which is exactly the coupling that removed the operator's only way to
+    // choose a deploy target on any single-topology recipe.
+    //
+    //   topology picker -> only meaningful when the recipe defines BOTH
+    //                      topologies; otherwise there is nothing to choose.
+    //   target picker   -> only meaningless for a 2-node deploy, which spans
+    //                      every host by definition. A 1-node deploy always
+    //                      has a target worth choosing, whether or not the
+    //                      recipe happens to also define a 2-node topology.
+    function updateDeployTargetControls() {
         const nodesSelect = document.getElementById('nodesSelect');
         const model = document.getElementById('modelSelect').value;
         const recipe = globalCatalog[model];
+        const topoKeys = Object.keys(recipe?.topologies || {});
         const nodes = nodesSelect.value || (recipe?.topologies?.['2_node'] ? '2' : '1');
-        
-        const headContainer = document.getElementById('headSelectContainer');
-        if (nodes === "2") {
-            headContainer.style.visibility = 'hidden';
-        } else {
-            headContainer.style.visibility = 'visible';
-        }
+
+        const showTopo = topoKeys.length > 1;
+        const showHead = nodes !== '2';
+
+        document.getElementById('topoSelectContainer').style.display = showTopo ? 'block' : 'none';
+        document.getElementById('headSelectContainer').style.display = showHead ? 'block' : 'none';
+
+        // display:none rather than visibility:hidden, so a hidden picker
+        // gives its column back instead of leaving a dead gap -- and the
+        // surviving picker goes full-width rather than sitting in half a row.
+        const topoRow = document.getElementById('topologyRow');
+        topoRow.style.display = (showTopo || showHead) ? 'grid' : 'none';
+        topoRow.style.gridTemplateColumns = (showTopo && showHead) ? '1fr 1fr' : '1fr';
+
         updateRecipeMetadata();
         updateTargetHint();
     }
@@ -1568,6 +1610,10 @@
                 const detail = await readErrorDetail(response);
                 showStatusToast(`Deployment Error: ${detailToMessage(detail, response.statusText)}`, true);
             } else {
+                // What is running and what was chosen now agree, so let the
+                // panel resume following reality until the operator diverges
+                // from it again.
+                modelSelectTouched = false;
                 showStatusToast(run_benchmark ? '✓ Deployment & benchmark sequence initiated' : '✓ Deployment sequence initiated');
             }
         } catch(e) {

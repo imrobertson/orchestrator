@@ -170,11 +170,23 @@ Detection order: the host your **Target** selector points at, then
 `serving_host`, then `cluster_config.yaml` order. So a CLI deploy to `spark-3`
 with the selector on `spark-4` shows `spark-4`'s recipe.
 
+**Auto-follow stops once you pick a model by hand** (`modelSelectTouched`), and
+resumes after a deploy is issued. Without that guard, target-aware detection
+had a trap: selecting a target host that already had something running on it
+would rewrite your *model* selection to whatever that host was serving, and
+rebuild the topology options underneath — a side effect of choosing where to
+deploy. See `TOMBSTONES.md` #132.
+
 This is deliberate but unsatisfying, and it is squarely a spike question. Under
 two independent 1-node deploys there is no single correct answer to "what is
 running", and the current UI can only express one. Following the operator's
 stated intent is the least-wrong option available without redesigning the panel —
 it is not a good answer, just a defensible one.
+
+The deeper problem is that this one control answers two questions — "what is
+running" and "what am I about to deploy" — which only had the same answer while
+the cluster ran one thing at a time. Every awkwardness here follows from that,
+and it is question 2 in §8.
 
 ### The ETA countdown is clamped, and the clamp is cosmetic
 
@@ -229,6 +241,20 @@ show per-host state correctly, but nothing in the UI presents "these two
 independent models are up, here is each one's health, throughput, and history"
 as a first-class view. Everything that does exist is a workaround for that
 absence.
+
+### Control visibility is decided in JavaScript, per recipe shape
+
+The Topology and Target pickers each hide themselves depending on the selected
+recipe: Topology is shown only when a recipe defines both topologies, Target
+only when the deploy is 1-node. They share a grid row for layout only.
+
+Worth knowing because they used to be *coupled* — the Target picker was a DOM
+child of the row that the Topology logic hid, so any single-topology recipe
+silently had no deploy-target control at all and fell through to
+`default_deploy_target` (`TOMBSTONES.md` #132). If a control ever appears to be
+"stuck" or ignoring input, check whether it is actually rendered before
+reasoning about its state: an absent control and a present-but-ignored one
+produce identical JavaScript state.
 
 ### `--dry-run` is not exempt from the reserved-host guard
 

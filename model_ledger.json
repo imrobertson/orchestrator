@@ -1433,5 +1433,51 @@
       "d": 34140.0,
       "a": 22546.0
     }
+  },
+  "qwen-3.6-35b-a3b-nvfp4-nothink::1_node": {
+    "runs": [
+      {
+        "run_id": "1788745061-spark-3-6e389260a1f6",
+        "ts": 1788745061.0,
+        "outcome": "ready",
+        "config_hash": "f2cabdaa9ea4b750",
+        "total_sec": 271.433959,
+        "pre_load_sec": 26.039016,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 187.44,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 51.04,
+        "rank_count": 1,
+        "unaccounted_sec": 6.914942999999994
+      },
+      {
+        "run_id": "1788746784-spark-4-668d1be178ab",
+        "ts": 1788746784.0,
+        "outcome": "ready",
+        "config_hash": "f2cabdaa9ea4b750",
+        "total_sec": 244.118058,
+        "pre_load_sec": 33.741612,
+        "pre_load_is_derived": true,
+        "pre_load_confidence": "measured",
+        "weight_load_sec": 192.65,
+        "download_sec": null,
+        "download_confidence": "absent_known_stack",
+        "compile_sec": null,
+        "compile_stage_confidence": "absent_known_stack",
+        "engine_init_sec": 12.52,
+        "rank_count": 1,
+        "unaccounted_sec": 5.206445999999971
+      }
+    ],
+    "launch_history": {
+      "f2cabdaa9ea4b750": {
+        "last_success_ts": 1788747032.5710511,
+        "count": 2
+      }
+    }
   }
 }
