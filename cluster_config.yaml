@@ -88,11 +88,11 @@ hosts:
   # Ray deploy and the host whose /metrics feed SESSION_TRACKER. Order
   # here is load-bearing -- do not reorder without reading
   # dgx-orchestrator.py's comment above PRIMARY_HOST.
-  spark-4:
-    alias: spark-9dbe
+  spark-3:
+    alias: spark-6e63
     role: head
-    management_ip: 10.0.14.43
-    backplane_ip: 192.168.99.2
+    management_ip: 10.0.14.41
+    backplane_ip: 192.168.99.1
     volume_mount: /home/tetrel/.cache/huggingface:/root/.cache/huggingface
     active: true
     # Carries the resident hermes agent. Deploy and teardown both refuse
@@ -111,11 +111,11 @@ hosts:
     # so any 2-node work needs --force and will take hermes down. That is
     # intended: it should be a decision, not a surprise.
     reserved: true
-  spark-3:
-    alias: spark-6e63
+  spark-4:
+    alias: spark-9dbe
     role: worker
-    management_ip: 10.0.14.41
-    backplane_ip: 192.168.99.1
+    management_ip: 10.0.14.43
+    backplane_ip: 192.168.99.2
     volume_mount: /home/tetrel/.cache/huggingface:/root/.cache/huggingface
     active: true
 
