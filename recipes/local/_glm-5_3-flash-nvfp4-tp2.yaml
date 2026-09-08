@@ -135,6 +135,7 @@ model_path_override: /models/GLM-5.3-Flash-NVFP4
 extra_mounts:
 - /var/tmp/glm-5.3-flash-nvfp4:/models/GLM-5.3-Flash-NVFP4
 gpu_util: 0.85
+gpu_util_ceiling_exempt: true
 notes: |
   LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt token corruption (vLLM #54150) — use RedHatAI/GLM-5.3-Flash-NVFP4 instead.
   KV pool ~507K at fp8 + gmu 0.85 with MTP active; two concurrent 512K requests exceeds budget — max 1 full-length at a time.
