@@ -212,6 +212,34 @@ class RecipeConfig(BaseModel):
     # need and most don't. Collapsing them would mean the dashboard
     # displaying a raw container filesystem path as "the model" instead of
     # the HF repo id every other recipe shows.
+    # CONSTRAINT, and it is not obvious: the container-side path's LAST
+    # SEGMENT should match hf_path's basename exactly, CASE INCLUDED.
+    #
+    #   hf_path: RedHatAI/GLM-5.3-Flash-NVFP4
+    #   good:    /models/GLM-5.3-Flash-NVFP4
+    #   bad:     /models/glm-5.3-flash-nvfp4     <- lowercase; breaks below
+    #
+    # _discover_host_container() derives loaded_model by splitting whatever
+    # follows --model on "/" and taking the last element, and
+    # _resolve_catalog_key() then matches that CASE-SENSITIVELY against
+    # hf_path/cat_key. Point --model at a path whose basename differs and
+    # all three of its match conditions fail, so it returns loaded_model
+    # unchanged -- a string that is not a catalog key. Per that function's
+    # own docstring it is the single source of truth for anything keying a
+    # ledger, session tracker, or historical lookup, so the fallback keys
+    # them on a fabricated name (the #127 class).
+    #
+    # Not live breakage today: _resolve_active_recipe() prefers
+    # ACTIVE_DEPLOYMENT_STATE's exact record, which covers every
+    # orchestrator-initiated deploy. It bites when that record is absent --
+    # cleared state, a container outliving it, anything started outside the
+    # deploy path. Matching the basename costs nothing and avoids relying
+    # on that preference holding.
+    #
+    # Deliberately NOT fixed by making _resolve_catalog_key()
+    # case-insensitive: broadening a fuzzy matcher with a history of
+    # ambiguous collisions (#57, #77, #110) trades a narrow, avoidable
+    # problem for a wider one.
     model_path_override: Optional[str] = None
     # Additional `-v host_path:container_path[:ro]` bind mounts, applied
     # identically on every target host. Exists for the same case as

@@ -103,9 +103,16 @@ entrypoint: ""
 # mods/prefetch hook for a path outside the shared HF cache mount):
 #   huggingface-cli download RedHatAI/GLM-5.3-Flash-NVFP4 \
 #     --local-dir /var/tmp/glm-5.3-flash-nvfp4
-model_path_override: /models/glm-5.3-flash-nvfp4
+# NOTE the container path's basename is GLM-5.3-Flash-NVFP4, matching
+# hf_path's basename exactly INCLUDING CASE -- not the lowercase
+# /var/tmp/... host path. _discover_host_container() reads the last path
+# segment of --model and _resolve_catalog_key() matches it case-sensitively
+# against hf_path, so a lowercase container path resolves to no catalog
+# entry and the ledger/session tracker key on a fabricated name. The host
+# side can be named anything; only the container side matters.
+model_path_override: /models/GLM-5.3-Flash-NVFP4
 extra_mounts:
-- /var/tmp/glm-5.3-flash-nvfp4:/models/glm-5.3-flash-nvfp4
+- /var/tmp/glm-5.3-flash-nvfp4:/models/GLM-5.3-Flash-NVFP4
 gpu_util: 0.85
 notes: |
   LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt token corruption (vLLM #54150) — use RedHatAI/GLM-5.3-Flash-NVFP4 instead.

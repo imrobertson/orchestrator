@@ -19,7 +19,7 @@ import datetime
 # is what actually answers "did my push/pull/restart take" now -- it's
 # derived, not typed, so it can't be forgotten the way this slug already
 # has been.
-ORCHESTRATOR_VERSION_SLUG = "2026-09-07-recipe-entrypoint-override-menu-force"
+ORCHESTRATOR_VERSION_SLUG = "2026-09-07-recipe-image-escape-hatches-serving-host"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
@@ -3941,7 +3941,15 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     # extra_mount_flags is host-symmetric by design (see RecipeConfig.
     # extra_mounts) and applied identically in both the 1-node and 2-node
     # branches, alongside vol_mount/compat_mount.
-    model_effective = model_config.get("model_path_override") or hf_path
+    # `is not None`, not truthiness -- consistent with entrypoint_override
+    # above. An empty-string override is meaningless rather than
+    # meaningful here (unlike entrypoint, where "" is the neutralize
+    # signal), but silently treating it as "unset" would hide a malformed
+    # recipe instead of launching something visibly wrong, and the two
+    # fields reading differently invites exactly the truthiness slip this
+    # rule exists to prevent.
+    _model_override = model_config.get("model_path_override")
+    model_effective = hf_path if _model_override is None else _model_override
     extra_mount_flags = []
     for mount in model_config.get("extra_mounts", []):
         extra_mount_flags.extend(["-v", mount])

@@ -13,6 +13,12 @@
 #   summary       one line, imperative where possible
 #   confidence    validated   -- watched it work
 #                 known_bad   -- watched it fail, mechanism understood
+#                 mechanism_confirmed
+#                             -- mechanism confirmed by direct source read;
+#                                no incident has occurred. Stronger than
+#                                unconfirmed, weaker than known_bad. Bounded
+#                                by rule 6 below -- read it before using this
+#                                tier, it is narrow on purpose.
 #                 unconfirmed -- written down, never actually exercised
 #   enforce       error | warn | none
 #                 `none` = documentation only; the linter must not fire
@@ -24,7 +30,7 @@
 # ADDING A RULE: only from a real incident. Do not anticipate.
 
 version: 1
-generated_from: "TOMBSTONES.md #27-#114, TROUBLESHOOTING.md #1-14, 2026-09-03 synthesis"
+generated_from: "TOMBSTONES.md #27-#114, TROUBLESHOOTING.md #1-14, 2026-09-03 synthesis + 2026-09-07 session (E019-E022; images: tonyd2wild_glm53, aeon_ultimate)"
 
 builds:
   # Named so a rule can be scoped to the build it was actually proven on.
@@ -82,6 +88,36 @@ images:
     tag: "hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d"
     ships_ray: true
     lineage: "jasl PR #41834 fork, prebuilt for GB10/sm_121 aarch64"
+  tonyd2wild_glm53:
+    tag: "ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8"
+    ships_ray: false          # confirmed 2026-09-07: ModuleNotFoundError
+    entrypoint: ["vllm", "serve"]
+    lineage: "built on vllm/vllm-openai:glm53-flash-arm64-cu130, 5 SM121 patches"
+    note: >-
+      Two independent gotchas, both confirmed on hardware 2026-09-07,
+      recorded in TOMBSTONES #133. (1) No ray module at all -- `docker run
+      --rm --entrypoint "" <tag> python3 -c "import ray"` raises
+      ModuleNotFoundError, nothing named ray on PATH or in /usr/local/bin,
+      PATH verified normal first so this is absence rather than an
+      entrypoint-neutralization artifact. Upstream never used ray here;
+      their launcher uses vLLM native multi-node (--nnodes/--node-rank,
+      --headless on non-zero ranks), which is what their published numbers
+      were measured on. E004 fires on this entry unaided -- it already
+      tests ships_ray. (2) Non-empty ENTRYPOINT inherited from the official
+      vllm/vllm-openai base -- see E020.
+  aeon_ultimate:
+    tag: "ghcr.io/aeon-7/aeon-vllm-ultimate:2026-06-18-v0.23.0-dflashfix"
+    ships_ray: unknown        # never exercised 2-node; not a verdict either way
+    entrypoint: ["bash"]
+    lineage: "AEON-7 uncensored NVFP4 + DFlash speculative decoding"
+    note: >-
+      ENTRYPOINT bash. Predates the recipe schema's entrypoint field and is
+      the reason deploy_gemma4_dflash.py existed as a repo-root standalone
+      rather than a recipe -- see E020 and TOMBSTONES #133. ships_ray is
+      deliberately `unknown`, not false: this image has only ever been
+      deployed 1-node, so nothing has tested it. E004 must treat unknown as
+      "needs a check", never as a verdict -- an image absent from evidence
+      is not an image proven safe.
 
 rules:
 
@@ -417,6 +453,161 @@ rules:
       - "llama-4-fp8 / -tp (PP vs TP comparison pair, WORKSTREAMS.md WS-1)"
     evidence: {tombstones: [57, 77, 110, 111]}   # 111 = the resolution entry
 
+  - id: E019
+    summary: "model_path_override's container-side basename must equal hf_path's basename, case included."
+    confidence: known_bad
+    enforce: warn
+    scope: {applies_to: recipe}
+    condition:
+      all:
+        - {field: model_path_override, present: true}
+        - {check: basename_mismatch, field_a: model_path_override, field_b: hf_path, case_sensitive: true}
+    failure: >-
+      _discover_host_container() derives loaded_model by splitting the
+      --model value on "/" and taking the last element. _resolve_catalog_key()
+      then matches that case-sensitively against hf_path and cat_key. A
+      basename mismatch fails all three of its match conditions, so it
+      returns loaded_model unchanged -- a string that is not a catalog key.
+      Per that function's own docstring it is the single source of truth for
+      anything keying a ledger, session tracker, or historical lookup, so
+      the fallback keys them on a fabricated name. Same class as the
+      fabricated ::2_node keys in TOMBSTONES #127, reached by a different
+      door.
+    confirmed_instance: >-
+      _glm-5.3-flash-nvfp4-tp2 as first written, 2026-09-07:
+      model_path_override /models/glm-5.3-flash-nvfp4 against hf_path
+      RedHatAI/GLM-5.3-Flash-NVFP4. Simulated against the real matcher --
+      match False before case-matching, True after. Caught in code review
+      before the recipe deployed, so no ledger data was corrupted; the
+      mechanism is confirmed by source read, the trigger by a real recipe
+      that was about to ship.
+    remedy: >-
+      Rename the CONTAINER side of the extra_mounts entry, and
+      model_path_override with it, to match hf_path's basename exactly
+      including case. The host side is unconstrained. Do NOT fix this by
+      making _resolve_catalog_key() case-insensitive -- broadening a fuzzy
+      matcher with a history of ambiguous collisions (E018, tombstones
+      57/77/110) trades a narrow avoidable problem for a wider one.
+    mitigating_factor: >-
+      _resolve_active_recipe() prefers ACTIVE_DEPLOYMENT_STATE's exact
+      record, which covers every orchestrator-initiated deploy, so this is
+      degraded-fallback rather than live breakage. It bites when that record
+      is absent: cleared state, a container outliving it, anything started
+      outside the deploy path. Warn rather than error for that reason.
+    evidence:
+      tombstones: [133]
+      notes: >-
+        Statically checkable -- two string comparisons on the recipe YAML.
+        No registry access, no docker inspect. Safe in the load_recipes()
+        soft-warning path. Asserted independently in verify_glm_recipe.py.
+
+  - id: E020
+    summary: 'An image that sets its own ENTRYPOINT needs entrypoint "" in the recipe.'
+    confidence: known_bad
+    enforce: none              # NOT load-path enforceable -- see notes
+    scope: {applies_to: recipe}
+    condition:
+      all:
+        - {field: image, entrypoint_non_empty: true}
+        - {field: entrypoint, present: false}
+    failure: >-
+      docker APPENDS a container CMD to an image's ENTRYPOINT rather than
+      replacing it. The orchestrator builds its argv as a CMD, so an image
+      with a non-empty ENTRYPOINT receives that argv as arguments to
+      something else. On a 2-node ray deploy the container CMD
+      ["ray","start","--head","--port=6379","--num-gpus=1","--block"] became
+      `vllm serve ray start ... --block`, and vLLM's argparse prefix-matched
+      --block to --block-size (unambiguous -- no other flag starts that way)
+      and died demanding a value. The error names --block-size, a flag the
+      recipe DOES set, for a token it does not: "vllm serve: error: argument
+      --block-size: expected one argument". Reading it cold points straight
+      at the wrong line.
+    confirmed_instance: >-
+      _glm-5.3-flash-nvfp4-tp2 on ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8
+      (ENTRYPOINT ["vllm","serve"]), 2026-09-07. Earlier and unrecorded at
+      the time: ghcr.io/aeon-7/aeon-vllm-ultimate (ENTRYPOINT bash), which is
+      why deploy_gemma4_dflash.py existed as a repo-root standalone rather
+      than a recipe.
+    remedy: >-
+      Set entrypoint: "" in the recipe. The quotes are load-bearing -- a bare
+      `entrypoint:` parses as null, which is identical to omitting the field.
+      See E022.
+    evidence:
+      tombstones: [133]
+      notes: >-
+        enforce is `none` deliberately and should stay there until an
+        offline consumer exists. Testing Config.Entrypoint needs `docker
+        inspect`, which needs the image pulled or registry access, and
+        build_catalog_response() fails closed -- one exception in the load
+        path empties the whole catalog (TOMBSTONES #41, linter rule 1). This
+        rule is written for an on-demand tools/audit_recipe_images.py pass
+        (WORKSTREAMS.md WS-3), not for load_recipes(). The images: block now
+        records `entrypoint:` for both known-affected images, so an audit
+        script can resolve this statically for images it already knows.
+        Promote to `warn` only once that path exists and is what consumes it.
+
+  - id: E021
+    summary: "model_path_override must resolve inside a path some extra_mounts entry provides."
+    confidence: mechanism_confirmed
+    enforce: warn
+    scope: {applies_to: recipe}
+    condition:
+      all:
+        - {field: model_path_override, present: true}
+        - {check: not_prefixed_by_any, field: model_path_override, source: extra_mounts, side: container}
+    failure: >-
+      _execute_deployment_impl() mounts exactly two things: the per-host
+      volume_mount from cluster_config.yaml (the shared HF cache) and
+      whatever extra_mounts provides. A model_path_override outside both is
+      simply not present in the container, and the deploy fails at model
+      load -- minutes in, with an ENOENT naming a file rather than the
+      missing mount, which sends diagnosis at the file instead of at the
+      recipe.
+    remedy: "Add the mount, or correct the path so it falls under an existing container-side mount point."
+    evidence:
+      tombstones: [133]
+      notes: >-
+        MECHANISM_CONFIRMED, not known_bad: derived by reading the mount
+        construction in _execute_deployment_impl(), not from an incident.
+        The trigger has not been observed. The CONSEQUENCE has -- an
+        ENOENT inside the container for a path that should have been
+        provided is exactly what TOMBSTONES #133 layer 3 produced by a
+        different route, so the cost of the failure is known even though
+        this particular cause has not fired. Fires only on an actual
+        mismatch, never on a correct recipe. Promote to known_bad the
+        first time it catches something real.
+
+  - id: E022
+    summary: 'An `entrypoint:` key present but null is almost certainly a missing pair of quotes.'
+    confidence: mechanism_confirmed
+    enforce: warn
+    scope: {applies_to: recipe}
+    condition:
+      all:
+        - {check: key_present_but_null, field: entrypoint, source: raw_yaml}
+    failure: >-
+      `entrypoint: ""` (quoted empty string) neutralizes the image's own
+      ENTRYPOINT. A bare `entrypoint:` parses as null, which is IDENTICAL to
+      omitting the field -- no --entrypoint flag is passed at all. The two
+      differ by two characters and produce opposite behaviour, and the
+      failure is E020's: an argv silently handed to the image's entrypoint
+      as arguments, surfacing as an error about an unrelated flag.
+    remedy: 'Write entrypoint: "" if neutralization was intended, or delete the key entirely if it was not. Do not leave it null.'
+    evidence:
+      tombstones: [133]
+      notes: >-
+        MECHANISM_CONFIRMED, not known_bad: the None-vs-"" distinction is
+        confirmed load-bearing throughout the entrypoint implementation --
+        every test is `is not None`, never truthiness, precisely because a
+        truthiness check collapses "neutralize" into "do nothing". A null in
+        the YAML reintroduces that collapse one layer above where any Python
+        discipline can catch it. Nobody has typed it yet. Fires only on an
+        actual null, never on a correct recipe.
+        IMPLEMENTATION CONSTRAINT: must be checked against the RAW YAML
+        (`"entrypoint" in doc and doc["entrypoint"] is None`), not against a
+        parsed RecipeConfig -- pydantic erases the distinction, which is the
+        whole reason this rule can exist at all.
+
 
 # 1. NEVER hard-fail the catalog. build_catalog_response() fails closed on any
 #    single bad recipe, so one linter exception would empty the entire model
@@ -427,9 +618,31 @@ rules:
 # 3. A rule scoped to a build or image must not fire outside that scope. The
 #    VLLM_BASE_DIR case is the cautionary example: a warning that always fires
 #    is a warning nobody reads, and it hides the ones that matter.
-# 4. New rules come from real incidents only. Every rule needs an `evidence`
-#    block; a rule nobody can trace back to a failure is a guess with a
-#    version number.
+# 4. New rules come from real incidents only, with ONE bounded exception --
+#    the `mechanism_confirmed` tier, see rule 6. Every rule needs an
+#    `evidence` block; a rule nobody can trace back to either a failure or a
+#    read of the code that causes one is a guess with a version number.
+# 6. `mechanism_confirmed` is not a loophole in rule 4. It exists because
+#    some consequences are deterministic from code that was actually read --
+#    a path that is not mounted is not in the container; a YAML null is not
+#    an empty string -- and calling those `unconfirmed` ("never exercised")
+#    understates them while forcing enforce: none, whereas calling them
+#    `known_bad` ("watched it fail") is simply false. To qualify, a rule
+#    must clear THREE bars, all of them:
+#      (a) the mechanism is confirmed by direct source read, and the
+#          evidence block names what was read;
+#      (b) it fires ONLY on an actual mismatch, never on a correct recipe --
+#          rule 3's "a warning that always fires is a warning nobody reads"
+#          applies with full force, and a heuristic cannot clear this;
+#      (c) the CONSEQUENCE has been observed somewhere, even though this
+#          particular TRIGGER has not. A rule that can point at neither an
+#          observed trigger nor an observed consequence is `unconfirmed`,
+#          enforce: none, like everything else that has never been
+#          exercised.
+#    Promote to `known_bad` the first time such a rule catches something
+#    real, and say so in its evidence block. A mechanism_confirmed rule that
+#    has never fired after a long time is worth re-examining: it may be
+#    guarding something that cannot actually happen.
 # 5. A `scope: {build: ...}` pin is a snapshot, not a guarantee -- :latest
 #    floats, confirmed real 2026-09-03 when the build moved three weeks
 #    between two sessions and made E015's contested history resolvable

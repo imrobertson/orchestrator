@@ -40,7 +40,9 @@ Two things a reserved host does '''not''' protect against:
 * '''2-node deploys always span both hosts''', so any 2-node work needs the override and will take the reserved host's service down. That's intended — it should be a decision, not a surprise. The dashboard warns about this under the topology selector before you click, and the confirmation dialog says so explicitly.
 * '''Raw `docker run` over SSH bypasses the orchestrator entirely''' and never sees this guard. `tests/ab_test.py` does its own check for that reason; anything hand-rolled won't.
 
-Which host is reserved is a property of the machine, not of any deployment — see the comments in `cluster_config.yaml` itself. If you swap which host is reserved, also update `default_deploy_target` to point at the OTHER host — leaving it pointed at a now-reserved host is a self-contradicting config (the field exists specifically so the reserved/authoritative node is never also the default fallback target) and has been observed to crash the daemon at startup rather than merely misbehave. Confirm via the orchestrator log (`docker logs dgx-orchestrator-api`) after any such change, not just the dashboard's "API disconnected" symptom.
+Which host is reserved is a property of the machine, not of any deployment — see the comments in `cluster_config.yaml` itself.
+
+'''If you swap which host is reserved, update `default_deploy_target` in the same edit.''' Leaving it pointed at the now-reserved host is a self-contradicting config — that field exists precisely so the reserved node is never also the unqualified-deploy fallback — and `common/config.py` rejects it at load, which takes the daemon down at startup rather than merely misbehaving. The dashboard just shows "API disconnected"; the actual reason is in `docker logs dgx-orchestrator-api`. Note also that `HOSTS`/`PRIMARY_HOST`/`RESERVED_HOSTS` are computed once at daemon start, so no `cluster_config.yaml` edit takes effect until the container is restarted. If you swap which host is reserved, also update `default_deploy_target` to point at the OTHER host — leaving it pointed at a now-reserved host is a self-contradicting config (the field exists specifically so the reserved/authoritative node is never also the default fallback target) and has been observed to crash the daemon at startup rather than merely misbehave. Confirm via the orchestrator log (`docker logs dgx-orchestrator-api`) after any such change, not just the dashboard's "API disconnected" symptom.
 
 == Deploying ==
 
@@ -50,7 +52,11 @@ Use the dashboard or run `dgx-config deploy --model MODEL --nodes N`.
 
 '''`HOSTS`/`PRIMARY_HOST`/`RESERVED_HOSTS` are computed once, at daemon startup''' — editing `cluster_config.yaml` does not take effect until the `dgx-orchestrator-api` container is restarted. If a host-order or reserved-flag change in the file doesn't seem to be respected, check the daemon actually restarted after the edit before assuming the config itself is wrong.
 
-The dashboard's Target dropdown follows the same default — it is built from the live host inventory and starts on `default_deploy_target`, not on a hardcoded node. Reserved hosts are labelled as such in the dropdown itself. Note this dropdown is only meaningful for a '''1-node''' deploy: for 2-node, the head is always `PRIMARY_HOST` (or your explicit `--head`), and the dashboard no longer sends whatever the (hidden, for 2-node) target dropdown happens to hold — see `docs/TOMBSTONES.md` #134 if you're wondering why an older build sometimes put the head on the wrong node with no error.
+The dashboard's Target dropdown follows the same default — it is built from the live host inventory and starts on `default_deploy_target`, not on a hardcoded node. Reserved hosts are labelled as such in the dropdown itself. Note that dropdown is only meaningful for a '''1-node''' deploy: for 2-node the head is always `PRIMARY_HOST` (or your explicit `--head`), and as of 2026-09-07 the dashboard no longer sends whatever the hidden dropdown happened to still hold. If you have older notes about 2-node deploys landing on the wrong node with no error, that was this — see `docs/TOMBSTONES.md` #134.
+
+'''Some recipes need more than `hf_path`/`image`/`vllm_args` to launch.''' Two schema fields exist for images that don't follow this cluster's conventions, and when a recipe sets them they are prerequisites, not decoration:
+* `entrypoint: ""` (with the quotes) neutralizes an image's own ENTRYPOINT. Required for anything built on the official `vllm/vllm-openai` base — without it the orchestrator's argv is appended to `vllm serve` rather than replacing it, and the resulting error names a flag that has nothing to do with the real problem.
+* `model_path_override:` / `extra_mounts:` appear when an image's model-loading code needs a real local directory rather than an HF repo id. If a recipe's header names a `huggingface-cli download ... --local-dir` step, run it on '''every''' target host before deploying — nothing pre-flights it, and skipping it fails inside the container. See `docs/TOMBSTONES.md` #133. Note this dropdown is only meaningful for a '''1-node''' deploy: for 2-node, the head is always `PRIMARY_HOST` (or your explicit `--head`), and the dashboard no longer sends whatever the (hidden, for 2-node) target dropdown happens to hold — see `docs/TOMBSTONES.md` #134 if you're wondering why an older build sometimes put the head on the wrong node with no error.
 
 Not sure a model/topology combo is valid, or want to sanity-check what will actually get sent before committing? Add `--dry-run` — prints the exact `docker run` command(s), no SSH connection made, nothing touched:
 
@@ -75,6 +81,8 @@ To deploy models without internet connectivity, you must pre-cache the assets an
 
 cd ~/docker/orchestrator
 python3 cache_cluster_assets.py
+
+Note: as of 2026-09-07, this prefetcher only knows the shared HF cache mount. A recipe using `extra_mounts` to stage weights at a separate local path (see Deploying, above) is '''not''' covered — stage those by hand per that recipe's own instructions, or the offline deploy fails at load.
 
 Note: as of 2026-09-07, this prefetcher only knows about the shared HF cache mount pattern. A recipe using `model_path_override`/`extra_mounts` to stage weights at a separate local directory (see Deploying, above) is NOT covered by this script — stage those manually per that recipe's own instructions.
 
@@ -102,6 +110,8 @@ cd ~/docker/orchestrator
 python3 benchmark.py
 
 All runs are automatically appended to `benchmark_ledger.csv` with precise Time-To-First-Token (TTFT) and Decode speed metrics. The tool is hardened against vLLM Multi-Token Prediction (MTP) stream buffering to ensure mathematical accuracy.
+
+'''If a deploy's auto-benchmark didn't fire,''' check `benchmark_ledger.csv` for a row near that deploy's timestamp before assuming the feature is broken. Two distinct known causes: the checkbox was ticked after Deploy was already clicked (expected — see Dashboard Usage Notes), or `wait_for_cluster_ready()`'s 900s budget expired silently on a slow boot, which skips the trigger with no error anywhere. Either way the manual '''Run Benchmark Suite Now''' button gets you the numbers once the dashboard shows ready.
 
 '''If a deploy's "auto-run benchmark when ready" doesn't seem to have fired,''' check `benchmark_ledger.csv` for an entry near the deploy's timestamp before assuming the feature is broken. Two known, distinct causes: (1) the checkbox was checked after the deploy was already sent — see the Dashboard Usage Notes above, this is expected behavior, not a bug; (2) `wait_for_cluster_ready()`'s timeout (`tuning.deploy_wait_timeout_sec`, 900s by default) can expire silently if a model takes longer than that to boot, skipping the benchmark trigger with no visible error. If it's (2), the manual "Run Benchmark Suite Now" button (appears once the dashboard shows the cluster as ready) gets you the numbers regardless.
 

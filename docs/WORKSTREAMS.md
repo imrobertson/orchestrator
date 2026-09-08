@@ -5,9 +5,14 @@ backlog role of `ARCHITECTURE-MIGRATION-PLAN.md`. For direction and
 decisions of record see `DIRECTION.md`; for per-fix history see
 `TOMBSTONES.md`; for machine-readable recipe rules see `errata.yaml`.
 
-Revision 2, 2026-09-03. Built from `TOMBSTONES.md` #27–#110,
+Revision 3, 2026-09-08. Built from `TOMBSTONES.md` #27–#137,
 `TROUBLESHOOTING.md` #1–14, `model_ledger.json`, and verification against
 `dgx-orchestrator.py`, `common/recipes.py`, `tests/ab_test.py`.
+
+Revision 3 adds WS-11 and D-9 (reserved-host state correctness and control
+surfaces, `TOMBSTONES.md` #129–#132) and flags F-l/F-m. The header had stayed
+at Revision 2/2026-09-03 through the 2026-09-07 additions, which is the drift
+F-k describes; bumped here rather than left to compound.
 
 ## Evidence grades
 
@@ -104,6 +109,43 @@ which means entries were being read as open work after the work was done.
     Decide whether version tags still earn their place in that file or
     should be dropped in favour of dates, which are already there and are
     never wrong.
+
+### Retrospective entries: symptom and rule, never mechanism
+
+Added 2026-09-08, from F-m. When an entry must be written by someone who was
+not there -- the #132 case -- the failure is not general unreliability. The
+backfill got the *rule* right (wrong-layer diagnosis; establish a control is
+rendered before reasoning about what it holds), because `UsageShortcut.md`
+had recorded it. It got the *mechanism* wrong three ways, because mechanism
+is exactly what a fluent writer infers from a symptom without noticing the
+inference is happening.
+
+One of those three is the instructive one. The backfill claimed the fix made
+the Target picker "a sibling of the topology row rather than a child." The
+DOM was never restructured; only the visibility logic changed. That claim is
+**falsifiable against code**, so a later auditor checks the DOM, finds the
+nesting unchanged, and concludes the fix was reverted. A wrong mechanism
+does not merely fail to inform -- it manufactures a false incident, which is
+strictly worse than the dangling citation the backfill was written to
+retire.
+
+So: **a retrospective entry may state the symptom and the rule. It must not
+state mechanism or fix shape.** Those are the claims archaeology tests
+against the code, and they are the claims a reconstruction cannot support.
+
+Note also what did *not* work: the #132 backfill carried an explicit
+provenance disclaimer in its own opening paragraph, and the disclaimer did
+no work at all. Three subsequent paragraphs of confident mechanism in the
+same voice as every first-hand entry in the file outweighed it, and the
+disclaimer had the polarity backwards besides -- it told the reader to trust
+the mechanism and discount the details, when mechanism was the part that was
+wrong. Where a retrospective claim is genuinely load-bearing, mark it inline
+at the claim, not once at the top.
+
+No linter can check this. It is a convention, which is why it lives here
+rather than in `errata.yaml`.
+
+---
 
 ### WS-0a — Retire `models.yaml`
 
@@ -295,7 +337,10 @@ half is unbuilt.
 | Initial `status:` values across the catalog | **UNBLOCKED, 2026-09-03** | The catalog is 24 files in `recipes/local/` — `recipes/eugr/` contains only a `.gitkeep` and is empty, so every doc reference to `recipes/eugr/*.yaml` describes nothing. Readable directly via the GitHub connector. The pass has not been done, but nothing prevents it now. |
 | Unknown-`VLLM_*` boot-log scraper | **OPEN** | Parse the boot log, don't maintain an allow-list — vLLM already emits the warning for the build actually running. Check recipe `env_vars` only; image-inherited hits report differently or not at all. Much cheaper once WS-7's log retention exists. |
 | Normalize `--speculative-config`'s embedded JSON in `config_hash` | **OPEN, small** | The one genuinely live piece of the otherwise-stale ROADMAP hash entry. #92 left it deliberately: flag values are opaque strings to the canonicalizer, so reformatting the JSON inside changes the hash. |
-| Near-duplicate catalog key detection at load | **OPEN** | Exact stem collisions already raise; nothing flags edit-distance-close keys or a shared `hf_path`. `find_cached_models()` already computes the `hf_path → catalog_key` map — build it as a shared helper. |
+| Near-duplicate catalog key detection at load | **OPEN** |
+| Image-ENTRYPOINT mismatch detection | **OPEN, new 2026-09-07** | A recipe whose `image` sets a non-empty ENTRYPOINT but omits `entrypoint: ""` fails at container start with an error naming an unrelated flag (#133: argparse prefix-matched `--block` to `--block-size`). Found only by a failed deploy today. `docker inspect <image> --format '{{.Config.Entrypoint}}'` is the check; it needs registry access or a local pull, so a `load_recipes()` hook is the wrong place -- `tools/audit_recipe_images.py` over the catalog's distinct images, run on demand, is the right one. Two catalog images are known-affected (`ghcr.io/tonyd2wild/vllm-glm53-flash`, `ghcr.io/aeon-7/aeon-vllm-ultimate`), so this is not hypothetical. |
+| `model_path_override` staging has no pre-flight check | **OPEN, new 2026-09-07** | A recipe setting `model_path_override`/`extra_mounts` depends on a manual `huggingface-cli download --local-dir` on **every** target host, with nothing verifying it happened. An unstaged or half-staged directory fails inside the container (ENOENT on a file the mount should have provided) rather than at deploy time. Cheap fix: `test -f <mount_source>/config.json` over SSH per target host before `docker run`, in the same place `_validate_mod_name()` already aborts early. |
+| `cache_cluster_assets.py` only knows the shared HF cache | **OPEN, new 2026-09-07** | The prefetcher assumes every recipe's weights live under the per-host `volume_mount` HF cache. Recipes using `extra_mounts` to stage weights at a separate local path are invisible to it, so "pre-cache assets then go offline" silently under-fetches for them and the offline deploy fails at load with no prior warning. | Exact stem collisions already raise; nothing flags edit-distance-close keys or a shared `hf_path`. `find_cached_models()` already computes the `hf_path → catalog_key` map — build it as a shared helper. |
 
 ---
 
@@ -546,7 +591,9 @@ evidence. Ordered by what each unblocks.
 | Host-level `ps aux` step is inert for containers | **Understood, keep the note** | Structurally cannot see containerized processes; kept only as a bare-metal safety net. Documented so nobody "fixes" it thinking it was the protection. |
 | POSIX `/dev/shm` files never swept | **OPEN, second real confirmation 2026-09-04** | SysV segments with `nattch == 0` are swept every teardown (a hard kernel guarantee). `/dev/shm` needs a `/proc/*/fd` + `/proc/*/maps` cross-reference — buildable, but riskier to get subtly wrong, deliberately deferred. SysV semaphores are inventoried, not swept. #116 independently confirmed this gap while investigating an unrelated deadlock: 29 orphaned `psm_*` files on spark-4 spanning ~36 hours, zero on spark-3, `ipcs -m` clean on both. Capacity-innocent (`df -h /dev/shm`: 1.3M/61G) and ruled out as that bug's cause, but the leak itself is real and this makes two suspected-or-confirmed incidents (2026-08-23, 2026-09-04) rather than one. |
 | Cache integrity retrospection | **OPEN, wants ground truth** | One concrete artifact: a `tilelang` entry named `tmp` with an implausible ~56-year age. The heuristic needs real Triton/TileLang/DeepGEMM cache-layout contracts before it can be trusted. |
-| Two fixes never verified in their real UI path | **OPEN, small** | #78's teardown error toast (no failing teardown existed to test against) and #66's `headSelect` sync (only `node --check`'d). |
+| `serving_host` ignored container run state | **LANDED 2026-09-07** | #136. The selection loop matched `active_container` by name regardless of `is_crashed`, so a stale `EXITED` container on an earlier-listed host shadowed a genuinely serving one and reported the whole cluster not-ready. Survived both #130 and #131 untouched -- neither had reason to distinguish running from dead until host order changed. Now gated on `not is_crashed`. Adjacent to *Engine health monitoring* above: that row's "container RUNNING, engine absent" case is this one's mirror image and is **not** caught by this fix. |
+| `wait_for_cluster_ready()` timeout fails silently | **OPEN, new 2026-09-07** | `_execute_deployment_impl()` wraps both load-time recording and the auto-benchmark trigger in a single `if is_ready:`. A `deploy_wait_timeout_sec` expiry (900s default) drops both with no error surfaced to dashboard, CLI, or toast -- indistinguishable from "auto-benchmark is broken". Suspected but **not confirmed** as a second cause of missed auto-benchmarks alongside #137; the evidence to settle it is `benchmark_ledger.csv` timestamps against deploy logs. At minimum, log and surface the timeout distinctly from success. |
+| Three fixes never verified in their real UI path, two of them to one element | **OPEN, small — worse than when this row was written** | #78's teardown error toast (no failing teardown existed to test against) and #66's `headSelect` sync (only `node --check`'d). Now three: #137's benchmark-checkbox state window was landed with control flow read by hand and brace balance checked, never opened in a browser. And #134 -- also unverified — is the **same element as #66**, plus #132 was a third failure of that same control from a different direction. Four bugs in one dropdown, two fixes to it never exercised. This is the argument for a minimal DOM-level harness over a fourth careful read. |
 
 ---
 
@@ -680,6 +727,60 @@ to trigger either.
    expert-parallelism specifically.
 
 ---
+
+## WS-10 — Recipe schema escape hatches for non-conforming images
+
+New 2026-09-07. Three fields landed, `_CONFIG_HASH_SCHEMA` 2 -> 4. See
+`TOMBSTONES.md` #133 for the incident that forced all three in one session.
+
+| Item | Status | Notes |
+|---|---|---|
+| `entrypoint: Optional[str]` | **LANDED** | `docker run --entrypoint` override. `None` = no flag (byte-identical to prior behaviour for every existing recipe); `""` = neutralize the image's ENTRYPOINT; other = executable. `""` vs `None` is load-bearing -- all tests `is not None`, never truthiness. `run_ssh()`'s `shlex.quote()` renders `""` as `''` and preserves it as a real empty arg, round-trip verified. |
+| `model_path_override: Optional[str]` | **LANDED** | Literal `--model` value when it must differ from `hf_path`. `hf_path` stays the recipe's identity for ledger, `_record_hf_path()`, cache bookkeeping, catalog display. Deliberately not unioned with `hf_path` -- collapsing them would surface a container filesystem path where the dashboard shows a repo id. |
+| `extra_mounts: list[str]` | **LANDED** | Additional bind mounts, host-symmetric, applied identically on every target host. Sorted before hashing (unlike `mods`): mounts don't overwrite each other, so order is not semantic. |
+| `_glm-5.3-flash-nvfp4-tp2` deploys | **BLOCKED on weight staging** | All three fields set, ray flag removed. `verify_glm_recipe.py` proves the argv shape for both ranks. Not hardware-validated: weight staging to `/var/tmp/glm-5.3-flash-nvfp4` on both hosts was incomplete at time of writing, and the non-Ray `--nnodes`/`--node-rank` path is inferred from upstream, not observed on this image. |
+| Retire `deploy_gemma4_dflash.py` | **BLOCKED on validation** | Its stated reason to exist (no `--entrypoint` field) is gone. `gemma4-26b-a4b-aeon-dflash.yaml` is the schema-native replacement, flag-by-flag diffed against the script's validated argv -- every flag reproduced, no extras, and it launched `READY` on spark-4 2026-09-07. **Do not delete the script until that recipe is also benchmarked**, and note one unverified assumption: the recipe uses `python3 -m vllm.entrypoints.openai.api_server` where the validated script used `--entrypoint vllm` + `serve <path>`. If that module path is absent in AEON's image, the schema has no field to change the argv prefix and this needs a fourth field, not a recipe tweak. |
+| Argv-prefix override (`python3 -m vllm...` vs `vllm serve`) | **OPEN, contingent** | Only needed if the assumption above fails. Deliberately not built speculatively -- the same discipline `deploy_gemma4_dflash.py`'s docstring applied to `entrypoint`: wait for a second real case. One case is currently hypothetical. |
+
+## WS-11 — Reserved-host protection: state correctness and control surfaces
+
+New 2026-09-08, written by the session that did the work. **Scope note, and
+it is narrower than F-k's gap:** this covers the 2026-09-07 corrections built
+*on top of* the reserved-host feature, `TOMBSTONES.md` #129–#132. It does
+**not** cover the feature itself — `reserved:`, `default_deploy_target:`,
+`check_reserved_hosts()`, `resolve_teardown_hosts()` all shipped in d8401e1a
+with #127/#128, in an earlier session. Those were already on disk when this
+work started and are known here only from reading them. Writing them up from
+that position is the reconstruction problem F-k declined and #132 proved
+real; see F-l.
+
+The through-line: the feature made "two independent deployments" a supported
+arrangement, and four separate pieces of code still assumed one. Same root as
+#127/#128, one layer up.
+
+| Item | Status | Notes |
+|---|---|---|
+| `pending_launch_state.json` — disk-backed, host-keyed | **LIVE-HEALTH** | #129. Was a module global, so a `dgx-config` deploy (separate short-lived process from the daemon that is the only consumer) wrote it and exited — **no CLI deploy ever recorded a launch success**. Independently, the single global slot was matched against `serving_host`'s model, so a deploy onto any other host aged out unrecorded. Same mistake `ACTIVE_DEPLOYMENT_STATE`'s own comment eighteen lines below documents having already made and fixed. Record written for the **head host only** — a 2-node deploy is one thing to confirm, not two. Observed: launch marker populated for a deploy on spark-3 while spark-4 sat idle. No throughput number, hence LIVE-HEALTH not LIVE. |
+| Per-host `/health` probing | **LIVE-HEALTH** | #130. `cluster_ready` was one host's health used for every host's readiness. A non-serving host was reported READY because the *serving* host was healthy (a compiling or dead model displayed READY), and archival plus `record_run_phases()` were gated on `host == serving_host` so they **never fired for the second node at all**. Now `self_ready` per host; a 2-node Ray WORKER still inherits the head's, which is the one case where inheriting is correct. That clause is load-bearing, not defensive — gating purely on `self_ready` drops a worker into `detect_model_stage()`, which can return a `CRASHED`-prefixed string and suppress #128's mirror. |
+| Reserved-host policy in `/api/status` | **LIVE-HEALTH** | #131. `reserved_hosts`, `default_deploy_host`, `primary_host`, per-host `alias`/`reserved`. The dashboard had been carrying its own hardcoded host list, which disagreed with `cluster_config.yaml` the moment `default_deploy_target` existed — its out-of-the-box deploy was aimed at the one host guaranteed to refuse it. |
+| HTTP 423 + per-action confirm dialog | **LIVE-HEALTH** | #131. `check_reserved_hosts()` retyped `Optional[str]` → `Optional[dict]` carrying `code`/`hosts`/`running`/`message`; both endpoints map it to 423, checked **before** their generic 400/409 (409 on teardown means "cluster busy", which must not be clickable-past). Deliberately not a persistent force checkbox: a checkbox holds state and can be left armed for a later deploy by a different person at the same always-on dashboard. Unforced attempt is free — the guard runs before `CLUSTER_OP_LOCK` and before any SSH. Observed firing on hardware. |
+| Dashboard target picker: no auto-follow onto reserved, no re-pin after touch | **LANDED** | #131. `headSelect.value` was re-pinned to `serving_host` every 4s poll, and `serving_host` is always the reserved host once anything resident runs there — a manual selection reverted within four seconds. |
+| Teardown scope selector | **LANDED** | #131. The dashboard Teardown button posted no host list → whole cluster → included the reserved host → refused every time. It was dead from the moment the feature shipped, with no way to express a scoped teardown from the dashboard at all, which was the feature's entire point. Never exercised against a real scoped teardown. |
+| Target picker rendered for every 1-node deploy | **LANDED** | #132. Was a DOM child of the row the topology logic hid, so single-topology recipes had no target control. Verified across all four recipe/topology shapes by simulation, not in a browser. See WS-7's row on unverified UI fixes — this is the fourth bug in that one dropdown. |
+| `modelSelectTouched` | **LANDED** | #132, second defect, introduced by #131's target-aware detection. Never exercised in a browser. |
+| Doc propagation | **LANDED** | `patch_docs_2026-09-06.py`, anchored + idempotent + all-or-nothing per file, applied to ROADMAP/USERMANUAL/UsageShortcut/REFERENCE. New `docs/REFERENCE-control-surfaces.md` written as interface-spike input; explicitly disposable, deliberately not in `README.md`'s doc map. |
+
+**Open, carried out of this work:**
+
+| Item | Status | Notes |
+|---|---|---|
+| `SESSION_TRACKER` is single-host | **OPEN — largest remaining gap** | One global instance fed from `serving_host`'s `/metrics`. Under two independent 1-node deploys the non-serving model's lifetime tokens do not accrue and its session speed is not shown. This is a *data model* limitation surfacing as a display one, which is why it matters more to the interface spike than its size suggests. `docs/BACKLOG-session-tracker-multi-model.md` produced, not landed. |
+| `launch_history` before 2026-09-06 is incomplete | **OPEN — feeds D-2** | Not sparse: CLI-only and non-`serving_host` deploys recorded nothing. Absence is not evidence a recipe never launched. See D-9's counter-pressure. |
+| `resolve_deploy_head()` silently substitutes on falsy `head` | **OPEN, small** | An empty-string `head` falls through to `DEFAULT_DEPLOY_HOST`. It was hypothesis (2) in #132's investigation and could not be ruled out by reading — a request that names a target and gets a different host should fail loudly, not substitute. |
+| Reserved-host guard does not cover raw `docker run` over SSH | **OPEN, by construction** | Bypasses the orchestrator entirely. `tests/ab_test.py` does its own check for this reason; anything hand-rolled will not. |
+
+---
+
 
 # 2. Dependency chains
 
@@ -866,6 +967,61 @@ spark-5/spark-6 racked  ──gates──>  Phase 3 proper
   but these want to land BEFORE the hardware:
   ├─> NCCL/Gloo ifname derivation out of recipe env_vars
   └─> config_hash topology-key versioning decision
+```
+
+**D-8 — the non-conforming-image chain (new 2026-09-07)**
+
+```
+RecipeConfig.entrypoint / model_path_override / extra_mounts   LANDED (WS-10)
+  ├─> WS-3's image-ENTRYPOINT linter has something to recommend  ← unblocked
+  │    (a linter that can only say "this will fail" and not "set
+  │     entrypoint: \"\"" is worth much less)
+  ├─> _glm-5.3-flash-nvfp4-tp2 deployable   ← BLOCKED: weight staging
+  │    on BOTH hosts, manual, unverified by anything in the code
+  └─> deploy_gemma4_dflash.py retirable     ← BLOCKED: recipe launched
+       READY but never benchmarked, and carries one unverified
+       module-path assumption that would need a FOURTH schema field
+       if it turns out wrong
+
+counter-pressure, same shape as D-2's:
+_CONFIG_HASH_SCHEMA 2 -> 3 -> 4 in one session ──(orphans every hash)──>
+  the status marker's data source, again. Second orphaning in recent
+  memory. See F-j.
+```
+
+**D-9 — the reserved-host state chain (new 2026-09-08, retroactive to 2026-09-07)**
+
+```
+reserved: / default_deploy_target: / check_reserved_hosts()   LANDED (d8401e1a)
+  │                                          no workstream entry -- see F-l
+  ├─> per-host /health probing (#130)        LANDED --> unblocks BOTH of:
+  │     ├─> non-serving host archives run logs + phase data   ← now fires
+  │     └─> per-host pending-launch promotion (#129)          ← now fires
+  │          (neither worked at all while readiness was cluster-wide;
+  │           they were gated on host == serving_host)
+  │
+  ├─> structured refusal record (code/hosts/running/message)  LANDED
+  │     └─> HTTP 423, distinct from 400/409                   ← required for
+  │          └─> per-action confirm dialog (#131)                the dialog to
+  │               exist without string-matching the message
+  │
+  └─> Target picker actually rendered (#132)   LANDED, never browser-tested
+        └─> the control the whole feature presupposes. Absent for every
+            single-topology recipe from d8401e1a until 2026-09-07; the
+            feature shipped with no usable way to direct a 1-node deploy.
+
+counter-pressure, third hit on the same data source:
+launch_history before 2026-09-06 is INCOMPLETE, not sparse ──> D-2's status
+  marker would systematically under-promote CLI-only and scratch-node-only
+  recipes, while looking like a working feature. Compounds F-j's two
+  _CONFIG_HASH_SCHEMA bumps: those orphaned hashes going forward, this one
+  hollowed out the history behind them. D-2 now depends on data damaged from
+  two independent directions.
+
+blocked, not by code:
+SESSION_TRACKER single-host ──> no honest reporting of concurrent deploys.
+  Every other piece of this chain now works per host; this one still assumes
+  the cluster serves one model. WS-11's largest open item.
 ```
 
 ---
@@ -1548,6 +1704,81 @@ keeps getting lost.
 
 ---
 
+## K11 — Two silent-failure windows around deploy readiness
+
+> ### Context
+>
+> Repo `imrobertson/orchestrator`. Two independent defects, grouped because
+> they produce the *same operator experience* — "the auto-benchmark didn't
+> run and nothing said why" — and because confusing one for the other has
+> already happened once. Both are recorded: `TOMBSTONES.md` #137 and #136,
+> WS-10 and WS-7 respectively.
+>
+> ### Part 1 — diagnose `wait_for_cluster_ready()`'s silent timeout (do this first, it is cheap)
+>
+> `_execute_deployment_impl()` wraps both load-time recording and the
+> auto-benchmark trigger in a single `if is_ready:`. When
+> `wait_for_cluster_ready()` exhausts `tuning.deploy_wait_timeout_sec`
+> (900s), it returns false and **both** are skipped, with no error surfaced
+> to the dashboard, the CLI, or a toast. That is indistinguishable from
+> "the feature is broken."
+>
+> This is **suspected, not confirmed**, as a second cause of missed
+> auto-benchmarks alongside #137. Confirm or rule it out before changing
+> anything: cross-reference `benchmark_ledger.csv` timestamps against deploy
+> logs for runs where auto-benchmark was requested. A deploy that reached
+> READY well after its 900s window, with no ledger row, is the signature.
+>
+> If confirmed, the fix is not "raise the timeout" — a longer wrong answer
+> is still wrong. Surface the timeout distinctly from success: it should be
+> visible on the dashboard and in the CLI's return value, and it should say
+> which of the two things it skipped. Consider whether load-time recording
+> and the benchmark trigger should share a single gate at all — a model that
+> booted slowly still produced real load-time data worth recording.
+>
+> ### Part 2 — close `awaitingReady`'s page-reload hole
+>
+> #137 made the benchmark checkbox disappear once its value has been sent,
+> because `run_benchmark` is captured once at payload construction and
+> nothing later can change it. The flag driving that (`awaitingReady`) is
+> client-only state, so **a page reload mid-boot brings the editable
+> checkbox back** for a launch already in flight — the exact condition #137
+> exists to prevent. On an always-on dashboard this will happen.
+>
+> A real fix needs `/api/status` to expose deploy-in-flight state plus the
+> `run_benchmark` value that was captured. Today it exposes
+> `is_benchmarking` and `is_tearing_down`; there is no `is_deploying`.
+>
+> **Before writing it, decide the lifecycle deliberately** rather than
+> mirroring `is_tearing_down`. Teardown is synchronous; a deploy with
+> `wait=false` returns almost immediately while the model boots for another
+> ten minutes, so "deploying" and "waiting for ready" are not the same
+> window and the client needs the second one. Note also that
+> `ACTIVE_DEPLOYMENT_STATE` is already disk-backed and host-keyed and may
+> be the right place to hang this, rather than a new in-memory global —
+> memory-only state across the CLI/daemon process boundary is a mistake
+> this repo has already made twice (#129, and `ACTIVE_DEPLOYMENT_STATE`'s
+> own history).
+>
+> ### What to report back
+>
+> For Part 1: whether the timeout theory is confirmed, with the specific
+> ledger rows and deploy timestamps that show it, or a clear statement that
+> the evidence does not support it. A clean "not this" is a real result —
+> #137 is already a confirmed cause and it may be the only one.
+>
+> For Part 2: the chosen lifecycle semantics before the code, not after.
+>
+> ### Do not
+>
+> Do not fix Part 2 by persisting `awaitingReady` to browser storage. It
+> would survive reload on one machine and be wrong on every other browser
+> pointed at the same always-on dashboard — which is precisely the
+> multi-surface staleness problem #131 rejected a persistent force checkbox
+> over.
+
+---
+
 # 4. Open flags
 
 Reduced from eleven to six; five were resolved by the operator or by reading
@@ -1637,6 +1868,96 @@ comparisons of speculative configs are explicitly untrusted here.
 **F-f — RESOLVED.** `SESSION-CLOSEOUT-2026-09-02-FINAL.md` is present in
 `docs/` (9.8 KB, 2026-09-02); it simply wasn't in the handoff. Its content
 is ported into WS-5. Diff the port against the original before archiving.
+
+**F-j — `_CONFIG_HASH_SCHEMA` moved twice in one session.** 2 -> 3 -> 4 on
+2026-09-07, orphaning every recorded `config_hash` and resetting the whole
+catalog to "not confirmed to launch successfully yet". Harmless in itself and
+correctly reasoned at each step (nothing in the catalog set any of the new
+fields, so no prior record was *wrong*, only uncomputable). But this is the
+second orphaning bump in recent memory, and D-2's status marker depends on
+exactly the data these bumps discard. If a third lands soon, it is worth
+asking whether `config_hash` should carry a migration path rather than a bare
+version integer -- there is currently no way to express "schema 3's answer
+still holds for recipes that set none of the new fields," which was true for
+the entire catalog in both bumps.
+
+**F-k — the docs that get read stay current; the docs that get referenced
+drift.** Confirmed by direct repo read 2026-09-07, not inferred:
+`UsageShortcut.md` and the code are current, `TOMBSTONES.md` was one entry
+behind (it cited #132 from `UsageShortcut.md` while #132 itself was never
+written -- backfilled in this pass), and this file was four days and two
+commits behind, still at Revision 2/2026-09-03. Concretely still missing: the
+2026-09-06 reserved-host and scoped-teardown work (commit d8401e1a, shipped
+with #127/#128 [CORRECTED -- see below]) has **no workstream entry at all** -- it is the direct
+predecessor of WS-10 and of most of the 2026-09-07 session, and reading this
+file alone would not reveal it happened. Deliberately not backfilled here:
+writing a workstream for someone else's session from outside is the same
+reconstruction problem #132 had, at ten times the size. WS-0 already
+diagnosed this general pattern ("seven places where a document described a
+state the code had moved past -- all seven pointed the same direction");
+this is the fourth and fifth instances, and they are in the two files WS-0
+did not cover.
+
+**Partially closed 2026-09-08.** WS-11 now covers #129-#132, written by the
+session that did that work. The d8401e1a feature itself remains unwritten,
+and F-k's reasoning above is why -- it was upheld, not overridden. See F-l
+for the narrowed gap and F-m for what the #132 backfill turned out to have
+cost.
+
+**Correction to F-k's own body, 2026-09-08.** The parenthetical above is
+wrong and is left in place with this note rather than edited away. d8401e1a
+did not "ship with #127/#128" in the sense the sentence implies: **#127 is
+topology derived by counting hosts, #128 is head->worker status mirroring.**
+Neither is reserved-host protection or scoped teardown. They are bugs found
+*while* doing that work, which is why the commit message lists them, and
+reading that list as a description of the commit's feature is the error.
+
+Introduced by the 2026-09-07 session (the same one that backfilled #132),
+propagated into the kickoff prompt handed to the 2026-09-08 session, and
+caught there because that session had first-hand knowledge the prompt's
+author did not. Recorded rather than quietly fixed because it is the same
+failure F-m describes, one layer up: a plausible attribution inferred from
+an artifact, written in the voice of established fact. F-m caught it inside
+a tombstone; this is the same mistake inside the prompt that commissioned
+the work.
+
+**The operational rule:** attribution belongs in a cross-session prompt as a
+question, never as a premise. A session handed "your work on X" has to argue
+against a framing presented as settled before it can even start, and the
+only reason this one was recoverable is that the receiving session knew
+better and said so.
+
+**F-l — the d8401e1a reserved-host feature still has no workstream entry.**
+Narrowed from F-k, not closed. WS-11 covers the 2026-09-07 corrections built
+on top of it (#129-#132) and is first-hand; the feature underneath it --
+`reserved:`, `default_deploy_target:`, `check_reserved_hosts()`,
+`resolve_teardown_hosts()`, shipped with #127/#128 -- is described in WS-11
+only as far as reading the code supports, and its design rationale is not
+recorded anywhere outside `cluster_config.yaml`'s inline comments. Whoever
+did that session should write it. Specifically unrecovered: why `spark-4`
+rather than `spark-3` was chosen as the reserved node, and whether scoped
+teardown was designed for the resident-agent workflow or arrived at
+afterwards. Both are answerable in one sentence by the person who decided
+them and not at all by anyone else.
+
+**F-m — a retrospective entry stated a fix that was never made, and only a
+participant could catch it.** #132's backfilled body (written 2026-09-07,
+correctly labelled as reconstruction) said the Target picker "is now a
+sibling of the topology row rather than a child." The DOM was never
+restructured; only the visibility logic changed, and the original nesting is
+still in place. Anyone auditing the fix against that description would find
+the nesting unchanged and reasonably conclude it had been reverted. It also
+attributed the bug to `updateDeployTargetControls()` -- the *post-fix*
+rename, which did not exist in the broken revision -- and listed two of the
+four investigation hypotheses that were never raised. Body replaced in place
+2026-09-08 with corrections called out inline. **The transferable point is
+not that the reconstruction was sloppy; it was careful, honest about its
+provenance, and right about the rule it drew.** It was wrong about the
+mechanism in exactly the places where a plausible mechanism can be inferred
+from a description of the symptom, which is every place that matters for
+code archaeology. This is direct evidence for F-k's and F-l's caution: the
+cost of backfilling from outside is not vagueness, it is confident and
+specific error.
 
 ---
 

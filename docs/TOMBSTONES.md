@@ -55,6 +55,530 @@ longer does. Numbering 27-131 confirmed contiguous by the same exhaustive
 "### N." scan method the 2026-08-31 note below established.
 -->
 
+<!--
+Reconciliation note (2026-09-07): #132-#137 added, appended above #131 per
+usual (newest/highest on top). Numbering 27-137 confirmed contiguous by the
+same exhaustive "### N." scan method the 2026-08-31 note below established.
+
+#132 is backfilled rather than new. The fix it records shipped in df18a6c6
+(2026-09-07) and UsageShortcut.md has cited "#132" for it since that commit,
+but the entry itself was never written -- the citation outran the entry and
+pointed at nothing for a day. Its text is reconstructed from that
+UsageShortcut description and the diagnostic account of the session, not
+from a contemporaneous write-up, and is marked as such in the entry.
+
+#133-#137 are from the 2026-09-07 session. #133 is one incident with three
+independent layers and is written as one entry for the same reason #131 was:
+they share a root cause (an image that doesn't follow this cluster's
+conventions) and separating them would imply three unrelated bugs.
+-->
+
+### 137. The benchmark checkbox stayed editable for the entire model-boot window, long after its value had already been sent
+
+**Trap:** `updateBenchmarkControl(clusterReady)` rendered the "Auto-run
+benchmark when ready" checkbox on every path where `cluster_ready` was
+false. That reads as "show the checkbox when there is nothing to benchmark
+yet", which is almost right and quietly wrong: `cluster_ready` is false
+during the pre-deploy idle state *and* during the entire post-deploy boot,
+and those two windows are not equivalent.
+
+`run_benchmark` is read exactly once, in `triggerDeploy()`, at the moment the
+`/deploy` payload is constructed:
+
+```javascript
+const run_benchmark = checkEl ? checkEl.checked : false;
+...
+const payload = { model, nodes, head, user_id, wait: run_benchmark, run_benchmark, force: false };
+```
+
+Once that request is sent, nothing the checkbox does can affect it. But the
+dashboard kept presenting it as a live control for the following ten-plus
+minutes of model load -- an interactive element that silently did nothing.
+
+Observed directly rather than theorised: the box was ticked partway through a
+Gemma4 boot, on the reasonable assumption that "when ready" meant the
+decision stayed open until ready arrived. It did not. The benchmark never
+ran, which read as the feature being broken rather than as the value having
+been frozen before the tick.
+
+**Fix:** new client state `awaitingReady`, set true at the point the deploy is
+actually committed -- after any reserved-host confirm dialog resolves to
+proceed, immediately before the payload goes out -- and cleared on
+cluster-ready, outright deploy failure, a cancelled confirm dialog, or
+teardown completion. `updateBenchmarkControl()` gains a third branch: while
+`awaitingReady` is true it renders an inert status line reporting what was
+actually decided ("Waiting for model to become ready -- benchmark will run
+automatically...") instead of a control. The checkbox appears only in the
+genuinely idle window, which is the only window where ticking it does
+anything.
+
+**Not verified in its real UI path.** Every path that sets the flag was traced
+against every path that clears it, and brace balance was checked; it was
+never opened in a browser. That makes three unverified `index.html` fixes
+(with #78 and #66) and the second this session -- see WS-7.
+
+Third instance this session of one shape (see #134, #135): a control whose
+editability did not track whether editing it still mattered. Worth a standing
+rule for this dashboard -- any control feeding a one-shot request payload
+should visibly stop being a control once that payload has shipped.
+
+---
+
+### 136. `serving_host` selected the first host with a matching container name, running or not, so a dead container shadowed a healthy deploy on the other node
+
+**Trap:** `_compute_cluster_status_impl()` picked the serving host like this:
+
+```python
+serving_host = PRIMARY_HOST
+for host in HOSTS:
+    if container_info.get(host, {}).get("active_container") in (ContainerRole.STANDALONE, ContainerRole.HEAD):
+        serving_host = host
+        break
+```
+
+`active_container` is set by `_discover_host_container()` from the container
+*name*, regardless of run state -- `is_crashed` is computed alongside it and
+was simply never consulted here. The loop matched an `EXITED` container as
+readily as a running one and stopped at the first hit.
+
+This is the same `serving_host` definition #130 and #131 both describe ("the
+first host in `cluster_config.yaml` order holding a `STANDALONE`/`HEAD`
+container"), and it survived both of those fixes intact -- neither touched
+the running/dead distinction, because until the host order changed there was
+no case where it mattered.
+
+It mattered once `spark-3` became first-listed: a stale `vllm-head` left
+`EXITED` on spark-3 matched before the loop ever reached spark-4, where a
+Gemma4 deploy was genuinely `RUNNING` and `READY`. `cluster_ready =
+host_health.get(serving_host, False)` then health-checked the dead container
+and reported the whole cluster not-ready.
+
+The visible symptom was two layers removed from the cause: the "Run Benchmark
+Suite Now" button never appeared for a demonstrably healthy deploy, because
+`updateBenchmarkControl()` only renders it when `cluster_ready` is true. The
+spark-4 host card showed `READY` throughout -- correctly, thanks to #130's
+per-host probing -- while the cluster-level flag derived from a different
+host said otherwise. Two indicators disagreeing, both right about what they
+measured.
+
+**Fix:** the loop skips crashed containers:
+
+```python
+if info.get("active_container") in (ContainerRole.STANDALONE, ContainerRole.HEAD) and not info.get("is_crashed"):
+```
+
+**Not fixed here:** whether `wait_for_cluster_ready()`'s timeout
+(`tuning.deploy_wait_timeout_sec`, 900s) expiring silently is a *separate*
+cause of missed auto-benchmarks. It is not this code path -- the deploy-time
+trigger in `_execute_deployment_impl()` uses `head`, the actual deploy target,
+not `serving_host`. But that block is structured as `if is_ready:` wrapping
+both load-time recording and the benchmark trigger, so a timeout drops both
+with no error surfaced anywhere an operator would look. Check
+`benchmark_ledger.csv` timestamps against deploy logs before assuming this
+entry covers it.
+
+---
+
+### 135. The interactive menu could not force past a reserved-host refusal, because `force` was never wired to it at all
+
+**Trap:** `execute_deployment()` takes `force: bool = False`.
+`interactive_menu()`'s call site:
+
+```python
+res = execute_deployment(selected_model, nodes, head, user_id, wait=do_wait, run_benchmark=do_bench)
+```
+
+No `force`, and no prompt anywhere in the function that could have supplied
+one. A `reserved_host` refusal from `dgx-config menu` was therefore a dead
+end: the menu printed the raw JSON refusal and returned, giving no indication
+that the non-interactive `dgx-config deploy --force` form existed or was the
+way out. The refusal message itself says "Re-run with `--force` if this is
+intended" -- accurate for the CLI surface it was written for, and unhelpful
+inside a menu that has no `--force` to pass.
+
+The menu already handled reserved hosts thoughtfully one step earlier: the
+1-node target prompt labels them `[reserved]` specifically so nobody picks
+one and hits a refusal afterwards. That care stopped at the 2-node path,
+which offers no host choice at all and lands on `PRIMARY_HOST` via
+`resolve_deploy_head(None, 2)` -- which, after the reserved-host swap, is the
+reserved host by definition.
+
+**Fix:** the menu catches a `reserved_host` refusal, prints the server's own
+message (which already names the host and what is recorded running on it),
+and asks an explicit y/N before retrying with `force=True`. Declining cancels
+cleanly and says so.
+
+Deliberately mirrors the dashboard's per-action confirm dialog rather than
+adding a menu-level force option: the override is held for exactly one retry
+and cannot outlive it. Same reasoning as #131's rejection of a persistent
+force checkbox -- an override with state is an override someone else
+inherits.
+
+---
+
+### 134. The dashboard sent a stale target-host value on every 2-node deploy, silently overriding the server's own topology-aware default
+
+**Trap:** `updateDeployTargetControls()` hides the target picker for 2-node
+(`showHead = nodes !== '2'`), because for 2-node the head is structural rather
+than chosen. But hiding a `<select>` does not clear it. The element retained
+whatever value it last held from a 1-node selection -- and was initialised to
+`default_deploy_target` the moment it was built -- while `triggerDeploy()`
+read it unconditionally:
+
+```javascript
+const head = document.getElementById('headSelect').value;
+...
+const payload = { model, nodes, head, ... };
+```
+
+Server-side, `resolve_deploy_head()` treats any truthy `head` as a deliberate
+operator choice:
+
+```python
+if head:
+    return head
+return PRIMARY_HOST if nodes == 2 else DEFAULT_DEPLOY_HOST
+```
+
+So every dashboard-initiated 2-node deploy sent an explicit override, and the
+`PRIMARY_HOST`-for-2-node branch was unreachable from that surface entirely.
+The head landed on the scratch node with no error, no warning, and nothing in
+the UI indicating a choice had been made on the operator's behalf. The CLI,
+reading the same function correctly, put the head where the config said. Two
+surfaces, opposite results, one resolver -- the same shape as #131's item 1,
+from the opposite direction.
+
+~~Near-certain origin of an earlier DSpark 2-node deploy found running
+`vllm-head` on `spark-3` while `PRIMARY_HOST` was `spark-4`, which had been
+attributed to config or host-order confusion at the time.~~
+[RETRACTED -- see correction below]
+
+> **Correction, 2026-09-08, by the session that wrote this entry.** The
+> retracted sentence is not supportable and is left visible rather than
+> deleted. The bug above is unaffected -- it was read directly from the
+> source and stands. What does not stand is attributing that specific
+> earlier incident to it.
+>
+> This mechanism is **dashboard-only**: it requires `triggerDeploy()`
+> reading a hidden `headSelect`. It cannot fire from the CLI. The operator's
+> next message after reporting that DSpark deploy was about the interactive
+> menu offering no head picker, which points at the CLI, where this
+> mechanism does not exist. And a competing explanation had real evidence in
+> the same session: `HOSTS`/`PRIMARY_HOST`/`RESERVED_HOSTS` are module-level
+> constants computed once at import, the running daemon was holding a stale
+> copy of them, and after a container restart the menu correctly offered
+> `head spark-4`. Which surface launched the DSpark deploy was asked and
+> never answered before the thread moved on.
+>
+> "Near-certain" was therefore a plausible mechanism inferred from a
+> symptom, written in the voice of established fact -- the exact failure
+> F-m identifies in this same session's #132 backfill. Two instances in one
+> session's output is a pattern, not a slip, and the pattern is specifically
+> that a *correct* piece of source-read analysis makes an adjacent
+> *inferred* claim feel equally solid to whoever is writing it.
+>
+> The operational form, now recorded in WORKSTREAMS WS-0: an entry may state
+> what was observed and what rule it demonstrates. Where it reaches for
+> cause across incidents it did not witness, that reach is marked at the
+> claim, not assumed to be covered by a disclaimer somewhere above it.
+
+**Fix:** `triggerDeploy()` sends `head` only when the picker is the control
+that actually decided anything:
+
+```javascript
+const head = nodes === 2 ? null : headSelectValue;
+```
+
+For 2-node the server applies its own default, as it was always supposed to.
+
+**Consequence worth stating plainly:** a hidden form control is not an inert
+one. Anything reading DOM state unconditionally will read whatever the UI
+last showed, including state the operator can no longer see or correct. #132
+is the same element failing the opposite way -- rendered nowhere, but assumed
+present.
+
+---
+
+### 133. GLM-5.3-Flash-NVFP4 failed three independent ways in sequence, each masking the next, because the recipe schema could not describe an image that does not follow this cluster's conventions
+
+**Trap:** the first recipe in the catalog whose *image* -- not its
+`vllm_args` -- violated the deploy path's baked-in assumptions. Three
+distinct root causes, discovered strictly one at a time, because each crashed
+the container before the next could surface.
+
+**Layer 1 -- docker appends to ENTRYPOINT, it does not replace it.**
+`ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8` is built on the official
+`vllm/vllm-openai` base, which sets `ENTRYPOINT ["vllm","serve"]`.
+`_execute_deployment_impl()` builds its argv as a docker CMD and never passed
+`--entrypoint`, so the 2-node container's CMD:
+
+```python
+entrypoint_cmd = ["ray", "start", "--head", f"--port={ray_port}", "--num-gpus=1", "--block"]
+```
+
+launched as `vllm serve ray start --head --port=6379 --num-gpus=1 --block`.
+vLLM's argparse prefix-matched `--block` to `--block-size` (unambiguous -- no
+other flag starts that way), which expects a value, and none followed:
+
+```
+vllm serve: error: argument --block-size: expected one argument
+```
+
+That reads as a fault in the recipe's own `--block-size 2304` line. That flag
+was never parsed. The failing argv was the *ray start* command, and
+`--block-size` in the error text came from vLLM's flag table, not from the
+recipe at all. Worth recording as its own diagnostic trap: **argparse prefix
+matching will name a flag you did write, for a token you did not.**
+
+Only the ray containers ever hit this -- the vLLM server is started later by
+`docker exec -d ... bash -c`, which does not apply ENTRYPOINT.
+
+**Layer 2 -- the image has no Ray.** With layer 1 fixed, `docker run --rm
+--entrypoint "" <image> python3 -c "import ray"` returns
+`ModuleNotFoundError`, and nothing named ray exists on `PATH` or in
+`/usr/local/bin`. PATH was verified normal first, so this is absence, not an
+entrypoint-neutralization artifact. Same class as the known
+`nvcr.io/nvidia/vllm` gap (`errata.yaml` E004), different image.
+
+Upstream never used Ray. Their sibling repo states it outright -- plain
+`docker run` per node, vLLM native multi-node via `--nnodes`/`--node-rank` --
+and their launcher takes a `NODE_RANK` argument with `--headless` on non-zero
+ranks. That is exactly `_execute_deployment_impl()`'s non-Ray branch. The
+published benchmark numbers in the recipe header were measured on that path,
+so matching it is fidelity, not compromise.
+
+**Layer 3 -- a custom processor that never learned about the hub.** With
+layers 1-2 fixed, the engine started and died in
+`Glm5NextProcessor.from_pretrained()`:
+
+```
+FileNotFoundError: [Errno 2] No such file or directory:
+  'RedHatAI/GLM-5.3-Flash-NVFP4/processor_config.json'
+```
+
+That method does a bare `open(os.path.join(model_path,
+"processor_config.json"))`. No `cached_file()`, no hub resolution, no
+awareness that a repo id is a thing. A repo-id string -- which is what every
+recipe's `hf_path` is, and what `--model` has always carried -- cannot satisfy
+it regardless of what is in the HF cache. The recipe's own header already
+documented the workaround (`huggingface-cli download --local-dir`) and
+upstream's launcher passes a local path, but the schema had no field capable
+of expressing either.
+
+**Fix:** three fields on `RecipeConfig`, all placed next to `image` because
+each describes a property of the image rather than of a topology.
+
+`entrypoint: Optional[str] = None` -- passed to `docker run --entrypoint`.
+`None` means no flag at all (byte-identical to prior behaviour, which is what
+keeps every existing recipe launching exactly as before); `""` neutralizes the
+image's ENTRYPOINT; any other string is used as the executable. The empty
+string is meaningful and distinct from `None`, so every test is `is not None`,
+never truthiness -- a truthiness check silently collapses "neutralize" into
+"do nothing", which is the exact bug being fixed. `run_ssh()` quotes via
+`shlex.quote()`, which renders `""` as `''` and preserves it as a real empty
+argument; verified by round-trip rather than assumed.
+
+`model_path_override: Optional[str] = None` -- the literal `--model` value
+when it must differ from `hf_path`. Deliberately not unioned with `hf_path`:
+`hf_path` remains this recipe's identity for the ledger, `_record_hf_path()`,
+cache bookkeeping and catalog display, and collapsing the two would put a raw
+container filesystem path on the dashboard where the repo id belongs.
+
+`extra_mounts: list[str] = []` -- additional bind mounts, applied identically
+on every target host. Sorted before hashing, unlike `mods`: bind mounts do not
+overwrite each other, so reordering them changes nothing about what launches.
+
+Layer 2 needed no code -- removing `--distributed-executor-backend ray` from
+the recipe's `vllm_args` flips `use_ray` false and lands the deploy on the
+matching native-multinode path.
+
+**Consequence for the backlog, recorded here because it is easy to miss:**
+`deploy_gemma4_dflash.py`'s docstring set the condition for touching the
+shared deploy path -- wait for a second real case. This recipe was that second
+case for `entrypoint`, and introduced two further categories in the same
+session. Community images built on upstream bases should be assumed to need
+this class of check rather than treated as drop-in compatible with
+`nvcr.io/nvidia/vllm` / `eugr/spark-vllm*` conventions. `docker inspect
+<image> --format '{{.Config.Entrypoint}}'` before writing the recipe is cheap;
+discovering it through a failed 2-node deploy is not. Nothing currently flags
+this at lint or catalog-load time -- see WS-3.
+
+**Schema migration:** `_CONFIG_HASH_SCHEMA` went 2 -> 3 (entrypoint) -> 4
+(model_path_override, extra_mounts) in one session. Every schema 1/2/3
+`config_hash` is now unreachable and the whole catalog reads "not confirmed to
+launch successfully yet" once, repopulating on next deploy. Tolerable rather
+than correcting, and the distinction matters: unlike the 1->2 bump, where
+schema 1 genuinely could not distinguish two recipes differing only in mods
+and some records therefore attested to configurations never launched, nothing
+in the catalog set any of these three fields. No prior record was *wrong*;
+they are simply no longer computable.
+
+**Audit still owed:** as of this entry the recipe is not hardware-validated.
+The non-Ray `--nnodes`/`--node-rank` path is inferred from upstream's stated
+approach, not observed on this image. Weight staging to
+`/var/tmp/glm-5.3-flash-nvfp4` on both hosts was in progress, not confirmed
+complete, when this was written. `verify_glm_recipe.py` reconstructs the
+docker command for both ranks and asserts all three fixes are present in the
+argv that would reach the wire -- that is argv-shape proof only, and proves
+nothing about whether the model loads.
+
+---
+
+### 132. The dashboard's Target picker was a DOM child of a row the topology logic hid, so on a single-topology recipe the control was never rendered at all -- and four rounds of state debugging looked straight past it
+
+**Body replaced 2026-09-08 by the session that made the fix.** The previous
+body was a good-faith reconstruction, correctly labelled as one. It got the
+rule right and the mechanism wrong in three specific ways, each of which
+would misdirect anyone later reading the code. Corrections are called out
+inline rather than silently applied, because the *shape* of the errors is
+itself the finding: every one is invisible from outside the session and
+obvious from inside it. F-k's caution about backfilling from outside was
+well placed -- this entry is the evidence for it.
+
+**Trap:** `headSelectContainer` (the Target host picker) is a child of
+`topologyRow`. `updateTopologyOptions()` hid that row whenever the selected
+recipe defined only one topology:
+
+```javascript
+const topoRow = document.getElementById('topologyRow');
+if (topoKeys.length <= 1) {
+    topoRow.style.display = 'none';
+} else {
+    topoRow.style.display = 'grid';
+}
+```
+
+The intent was "there is nothing to choose between when a recipe has one
+topology, so hide the topology picker." The effect was that the deploy target
+picker went with it. A 1-node deploy of a single-topology recipe -- most of
+the catalog -- offered no way to pick a host, and `resolve_deploy_head()`
+silently used `default_deploy_target`.
+
+> **Correction 1.** The prior body attributed the hiding to
+> `updateDeployTargetControls()`. That function did not exist when the bug
+> did: it is the *post-fix* rename of `updateHeadNodeVisibility()`, which
+> only ever set `visibility` on the head container and never touched the
+> row. Naming the fix's function as the bug's cause inverts the history, and
+> anyone grepping for it in the broken revision finds nothing.
+
+**Latent for its whole life, then inverted by a config change that never
+touched it.** The hidden fallback was `spark-4`, which is where 1-node work
+went anyway, so nobody missed a control that always produced the wanted
+answer. Adding `default_deploy_target: spark-3` to `cluster_config.yaml`
+(the d8401e1a reserved-host work) made the same silent fallback produce an
+answer the operator had explicitly not asked for. This is why the entry is
+filed under the reserved-host cluster despite predating it: the config
+change is what converted it from invisible to wrong.
+
+**The diagnostic failure.** The report was not "the target dropdown doesn't
+work" -- it was *"I selected spark-4 and deploy model. I got a dialog but it
+just forces it to spark-3."* Every element of that is accurate, and it
+describes a coherent state-mutation bug that did not exist. Four rounds went
+into theories about the `<select>`'s value changing:
+
+1. the target-aware recipe detection added in #131 hijacking the model
+   dropdown and flipping `nodes` to 2, which would make
+   `deployment_target_hosts()` ignore `head` entirely;
+2. an empty-string `head` falling through `resolve_deploy_head()`'s falsy
+   check to `DEFAULT_DEPLOY_HOST`;
+3. a duplicated element id, so `getElementById` returned a different node
+   than the one being interacted with;
+4. a stale cached page, or `onHeadSelectChanged` not firing.
+
+> **Correction 2.** The prior body listed these as "poll re-pinning,
+> `headSelectTouched` guard behaviour, catalog sync order, the reserved-host
+> filter." Two of those were never hypotheses. The distinction matters
+> because the real set shows the failure was *not* carelessness: (1) and (4)
+> were live regressions in that exact element from #131, days old, and (2)
+> is a real silent-substitution path that still exists in
+> `resolve_deploy_head()`. Every theory was recent, specific, and
+> load-bearing. They were all at the wrong layer.
+
+**The compounding factor, absent from the reconstruction.** #131 had added a
+teardown *scope* selector beside the Teardown button, and the log-host
+selector was already there. When the Target picker vanished, two other
+unlabelled host dropdowns remained on the panel. The operator's follow-up --
+"the dropdown persistently says spark-4 (reserved) unless I change it" --
+was a precise description of a real dropdown, just not the one under
+investigation. A missing control is hard enough to spot; a missing control
+with a plausible substitute a few rows below it is worse, and that was
+self-inflicted in the immediately preceding change.
+
+**What ended it.** A console dump requested to settle the duplicate-id
+theory:
+
+```
+count: 1   idx: 1   value: spark-3   touched: false   default: spark-3
+opts: ['spark-4 => spark-4 (9dbe) — reserved', 'spark-3 => spark-3 (6e63)']
+```
+
+Every value there is correct behaviour for an untouched control.
+`touched: false` was the complete answer and was read as "the handler isn't
+firing" rather than "this was never interacted with, because it was never on
+screen." The screenshot attached in the same message settled it in one look:
+the Topology and Target rows were plainly not on the panel.
+
+**Fix:** the two pickers decide their own visibility. They answer different
+questions and only ever shared a row for layout.
+
+```javascript
+const showTopo = topoKeys.length > 1;   // nothing to choose if there's one topology
+const showHead = nodes !== '2';         // a 2-node deploy spans every host by definition
+
+document.getElementById('topoSelectContainer').style.display = showTopo ? 'block' : 'none';
+document.getElementById('headSelectContainer').style.display = showHead ? 'block' : 'none';
+
+const topoRow = document.getElementById('topologyRow');
+topoRow.style.display = (showTopo || showHead) ? 'grid' : 'none';
+topoRow.style.gridTemplateColumns = (showTopo && showHead) ? '1fr 1fr' : '1fr';
+```
+
+`display` rather than `visibility`, so a hidden picker returns its grid
+column instead of leaving a dead gap. `updateHeadNodeVisibility()` renamed to
+`updateDeployTargetControls()`, since it no longer governs only the head
+picker. Verified across all four shapes:
+
+| Recipe / selection | Topology picker | Target picker | Row |
+|---|---|---|---|
+| `1_node` only | hidden | **shown, full width** | grid, `1fr` |
+| `2_node` only | hidden | hidden | collapsed |
+| both, 1-node selected | shown | shown | grid, `1fr 1fr` |
+| both, 2-node selected | shown | hidden | grid, `1fr` |
+
+> **Correction 3, the most consequential.** The prior body stated the fix as
+> "the Target picker is now a sibling of the topology row rather than a
+> child." It is not, and the DOM was never restructured. `headSelectContainer`
+> remains a child of `topologyRow`; only the visibility logic changed. Anyone
+> auditing this fix against that description would look for a nesting change
+> that does not exist, find the original nesting still in place, and
+> reasonably conclude the fix had been reverted.
+
+**Second defect fixed in the same pass, introduced by #131.** Target-aware
+recipe detection (`detectActiveRecipeKey()` prefers the host the operator is
+pointed at) meant that selecting a target host which already had something
+running would snap the *model* dropdown to whatever that host was serving and
+rebuild the topology options underneath -- silently rewriting the model
+selection as a side effect of choosing where to deploy. Fixed with the same
+`touched`-flag pattern used for the target picker: `modelSelectTouched` stops
+auto-follow once a model is chosen by hand and resets after a deploy is
+issued, when what is running and what was chosen agree again. Also labelled
+the teardown scope selector, per the compounding factor above.
+
+The tension underneath is unresolved and belongs to the interface spike: the
+Model Deployer panel answers both "what is running" and "what am I about to
+deploy", which had the same answer only while the cluster ran one thing at a
+time. See `docs/REFERENCE-control-surfaces.md` §8, question 2.
+
+**The rule this demonstrates, which is why it is written up at this length:**
+four rounds were spent debugging the state of an element that was not in the
+render tree. Every hypothesis was plausible, recent, and about the right
+element -- they were simply at the wrong layer. When a control "doesn't
+work", establish that it is *rendered* before reasoning about what it holds.
+An absent control and a present-but-ignored control produce identical
+JavaScript state; only the rendering distinguishes them. The cheap check --
+a screenshot, or one line in the console -- was available from round one and
+would have cost less than any single round spent without it.
+
 ### 131. The dashboard predated reserved hosts in three separate places, and each one silently steered the operator onto the host the backend was about to refuse
 
 **Trap:** `reserved:` / `default_deploy_target:` landed in `cluster_config.yaml`
