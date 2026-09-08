@@ -80,6 +80,132 @@ work is in the same session's transcript -- so neither carries the
 retrospective caveat #132 needed. Note #138 closes #86, open since Task MC.
 -->
 
+<!--
+Reconciliation note (2026-09-08, third pass): #140-#141 added, 27-141
+contiguous. Both first-hand and both hardware-confirmed rather than
+source-inferred -- #140's mechanism was predicted from a source read and
+then observed in a boot log, which is the ordering this file has been
+asking for.
+-->
+
+### 141. The benchmark button aimed at the headless worker, because the same hidden dropdown was read in a second place nobody checked
+
+**Trap:** #134 fixed `triggerDeploy()` reading a hidden `headSelect`
+unconditionally. It did not fix `triggerBenchmarkNow()`, which does the same
+thing:
+
+```javascript
+const head = document.getElementById('headSelect').value;
+if(!confirm(`Run basic benchmark now against active container on ${head}?`)) return;
+const response = await postJson('/benchmark', { head, nodes, model });
+```
+
+For a 2-node deploy that picker is hidden and holds its last 1-node value
+(`default_deploy_target`). So the benchmark went to whichever host that was
+-- frequently the WORKER, which under `vllm serve --headless` runs no API
+server at all, by design (#140). The dashboard reported:
+
+```
+Benchmark Error: vLLM engine on spark-4 (10.0.14.43) is not responding to health checks.
+```
+
+Accurate error, wrong target. The confirm dialog said "against active
+container on spark-4", which was also true and also not what the operator
+wanted -- spark-4 does have an active container, it just isn't serving.
+
+**Fix:** for 2-node the benchmark targets `currentServingHost` (the
+server's own answer, refreshed from `data.serving_host` every poll) and
+falls back to the picker only for 1-node, where the picker is the control
+the operator actually used. The dialog now says "spark-3 (2-node head --
+the worker serves no API)".
+
+**What this demonstrates, and it is not "test in a browser":** #134 was
+found, understood, fixed, and written up, and the fix was applied to the one
+call site in front of it. Nobody grepped for other readers of the same
+element. An audit at fix time -- `grep -n "headSelect'" index.html`, seven
+hits, five minutes -- would have found this immediately. Two of the other
+five turned out already-safe (one guarded behind a 2-node branch, one a
+preference list with fallbacks), which is exactly the kind of thing an audit
+establishes and an assumption does not.
+
+**This is the fourth bug in this one dropdown** (#66 sync, #132 not
+rendered, #134 stale value on deploy, this) and the SECOND partial fix to
+it. See WS-7 and F-n.
+
+---
+
+### 140. `vllm serve` and `python3 -m vllm.entrypoints.openai.api_server` are not equivalent, and the difference only appears on a multi-node worker
+
+**Trap:** the orchestrator built every container's argv as
+`["python3", "-m", "vllm.entrypoints.openai.api_server", ...]`. For 1-node
+that is fine; both entry points reach the same code. For a 2-node WORKER it
+is not, and the failure is silent until it is fatal.
+
+`--headless` was PARSED -- it appears in the worker's boot log under
+`non-default args: {'headless': True, ...}` -- and then ignored. The worker
+started its own APIServer and EngineCore, which called `collective_rpc` on a
+node that correctly knew it was a follower:
+
+```
+AssertionError: collective_rpc should not be called on follower node
+```
+
+after nine minutes of weight loading. The head then hung indefinitely in
+`shm_broadcast`, logging "No available shared memory broadcast block found
+in 60 seconds" every minute for half an hour, with `IBV_WC_RETRY_EXC_ERR`
+against a peer that no longer existed. Two failure surfaces, neither naming
+the cause.
+
+**Confirmed by source read before any fix was attempted**, in the image's
+own `vllm/entrypoints/cli/serve.py`:
+
+```
+146:            run_headless(args)
+177: def run_headless(args: argparse.Namespace):
+262:        assert not args.headless
+```
+
+`vllm serve` branches on `--headless` into `run_headless()`, which starts
+workers only. The path `api_server.py` runs is the one guarded by the assert
+at line 262 -- reachable ONLY with headless false. So the module path cannot
+honour `--headless`; there is no code in it that would.
+
+**Note this is a SECOND, INDEPENDENT trigger for #43's assert.** #43
+attributed `collective_rpc should not be called on follower node` to the
+`mp` backend and fixed it with the Ray flag. Ray sidesteps this entirely by
+never passing `--headless`. Nothing in the docs distinguished the two, and
+an operator hitting this error would reasonably have reached for #43's fix
+-- which is unavailable here, because this image has no ray (#133 layer 2).
+
+**Fix:** `RecipeConfig.launch_argv_prefix` (schema 4 -> 5). `None`
+reproduces the historical module path exactly; a `{model}` token in the
+prefix is substituted with the resolved path and suppresses the separate
+`--model` flag, because `vllm serve`'s usage line is
+`vllm serve [model_tag] [options]` and positional is what the image
+documents. GLM-5.3 sets `["vllm", "serve", "{model}"]`.
+
+**Also fixed, and only found by grepping for the string:** teardown's
+graceful pass was `pkill -f vllm.entrypoints.openai.api_server`. A
+`vllm serve` process contains no trace of that string, so a recipe using the
+CLI would have silently skipped the graceful SIGTERM entirely and gone
+straight to `docker stop`/`docker rm -f` -- losing the protection that keeps
+an in-flight JIT compile from being left half-written. Now matches both
+patterns. **The prediction was source-read; this consequence was not
+predicted at all and would have been a silent regression.**
+
+**Validated on hardware 2026-09-08.** Worker log:
+
+```
+INFO 09-08 18:35:50 [serve.py:216] Launching vLLM (v0.1.dev20051+g487ecf187)
+headless multiproc executor, with head node address 10.0.14.41:29500 for
+torch.distributed process group.
+```
+
+serve.py:216 is inside `run_headless()`. No APIServer banner in the worker
+log. The head's traceback, when it later failed on an unrelated KV-cache
+sizing issue, went through `cli/serve.py:152` -- the non-headless branch.
+Both ranks on the entry point they should be on.
+
 ### 139. `gpu_util_ceiling` was a required config field that nothing read, for as long as it existed
 
 **Trap:** `cluster_config.yaml` has declared `gpu_util_ceiling: 0.75` since

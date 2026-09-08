@@ -7,9 +7,18 @@ recipe_version: '1'
 # token corruption (vLLM #54150); RedHatAI is uncorrupted and loads ~2x faster
 # (11 large shards vs 120 small).
 #
-# Performance targets on 2x DGX Spark (community benchmarks):
-#   - fp8 KV + MTP-4: ~21.8 tok/s, 507K KV pool (tonyd2wild)
-#   - fp8 KV + DFlash2: 46.9 tok/s, 74.1% acceptance, 581K KV (tonyd2wild)
+# VALIDATED ON HARDWARE 2026-09-08, spark-3 (head) + spark-4 (worker):
+#   - 23.1 tok/s warm decode, TTFT 0.22 s, MTP acceptance 36.9% live
+#   - 22.3 tok/s on an independent earlier run -- TWO runs, not one sample
+#   - max_model_len 98304, KV pool 312,785 tokens, 3.18x concurrency
+#   - boot ~11 min (weights ~6 min/rank, then JIT + cudagraph capture)
+#   The MTP figure REPRODUCES upstream's ~21.8 tok/s / ~0.24 s TTFT, so the
+#   throughput claim below is confirmed. The KV-pool claim is not -- see the
+#   MAX CONTEXT NOTE.
+#
+# Community benchmarks (tonyd2wild), for comparison:
+#   - fp8 KV + MTP-4: ~21.8 tok/s, 507K KV pool  <- tok/s reproduced, KV NOT
+#   - fp8 KV + DFlash2: 46.9 tok/s, 74.1% acceptance, 581K KV (NOT TESTED here)
 #   - 4-node TP4: 68.5 tok/s (sibling repo, not tested on 2-node)
 #   - TTFT: ~0.24 s (greedy, no spec)
 #
@@ -41,19 +50,69 @@ recipe_version: '1'
 # WEIGHTS: huggingface-cli download RedHatAI/GLM-5.3-Flash-NVFP4
 #   --local-dir /var/tmp/glm-5.3-flash-nvfp4
 #   Download to BOTH spark-3 and spark-4 (or NFS-export from head).
-#   ~169 GB (11 safetensors files). ~14 min total boot (10 min weights + ~2.5 min).
+#   184.26 GiB on disk (11 safetensors files), 92.76 GiB resident per rank
+#   after TP2 sharding. Measured boot 2026-09-08: ~11 min wall
+#   (weights ~6 min on the head, ~5 min on the worker -- they differ, the
+#   head is slower -- then ~75 s for JIT, profiling and cudagraph capture).
 #
-# MAX CONTEXT NOTE:
-#   At fp8 KV + gmu 0.85, the KV pool is ~507K tokens (with MTP active) to
-#   ~700K+ (without MTP). With max_model_len 524288 and max_num_seqs 2, two
-#   full-length concurrent requests would need ~1M tokens — exceeds the fp8
-#   budget. For 512K context, max ~1 concurrent full-length request. For
-#   max_num_seqs 4, use max_model_len 262144 (262K) instead.
+#   The mount is /var/tmp/glm-5.3-flash-nvfp4 on the HOST side. Docker
+#   silently CREATES a missing bind-mount source as an empty directory
+#   rather than failing, which reproduces the original FileNotFoundError
+#   with no hint that the mount was the problem. Verify before deploying:
+#     ls /var/tmp/glm-5.3-flash-nvfp4/processor_config.json    # on BOTH hosts
+#
+# MAX CONTEXT NOTE -- CORRECTED 2026-09-08, the original claim did not hold.
+#
+#   ORIGINAL CLAIM (upstream, left visible because the gap is unexplained):
+#     "At fp8 KV + gmu 0.85, the KV pool is ~507K tokens (with MTP active)
+#      to ~700K+ (without MTP) ... For 512K context, max ~1 concurrent
+#      full-length request."
+#
+#   MEASURED HERE: 524288 does not boot at all. The engine refuses during
+#   KV-cache allocation --
+#
+#     ValueError: To serve at least one request with the model's max seq
+#     len (524288), 3.82 GiB KV cache is needed, which is larger than the
+#     available KV cache memory (1.36 GiB). Based on the available memory,
+#     the estimated maximum model length is 119808.
+#
+#   At 98304 it boots with a 312,785-token pool and 3.18x concurrency --
+#   i.e. THREE concurrent full-length requests, not one. Better concurrency,
+#   a fifth of the context.
+#
+#   WHERE THE MEMORY GOES (gpu_worker.py:790, both ranks, budget 103.44 GiB):
+#     consumed (weights + non-torch)  95.55 GiB head / 96.68 GiB worker
+#     peak activation                  2.79 / 2.82
+#     KV in use                        5.09 / 3.94
+#   Weights are 92.76 GiB, so ~3 GiB is non-torch overhead. The head/worker
+#   KV asymmetry (5.09 vs 3.94) is REAL AND UNEXPLAINED -- under TP2 these
+#   should match, and the cluster is limited by the smaller.
+#
+#   RULED OUT: the multimodal encoder cache. It reports an identical 32242
+#   token budget at both 524288 and 98304, so it does not scale with
+#   context and is not the missing memory.
+#
+#   NOT YET TRIED, and the most promising lead: vLLM itself suggests
+#   `--kv-cache-memory=9166886912` (8.54 GiB) "to fully utilize gpu memory"
+#   -- more than double what the gpu_memory_utilization heuristic allocated,
+#   because that heuristic reasons about a 121.69 GiB device while ~14 GiB
+#   sits unused. Setting it explicitly (sized to the TIGHTER rank) is the
+#   plausible route back to a larger context. Try before concluding 512K is
+#   unreachable on this hardware.
 #
 # DEPLOY SEQUENCE:
-#   Worker first (spark-4), confirm it's Up, THEN head (spark-3). Never let
-#   a new rank rendezvous with a dying one. Full teardown of both before
-#   either relaunch. Capture docker logs before rm -f.
+#   Upstream's procedure is worker-first with a ~25 s gap, then the head.
+#   The orchestrator launches HEAD FIRST with no delay, and that worked --
+#   validated 2026-09-08. NCCL rendezvous completed in ~2.5 s on both comms
+#   over RoCE. Do not add a delay to the deploy path on upstream's word
+#   alone; if a rendezvous hang ever appears, this ordering is the first
+#   thing to suspect, but it is not a problem today.
+#
+#   Full teardown of both hosts before either relaunch still applies, and
+#   `dgx-config teardown --all --force` is the way (spark-3 is reserved).
+#   Capture docker logs before tearing down -- a failed boot leaves the head
+#   spinning in shm_broadcast with IB retry errors and the log is the only
+#   record of why.
 #
 # KNOWN GB10/SM121 issues (all resolved by the image):
 #   - decode-time top-k hard-kills past ~24K (Patch 1: FA2 kernel)
@@ -152,10 +211,23 @@ topologies:
     # KV cache: fp8 (~5.95 bytes/token vs 11.9 for bf16). At gmu 0.85, ~7.2 GB
     # available for KV → ~507K tokens with MTP active, ~700K+ without MTP.
     #
-    # --block-size 2304: Community-verified (tonyd2wild). The block aligner
-    #   picks 2176 on this backend; DeepGEMM paged-MQA on arch-12 fp8 accepts
-    #   only 64-entry pool pages. 2304 is a multiple of both 256 (kpool·64) and
-    #   128 (MLA alignment), and the aligner pads the mamba page ~6% to match.
+    # --block-size 2304: passed, and then OVERRIDDEN by the engine. Confirmed
+    #   2026-09-08 in both ranks' boot logs:
+    #     "Setting attention block size to 4608 tokens to ensure that
+    #      attention page size is >= mamba page size."
+    #     "Padding mamba page size by 2.86% to ensure that mamba page size
+    #      and attention page size are exactly equal."
+    #   So the value that takes effect is 4608, not 2304, and the original
+    #   rationale below does not survive contact with this build. The flag is
+    #   KEPT rather than removed because removing it is a separate untested
+    #   change and the engine's override appears deterministic -- but do not
+    #   reason about 2304 as if it were in force.
+    #
+    #   Original rationale (community-verified, tonyd2wild): "The block
+    #   aligner picks 2176 on this backend; DeepGEMM paged-MQA on arch-12 fp8
+    #   accepts only 64-entry pool pages. 2304 is a multiple of both 256
+    #   (kpool·64) and 128 (MLA alignment), and the aligner pads the mamba
+    #   page ~6% to match." 
     #
     # --moe-backend marlin: Verified on sm_121 by tonyd2wild. FLASHINFER_CUTLASS
     #   also runs but marlin was kept for the validated final config.
@@ -173,7 +245,11 @@ topologies:
     #   field. Disable per-request with chat_template_kwargs: {"enable_thinking": false}.
     #
     # --enable-prefix-caching: RedHatAI recommends this for GLM-5.3.
-    max_model_len: 524288
+    # 98304, not the 524288 this recipe originally carried. 524288 does not
+    # boot -- see the MAX CONTEXT NOTE in the header for the engine's own
+    # refusal message and the memory accounting. Raise this only after
+    # testing --kv-cache-memory, and re-benchmark if you do.
+    max_model_len: 98304
     tp_size: 2
     pp_size: 1
     env_vars:

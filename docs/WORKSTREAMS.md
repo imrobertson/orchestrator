@@ -596,6 +596,7 @@ evidence. Ordered by what each unblocks.
 | Cache integrity retrospection | **OPEN, wants ground truth** | One concrete artifact: a `tilelang` entry named `tmp` with an implausible ~56-year age. The heuristic needs real Triton/TileLang/DeepGEMM cache-layout contracts before it can be trusted. |
 | `serving_host` ignored container run state | **LANDED 2026-09-07** | #136. The selection loop matched `active_container` by name regardless of `is_crashed`, so a stale `EXITED` container on an earlier-listed host shadowed a genuinely serving one and reported the whole cluster not-ready. Survived both #130 and #131 untouched -- neither had reason to distinguish running from dead until host order changed. Now gated on `not is_crashed`. Adjacent to *Engine health monitoring* above: that row's "container RUNNING, engine absent" case is this one's mirror image and is **not** caught by this fix. |
 | `wait_for_cluster_ready()` timeout fails silently | **OPEN, new 2026-09-07** | `_execute_deployment_impl()` wraps both load-time recording and the auto-benchmark trigger in a single `if is_ready:`. A `deploy_wait_timeout_sec` expiry (900s default) drops both with no error surfaced to dashboard, CLI, or toast -- indistinguishable from "auto-benchmark is broken". Suspected but **not confirmed** as a second cause of missed auto-benchmarks alongside #137; the evidence to settle it is `benchmark_ledger.csv` timestamps against deploy logs. At minimum, log and surface the timeout distinctly from success. |
+| A fix to a shared element must be preceded by an audit of its other readers | **PRACTICE, adopted 2026-09-08** | #141. #134 fixed one reader of `headSelect` and left another broken for a day, which then aimed the benchmark at a headless worker. `grep -n "headSelect'" index.html` returns seven hits and takes five minutes; doing it at fix time would have caught #141 immediately, and it also establishes which other readers are already safe (two were) rather than leaving that to assumption. Cheap, mechanical, and it does not depend on having a browser harness — which is the other open row above, still unaddressed. |
 | Three fixes never verified in their real UI path, two of them to one element | **OPEN, small — worse than when this row was written** | #78's teardown error toast (no failing teardown existed to test against) and #66's `headSelect` sync (only `node --check`'d). Now three: #137's benchmark-checkbox state window was landed with control flow read by hand and brace balance checked, never opened in a browser. And #134 -- also unverified — is the **same element as #66**, plus #132 was a third failure of that same control from a different direction. Four bugs in one dropdown, two fixes to it never exercised. This is the argument for a minimal DOM-level harness over a fourth careful read. |
 
 ---
@@ -741,6 +742,10 @@ New 2026-09-07. Three fields landed, `_CONFIG_HASH_SCHEMA` 2 -> 4. See
 | `entrypoint: Optional[str]` | **LANDED** | `docker run --entrypoint` override. `None` = no flag (byte-identical to prior behaviour for every existing recipe); `""` = neutralize the image's ENTRYPOINT; other = executable. `""` vs `None` is load-bearing -- all tests `is not None`, never truthiness. `run_ssh()`'s `shlex.quote()` renders `""` as `''` and preserves it as a real empty arg, round-trip verified. |
 | `model_path_override: Optional[str]` | **LANDED** | Literal `--model` value when it must differ from `hf_path`. `hf_path` stays the recipe's identity for ledger, `_record_hf_path()`, cache bookkeeping, catalog display. Deliberately not unioned with `hf_path` -- collapsing them would surface a container filesystem path where the dashboard shows a repo id. |
 | `extra_mounts: list[str]` | **LANDED** | Additional bind mounts, host-symmetric, applied identically on every target host. Sorted before hashing (unlike `mods`): mounts don't overwrite each other, so order is not semantic. |
+| `launch_argv_prefix` | **LANDED, hardware-validated** | #140. Schema 4 -> 5. `None` = the historical module path; a `{model}` token is substituted and suppresses `--model`. Required for any multi-node WORKER on an image where `vllm serve` is the entry point -- the module path parses `--headless` and ignores it, then dies on `collective_rpc`. Confirmed by source read (serve.py:146/177/262) BEFORE the fix, then observed in a boot log (serve.py:216) after. Teardown's `pkill` pattern had to widen too, which was not predicted -- see #140. |
+| `_glm-5.3-flash-nvfp4-tp2` deploys | **VALIDATED 2026-09-08** | Serving on spark-3 (head) + spark-4 (worker). 23.1 tok/s warm, TTFT 0.22 s, MTP acceptance 36.9%, two independent benchmark runs. REPRODUCES upstream's ~21.8 tok/s MTP figure. Logged to `benchmark_ledger.csv` under key `GLM-5.3-Flash-NVFP4` — the E019 basename constraint doing its job, since a lowercase mount would have orphaned the entry. |
+| GLM-5.3 context is a fifth of what the recipe claimed | **OPEN, unexplained** | Header claimed ~507K KV pool at fp8 + gmu 0.85. Reality: 524288 does not boot (needs 3.82 GiB KV, has 1.36), engine's own estimate of max reachable length is 119808. Running at 98304 with a 312,785-token pool and 3.18x concurrency. Encoder-cache theory RULED OUT (identical 32242-token budget at both context sizes). Head/worker KV asymmetry (5.09 vs 3.94 GiB) is real and unexplained — under TP2 they should match. Most promising lead, untried: vLLM suggests `--kv-cache-memory=9166886912` to reclaim ~14 GiB the utilization heuristic leaves unused. |
+| `--block-size 2304` is overridden to 4608 | **OPEN, cosmetic today** | The engine sets 4608 "to ensure that attention page size is >= mamba page size" and pads the mamba page 2.86%. The recipe's DeepGEMM-alignment rationale for 2304 therefore does not survive contact with this build. Flag kept (removing it is a separate untested change), comment corrected. |
 | `_glm-5.3-flash-nvfp4-tp2` deploys | **BLOCKED on weight staging** | All three fields set, ray flag removed. `verify_glm_recipe.py` proves the argv shape for both ranks. Not hardware-validated: weight staging to `/var/tmp/glm-5.3-flash-nvfp4` on both hosts was incomplete at time of writing, and the non-Ray `--nnodes`/`--node-rank` path is inferred from upstream, not observed on this image. |
 | Retire `deploy_gemma4_dflash.py` | **BLOCKED on validation** | Its stated reason to exist (no `--entrypoint` field) is gone. `gemma4-26b-a4b-aeon-dflash.yaml` is the schema-native replacement, flag-by-flag diffed against the script's validated argv -- every flag reproduced, no extras, and it launched `READY` on spark-4 2026-09-07. **Do not delete the script until that recipe is also benchmarked**, and note one unverified assumption: the recipe uses `python3 -m vllm.entrypoints.openai.api_server` where the validated script used `--entrypoint vllm` + `serve <path>`. If that module path is absent in AEON's image, the schema has no field to change the argv prefix and this needs a fourth field, not a recipe tweak. |
 | Argv-prefix override (`python3 -m vllm...` vs `vllm serve`) | **OPEN, contingent** | Only needed if the assumption above fails. Deliberately not built speculatively -- the same discipline `deploy_gemma4_dflash.py`'s docstring applied to `entrypoint`: wait for a second real case. One case is currently hypothetical. |
@@ -1984,6 +1989,27 @@ from a description of the symptom, which is every place that matters for
 code archaeology. This is direct evidence for F-k's and F-l's caution: the
 cost of backfilling from outside is not vagueness, it is confident and
 specific error.
+
+**F-n — four bugs in one dropdown, and two of the fixes were partial.**
+`headSelect` has now produced #66 (sync never verified), #132 (not rendered
+at all, four rounds of state debugging on an element that was not in the
+DOM), #134 (hidden but still read, silently overriding the server's own
+default) and #141 (the same as #134, in a second caller nobody checked).
+Two of those four fixes were incomplete when declared done.
+
+The common factor is not the element -- it is that this control is
+CONDITIONALLY VISIBLE, and every bug has been about the gap between what it
+shows and what it holds. #132 was "not rendered but assumed present"; #134
+and #141 were "not visible but still read". The same ambiguity produced
+opposite errors.
+
+Worth considering whether the fix is structural rather than another patch:
+a control that is hidden for a topology could be CLEARED or DISABLED when
+hidden, so a stale read returns empty rather than a plausible wrong host.
+That would have made #134 and #141 fail loudly at the first call site
+instead of silently at the second. Not proposed as work yet -- recorded
+because the fourth instance is the point at which "fix it again" stops
+being the obvious response.
 
 ---
 

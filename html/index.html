@@ -1707,9 +1707,34 @@
             nodes = recipe?.topologies?.['2_node'] ? 2 : 1;
         }
 
-        const head = document.getElementById('headSelect').value;
+        // SAME BUG AS #134, in a second caller. `headSelect` is hidden for
+        // a 2-node deploy but still holds its last 1-node value
+        // (default_deploy_target), so reading it unconditionally aimed the
+        // benchmark at whichever host that happened to be. For a 2-node
+        // deploy that is frequently the WORKER -- which under
+        // `vllm serve --headless` runs no API server at all, by design --
+        // so the benchmark hit a host with nothing listening on :8000 and
+        // reported "vLLM engine on <worker> is not responding to health
+        // checks". Accurate error, wrong target.
+        //
+        // For 2-node the benchmark must go to the head, which is the only
+        // rank serving. `serving_host` is the server's own answer to
+        // "which host is actually serving", so use it and fall back to the
+        // picker only for 1-node, where the picker is the control the
+        // operator actually used.
+        //
+        // #134 fixed triggerDeploy() and this caller was not checked. That
+        // is four bugs in this one dropdown (#66, #132, #134, this) and
+        // the second partial fix -- see WS-7.
+        const headSelectValue = document.getElementById('headSelect').value;
+        const head = nodes === 2
+            ? (currentServingHost || headSelectValue)
+            : headSelectValue;
 
-        if(!confirm(`Run basic benchmark now against active container on ${head}?`)) return;
+        const targetLabel = nodes === 2
+            ? `${head} (2-node head — the worker serves no API)`
+            : head;
+        if(!confirm(`Run basic benchmark now against active container on ${targetLabel}?`)) return;
 
         try {
             showStatusToast('✓ Initiating benchmark ...');

@@ -19,7 +19,7 @@ import datetime
 # is what actually answers "did my push/pull/restart take" now -- it's
 # derived, not typed, so it can't be forgotten the way this slug already
 # has been.
-ORCHESTRATOR_VERSION_SLUG = "2026-09-08-launch-argv-prefix-headless-fix"
+ORCHESTRATOR_VERSION_SLUG = "2026-09-08-positional-model-parse-benchmark-target"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
@@ -2392,8 +2392,49 @@ def _discover_host_container(host: str, meta: dict) -> dict:
         info["is_crashed"] = is_crashed
 
         loaded_model = "None"
+        # TWO CALLING CONVENTIONS, both of which appear in this catalog:
+        #
+        #   python3 -m vllm.entrypoints.openai.api_server --model <path>
+        #   vllm serve <path>                                (positional)
+        #
+        # The second arrived with RecipeConfig.launch_argv_prefix (schema 5,
+        # TOMBSTONES #140), which some images REQUIRE -- a multi-node worker
+        # on an image where `vllm serve` is the entry point cannot honour
+        # --headless via the module path. Every branch below used to gate on
+        # the literal string "--model", so a positional recipe matched none
+        # of them and fell through to the "Active Container" placeholder on
+        # every host. That is not cosmetic: loaded_model is what
+        # _resolve_catalog_key() consumes, so the dashboard's model name,
+        # and any ledger or session key resolved through the fuzzy fallback
+        # rather than ACTIVE_DEPLOYMENT_STATE's exact record, all degrade at
+        # once.
+        #
+        # Note the E019 basename constraint (errata.yaml) protects the
+        # --model form specifically. It cannot help here, because in the
+        # positional form there is no parse to protect -- which is why this
+        # needed its own fix rather than being covered by that rule.
+        def _model_from_argv(parts: list) -> str:
+            """Return the model basename from either convention, or ''."""
+            if "--model" in parts:
+                idx = parts.index("--model")
+                if idx + 1 < len(parts):
+                    return parts[idx + 1].split("/")[-1]
+                return ""
+            # Positional: the token immediately after `serve`. Guarded on
+            # the pair rather than on `serve` alone so an unrelated argv
+            # containing that word cannot produce a bogus name.
+            for i in range(len(parts) - 2):
+                if parts[i].endswith("vllm") and parts[i + 1] == "serve":
+                    candidate = parts[i + 2]
+                    if not candidate.startswith("-"):
+                        return candidate.split("/")[-1]
+            return ""
+
         inspect_res = run_ssh(ip, user, ["docker", "inspect", c_name, "--format", "{{json .Config.Cmd}}"], timeout=8)
-        if inspect_res.returncode == 0 and "--model" in inspect_res.stdout:
+        _has_model_hint = inspect_res.returncode == 0 and (
+            "--model" in inspect_res.stdout or "serve" in inspect_res.stdout
+        )
+        if _has_model_hint:
             try:
                 cmd_parts = json.loads(inspect_res.stdout.strip())
                 if len(cmd_parts) >= 2 and cmd_parts[0] == "bash" and "-c" in cmd_parts:
@@ -2401,10 +2442,14 @@ def _discover_host_container(host: str, meta: dict) -> dict:
                     model_match = re.search(r'--model\s+([^\s]+)', bash_cmd)
                     if model_match:
                         loaded_model = model_match.group(1).split("/")[-1]
-                elif "--model" in cmd_parts:
-                    idx = cmd_parts.index("--model")
-                    if idx + 1 < len(cmd_parts):
-                        loaded_model = cmd_parts[idx + 1].split("/")[-1]
+                    else:
+                        serve_match = re.search(r'\bvllm\s+serve\s+([^\s-][^\s]*)', bash_cmd)
+                        if serve_match:
+                            loaded_model = serve_match.group(1).split("/")[-1]
+                else:
+                    parsed = _model_from_argv(cmd_parts)
+                    if parsed:
+                        loaded_model = parsed
             except Exception as exc:
                 # Falling back to a placeholder here means active_model
                 # (and downstream matched_key resolution, when
@@ -2416,19 +2461,27 @@ def _discover_host_container(host: str, meta: dict) -> dict:
                 # Container" on the dashboard.
                 print(f"[!] _discover_host_container({host}): failed to parse inspected Cmd for model name - {exc}")
                 loaded_model = "Active Container"
-        else:
+
+        if loaded_model in ("None", ""):
             ps_res = run_ssh(ip, user, ["docker", "exec", c_name, "ps", "aux"], timeout=10)
-            if ps_res.returncode == 0 and "--model" in ps_res.stdout:
+            if ps_res.returncode == 0 and ("--model" in ps_res.stdout or "vllm serve" in ps_res.stdout):
                 try:
-                    for part in ps_res.stdout.split():
-                        if "/" in part and any(fam in part for fam in ["DeepSeek", "Qwen", "Llama", "model", "gemma", "Nemotron", "Muse", "Glimmer"]):
-                            loaded_model = part.split("/")[-1]
-                            break
+                    parsed = _model_from_argv(ps_res.stdout.split())
+                    if parsed:
+                        loaded_model = parsed
+                    else:
+                        for part in ps_res.stdout.split():
+                            if "/" in part and any(fam in part for fam in ["DeepSeek", "Qwen", "Llama", "model", "gemma", "Nemotron", "Muse", "Glimmer", "GLM"]):
+                                loaded_model = part.split("/")[-1]
+                                break
                 except Exception as exc:
                     print(f"[!] _discover_host_container({host}): failed to parse `ps aux` output for model name - {exc}")
                     loaded_model = "Active Container"
             else:
                 loaded_model = "Active Container"
+
+        if loaded_model in ("None", ""):
+            loaded_model = "Active Container"
 
         info["loaded_model"] = loaded_model
         break
