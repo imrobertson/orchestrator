@@ -288,6 +288,45 @@ class RecipeConfig(BaseModel):
     # If this field ever gains a second meaning, re-run that trace before
     # trusting this comment.
     gpu_util_ceiling_exempt: bool = False
+    # The argv that precedes the engine flags. None means the historical
+    # ["python3", "-m", "vllm.entrypoints.openai.api_server"], which is
+    # every recipe today.
+    #
+    # If the list contains the literal token "{model}", it is replaced with
+    # the resolved model path and the orchestrator does NOT emit a separate
+    # `--model` flag. Otherwise `--model <path>` is emitted as before.
+    #
+    # WHY THIS EXISTS -- the failure is specific and was confirmed by
+    # source read, not inferred. `vllm serve` and
+    # `python3 -m vllm.entrypoints.openai.api_server` are NOT equivalent
+    # for a multi-node worker. In the image's own
+    # vllm/entrypoints/cli/serve.py:
+    #
+    #     146:            run_headless(args)
+    #     177: def run_headless(args: argparse.Namespace):
+    #     262:        assert not args.headless
+    #
+    # `vllm serve` branches on --headless into run_headless(), which starts
+    # workers only. The path api_server.py runs is the one guarded by that
+    # assert at line 262 -- it is only ever reached with headless FALSE.
+    # Invoke the module directly with --headless and the flag is PARSED
+    # (it appears in the boot log's "non-default args") and then IGNORED:
+    # the follower starts its own APIServer and EngineCore, which calls
+    # collective_rpc on a node that correctly knows it is a follower, and
+    # dies with:
+    #
+    #     AssertionError: collective_rpc should not be called on follower node
+    #
+    # That is the same error string as TOMBSTONES #43 / incident #1, which
+    # was attributed to the `mp` backend and fixed with the Ray flag. This
+    # is a SECOND, INDEPENDENT trigger for the same assert: Ray sidesteps
+    # it by never passing --headless at all. Nothing in the docs
+    # distinguished the two until 2026-09-08.
+    #
+    # 1-node deploys are unaffected either way -- there is no --headless,
+    # so both entry points reach the same code. Only multi-node workers
+    # care.
+    launch_argv_prefix: Optional[list[str]] = None
     gpu_util: float
     capability: CapabilityConfig = Field(default_factory=CapabilityConfig)
     # Each entry is a bare directory name, resolved against the repo-root
@@ -354,7 +393,11 @@ class RecipeConfig(BaseModel):
 #   4 -- model_path_override and extra_mounts included. The former changes
 #        the literal --model argv; the latter changes what's visible in the
 #        container filesystem. Both decide what actually launches.
-_CONFIG_HASH_SCHEMA = 4
+#   5 -- launch_argv_prefix included. It selects the ENTRY POINT, which on
+#        a multi-node worker decides whether --headless is honoured at all
+#        (see the field's own comment and TOMBSTONES #140). Two recipes
+#        differing only in it launch genuinely different processes.
+_CONFIG_HASH_SCHEMA = 5
 
 
 def _canonicalize_vllm_args(raw: str):
@@ -458,6 +501,7 @@ def build_config_payload(recipe: RecipeConfig, topo_key: str) -> dict:
         "entrypoint": recipe.entrypoint,
         "model_path_override": recipe.model_path_override,
         "extra_mounts": sorted(recipe.extra_mounts),
+        "launch_argv_prefix": list(recipe.launch_argv_prefix) if recipe.launch_argv_prefix is not None else None,
         "gpu_util": recipe.gpu_util,
         "max_model_len": topo.max_model_len,
         "tp_size": topo.tp_size,
@@ -555,6 +599,10 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
         set, overriding hf_path for launch purposes only (hf_path remains
         the recipe's identity everywhere else). None vs. any string are
         different launches.
+      - launch_argv_prefix, ORDER-SIGNIFICANT (it is an argv). Selects the
+        entry point; on a multi-node worker that decides whether --headless
+        is honoured at all. None (the module path) and ["vllm","serve"] are
+        different launches and hash differently, which is correct.
       - extra_mounts, SORTED. Additional bind mounts change what's visible
         in the container filesystem, which some images' custom loading
         code depends on directly. Sorted rather than order-preserved like
@@ -764,6 +812,8 @@ def build_catalog_response() -> dict:
             # its catalog entry stays byte-identical to before this field.
             if recipe.gpu_util_ceiling_exempt:
                 model_entry["gpu_util_ceiling_exempt"] = True
+            if recipe.launch_argv_prefix is not None:
+                model_entry["launch_argv_prefix"] = list(recipe.launch_argv_prefix)
             if recipe.notes is not None:
                 model_entry["notes"] = recipe.notes
 

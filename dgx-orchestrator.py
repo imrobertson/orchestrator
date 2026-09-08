@@ -19,7 +19,7 @@ import datetime
 # is what actually answers "did my push/pull/restart take" now -- it's
 # derived, not typed, so it can't be forgotten the way this slug already
 # has been.
-ORCHESTRATOR_VERSION_SLUG = "2026-09-08-dryrun-hardening-gpu-ceiling-enforce"
+ORCHESTRATOR_VERSION_SLUG = "2026-09-08-launch-argv-prefix-headless-fix"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
@@ -3407,12 +3407,30 @@ def _teardown_host_container_internals(ip: str) -> None:
     safe in that case specifically, not load-bearing the way it is for a
     2-node Ray deploy.
     """
+    # Two patterns, because a recipe may launch by EITHER entry point and
+    # the process command line differs. `launch_argv_prefix` (schema 5)
+    # lets a recipe use `vllm serve`, whose argv contains no trace of the
+    # module path this used to match on exclusively -- so a GLM-style
+    # deploy would have silently skipped the graceful pass entirely and
+    # gone straight to `docker stop`/`docker rm -f`. That matters: the
+    # graceful pass is what protects an in-flight JIT compile from being
+    # left half-written.
+    #
+    # Both patterns are run for both roles unconditionally. A pkill that
+    # matches nothing is a no-op with a nonzero exit, which is already how
+    # this function treats every role that doesn't exist on a given host.
+    ENGINE_PATTERNS = (
+        "vllm.entrypoints.openai.api_server",   # module path (default prefix)
+        "vllm serve",                           # CLI (launch_argv_prefix)
+    )
     for role in (ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER):
         # Graceful pass.
-        run_ssh(ip, None, ["docker", "exec", role, "pkill", "-TERM", "-f", "vllm.entrypoints.openai.api_server"], timeout=10)
+        for pat in ENGINE_PATTERNS:
+            run_ssh(ip, None, ["docker", "exec", role, "pkill", "-TERM", "-f", pat], timeout=10)
         run_ssh(ip, None, ["docker", "exec", role, "ray", "stop"], timeout=TEARDOWN_GRACE_SEC + 5)
         # Escalation pass -- whatever's still alive gets forced.
-        run_ssh(ip, None, ["docker", "exec", role, "pkill", "-9", "-f", "vllm.entrypoints.openai.api_server"], timeout=10)
+        for pat in ENGINE_PATTERNS:
+            run_ssh(ip, None, ["docker", "exec", role, "pkill", "-9", "-f", pat], timeout=10)
         run_ssh(ip, None, ["docker", "exec", role, "ray", "stop", "--force"], timeout=15)
 
 def _teardown_host_containers(ip: str) -> None:
@@ -3911,6 +3929,39 @@ def _env_flag_collisions(env_flags: list) -> dict:
     }
 
 
+def _resolve_launch_argv(model_config: dict, model_effective: str) -> tuple:
+    """
+    Return (prefix, model_args) for a container's argv.
+
+    Default (no launch_argv_prefix) reproduces the historical form exactly:
+        (["python3","-m","vllm.entrypoints.openai.api_server"],
+         ["--model", <path>])
+
+    A recipe-supplied prefix containing the literal token "{model}" gets it
+    substituted with the resolved path, and model_args comes back EMPTY --
+    the model is positional, so emitting `--model` as well would pass it
+    twice.
+
+    The positional form exists because `vllm serve`'s own usage line is
+    `vllm serve [model_tag] [options]`. Whether that CLI also accepts
+    `--model` is not known here and deliberately not relied on: the
+    positional form is the one the image itself documents.
+
+    See RecipeConfig.launch_argv_prefix for why any of this is needed --
+    short version, `vllm serve` dispatches --headless to run_headless()
+    while the api_server module path ignores it and dies on a follower
+    node.
+    """
+    prefix = model_config.get("launch_argv_prefix")
+    if prefix is None:
+        return (["python3", "-m", "vllm.entrypoints.openai.api_server"],
+                ["--model", model_effective])
+    prefix = [model_effective if tok == "{model}" else tok for tok in prefix]
+    if model_effective in prefix:
+        return (prefix, [])
+    return (prefix, ["--model", model_effective])
+
+
 def _execute_deployment_impl(
 model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
     deploy_start_time = time.time()
@@ -4206,9 +4257,8 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
             if not ev.startswith("HF_HUB_OFFLINE=") and not ev.startswith("TRANSFORMERS_OFFLINE="):
                 env_flags.extend(["-e", ev])
 
-        container_args = [
-            "python3", "-m", "vllm.entrypoints.openai.api_server",
-            "--model", model_effective,
+        _prefix, _model_args = _resolve_launch_argv(model_config, model_effective)
+        container_args = _prefix + _model_args + [
             "--gpu-memory-utilization", str(gpu_util),
             "--max-model-len", str(max_model_len)
         ] + vllm_args_list
@@ -4274,18 +4324,16 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
                     env_flags.extend(["-e", ev])
 
             if use_ray:
-                container_args = [
-                    "python3", "-m", "vllm.entrypoints.openai.api_server",
-                    "--model", model_effective,
+                _prefix, _model_args = _resolve_launch_argv(model_config, model_effective)
+                container_args = _prefix + _model_args + [
                     "--tensor-parallel-size", str(tp_size),
                     "--pipeline-parallel-size", str(pp_size),
                     "--gpu-memory-utilization", str(gpu_util),
                     "--max-model-len", str(max_model_len)
                 ] + vllm_args_list
             else:
-                container_args = [
-                    "python3", "-m", "vllm.entrypoints.openai.api_server",
-                    "--model", model_effective,
+                _prefix, _model_args = _resolve_launch_argv(model_config, model_effective)
+                container_args = _prefix + _model_args + [
                     "--tensor-parallel-size", str(tp_size),
                     "--pipeline-parallel-size", str(pp_size),
                     "--nnodes", str(nodes),

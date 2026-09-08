@@ -81,6 +81,27 @@ image: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8
 # eugr/spark-vllm* and the nvcr default image (neither sets an
 # ENTRYPOINT). Quotes are required: bare `entrypoint:` parses as null.
 entrypoint: ""
+# Launch via the `vllm serve` CLI, NOT the api_server module path.
+#
+# Required for the 2-node worker, confirmed by reading this image's own
+# vllm/entrypoints/cli/serve.py: line 146 `run_headless(args)`, line 177
+# `def run_headless(...)`, and line 262 `assert not args.headless`. The
+# CLI branches on --headless into run_headless(), which starts workers
+# only. The path api_server.py runs is the one guarded by that assert --
+# reachable only with headless FALSE.
+#
+# Launched via the module path, the worker PARSED --headless (it appears
+# in the boot log's "non-default args") and then IGNORED it: it started
+# its own APIServer and EngineCore, which called collective_rpc on a node
+# that correctly knew it was a follower, and died with
+# "AssertionError: collective_rpc should not be called on follower node"
+# after ~9 minutes of weight loading. The head then hung indefinitely on
+# shm_broadcast with IB retry-exhausted errors against the dead peer.
+#
+# {model} is substituted with model_path_override below and suppresses the
+# separate --model flag -- `vllm serve`'s usage line is
+# `vllm serve [model_tag] [options]`, so the model is positional.
+launch_argv_prefix: ["vllm", "serve", "{model}"]
 # Glm5NextProcessor.from_pretrained() (this image's custom GLM5-Next
 # processor code) does a bare `open(os.path.join(model_path,
 # "processor_config.json"))` -- no hub resolution, no cached_file(), just a
@@ -114,25 +135,6 @@ model_path_override: /models/GLM-5.3-Flash-NVFP4
 extra_mounts:
 - /var/tmp/glm-5.3-flash-nvfp4:/models/GLM-5.3-Flash-NVFP4
 gpu_util: 0.85
-# Permits this recipe's gpu_util above cluster_config.yaml's
-# gpu_util_ceiling (0.75 as of 2026-09-08). Not a workaround: this value is
-# the validated one for this recipe, and the ceiling is deliberately kept
-# conservative for the catalog as a whole rather than raised to match its
-# highest member.
-#
-# Effect depends on cluster_config.yaml's gpu_util_ceiling_enforce:
-#   off   -- the default today; nothing is enforced, this is documentation
-#   warn  -- suppresses the warning this recipe would otherwise emit
-#   error -- required, or the deploy is refused
-#
-# An exempt recipe emits a one-line INFORMATIONAL note on every deploy,
-# never a warning: it would fire every single time, and a warning that
-# always fires is a warning nobody reads (errata.yaml linter rule 3).
-#
-# Deliberately NOT part of compute_config_hash() -- it gates whether a
-# deploy proceeds, never what the container runs, so adding it does not
-# orphan this recipe's launch history.
-gpu_util_ceiling_exempt: true
 notes: |
   LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt token corruption (vLLM #54150) — use RedHatAI/GLM-5.3-Flash-NVFP4 instead.
   KV pool ~507K at fp8 + gmu 0.85 with MTP active; two concurrent 512K requests exceeds budget — max 1 full-length at a time.
