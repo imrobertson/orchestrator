@@ -50,6 +50,25 @@ recipe_version: '1'
 hf_path: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
 image: hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d
 gpu_util: 0.80
+# Permits this recipe's gpu_util above cluster_config.yaml's
+# gpu_util_ceiling (0.75 as of 2026-09-08). Not a workaround: this value is
+# the validated one for this recipe, and the ceiling is deliberately kept
+# conservative for the catalog as a whole rather than raised to match its
+# highest member.
+#
+# Effect depends on cluster_config.yaml's gpu_util_ceiling_enforce:
+#   off   -- the default today; nothing is enforced, this is documentation
+#   warn  -- suppresses the warning this recipe would otherwise emit
+#   error -- required, or the deploy is refused
+#
+# An exempt recipe emits a one-line INFORMATIONAL note on every deploy,
+# never a warning: it would fire every single time, and a warning that
+# always fires is a warning nobody reads (errata.yaml linter rule 3).
+#
+# Deliberately NOT part of compute_config_hash() -- it gates whether a
+# deploy proceeds, never what the container runs, so adding it does not
+# orphan this recipe's launch history.
+gpu_util_ceiling_exempt: true
 capability:
   task: null
   context_class: null

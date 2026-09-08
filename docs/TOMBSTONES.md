@@ -73,6 +73,173 @@ they share a root cause (an image that doesn't follow this cluster's
 conventions) and separating them would imply three unrelated bugs.
 -->
 
+<!--
+Reconciliation note (2026-09-08, second session): #138-#139 added.
+Numbering 27-139 confirmed contiguous. Both entries are first-hand -- the
+work is in the same session's transcript -- so neither carries the
+retrospective caveat #132 needed. Note #138 closes #86, open since Task MC.
+-->
+
+### 139. `gpu_util_ceiling` was a required config field that nothing read, for as long as it existed
+
+**Trap:** `cluster_config.yaml` has declared `gpu_util_ceiling: 0.75` since
+the config extraction. `ClusterConfig` types it as a required `float`, so a
+file omitting it fails validation and the daemon will not start. Then
+nothing reads it. `grep -rn gpu_util_ceiling` across `dgx-orchestrator.py`
+and `common/recipes.py` returns nothing; the only hit in the repo is the
+declaration itself and this line in `common/config.py`'s module docstring:
+
+> Nothing in this module enforces gpu_util_ceiling; it is carried as data
+> only, per the task's constraints.
+
+So it was never an oversight -- it was a deliberate scoping decision, the
+extraction task having been bounded to *move literals into
+`cluster_config.yaml` without changing behaviour*. The docstring is honest.
+The problem is where that honesty lives: in a Python module, while the
+field presents itself in a YAML file that reads like cluster policy. A
+field that is mandatory, validated, named like a safety limit, and inert is
+the worst available combination, because the failure mode is silent
+misplaced confidence. Someone eventually sets it expecting it to bind.
+
+Surfaced while reviewing a `--dry-run` for `_glm-5.3-flash-nvfp4-tp2`,
+which requests `gpu_util: 0.85` against the declared 0.75 and deploys
+without comment.
+
+**Fix:** the ceiling can now bind, gated on a new
+`gpu_util_ceiling_enforce: off|warn|error` in `cluster_config.yaml`, with
+`gpu_util_ceiling_exempt: bool` on the recipe.
+
+**Defaults to `off`, which is byte-identical to the prior behaviour.**
+Shipping an enforcing guard and auditing the catalog afterwards is how a
+working catalog breaks on upgrade. Ship inert, audit, then turn it up. The
+default is a migration stance, not an opinion that the ceiling should not
+bind.
+
+**Never clamps, in any mode.** Permits, warns, or refuses -- never silently
+serves a different number than the recipe asked for. Clamping GLM's 0.85 to
+0.75 would produce a deploy that is neither the recipe nor an error, which
+is how an unexplained performance regression appears six weeks later with
+nothing in the logs. `verify_gpu_ceiling.py` asserts this across all eight
+combinations of value, mode, and exemption; it is the property most worth
+protecting here.
+
+**Named `exempt`, not `force`.** In this repo `force` means "override a
+guard for exactly one request, held nowhere" -- `--force`, the dashboard
+confirm dialog, the menu y/N -- and that non-persistence is the entire
+point (#131). A durable YAML field reusing the verb would muddy a
+vocabulary that has stayed consistent. This is closer to `reserved:`: a
+standing property, reviewed when the file is reviewed.
+
+**An exempt recipe emits an informational note, never a warning.** It fires
+on every deploy of that recipe forever, and a warning that always fires is
+a warning nobody reads (`errata.yaml` linter rule 3). Same visibility,
+different volume, so the eye learns which one matters.
+
+**Not in `config_hash`, and the exclusion is dated rather than inherited:**
+verified 2026-09-08 by tracing that the value cannot reach `docker run`,
+the entrypoint, or anything else changing what the container executes -- it
+gates only *whether* a deploy proceeds. Two recipes differing only in it
+launch byte-identical containers whenever both are permitted. The trace is
+stated and not just its conclusion, because "inert metadata, safe to
+exclude" is exactly the premise that went stale for `mods` (which turned
+out to substitute the image via `_resolve_host_image_tag()`) and is still
+open for `capability` (WORKSTREAMS K4 Q2). This also avoids a third
+orphaning of launch history in three days.
+
+A config-read failure degrades to `off`, never to refusing. A malformed
+`cluster_config.yaml` must not be able to block every deploy on the cluster
+-- #41's fails-closed lesson applied to a different surface.
+
+**Catalog audit, 2026-09-08.** Four recipes over the ceiling:
+
+```
+_glm-5_3-flash-nvfp4-tp2             0.85
+_deepseek-v4-flash-vision-exp        0.80
+deepseek-v4-flash-0731-dspark        0.80
+deepseek-v4-flash-0731-dspark-512k   0.80
+```
+
+All four exempted; ceiling stays 0.75; enforce stays `off`. Worth recording
+why that combination rather than raising the ceiling to 0.80: **the ceiling
+is not being violated by carelessness.**
+`deepseek-v4-flash-0731-dspark` is the validated production recipe (44.7
+tok/s cold, 42.7 warm, real hardware) and 0.80 is its measured-good value.
+Raising the ceiling to 0.80 would make it describe what the cluster already
+does, at the cost of the signal -- and the 0.80 evidence is narrow, one
+model family on one image, not a general claim that 0.80 is safe for every
+model. Keeping 0.75 and marking four exceptions asserts less.
+
+**Deliberately not an `errata.yaml` rule.** That file catalogs things that
+break; every rule traces to a failure. This is config drift from a declared
+policy. It does not clear `mechanism_confirmed` either, since rule 6
+requires an observed *consequence* and the consequence here is a deploy
+refusal, which is designed behaviour. See WS-3.
+
+---
+
+### 138. `--dry-run` printed live credentials for months, and the fix for it is the one place a redaction test can lie to you
+
+**Trap:** `docker_run_commands` in a `--dry-run` response is the literal
+argv `docker run` would receive, including `-e HF_TOKEN=<real token>`
+whenever `get_hf_token()` finds one. `--dry-run` reads as "nothing real
+happens", which is exactly what makes its output feel safe to paste into a
+bug report or a chat.
+
+Recorded as #86 during Task MC's verification, when a dry-run response
+containing a real token was pasted into a conversation while confirming the
+output looked correct. **No fix was applied at the time**, and the standing
+workaround was for the operator to trim the token by hand on every paste --
+which worked, because they remembered every time, which is not a property
+anyone should have to supply.
+
+**Fix:** `_mask_secret_argv()` replaces credential *values* before an argv
+enters any response dict.
+
+Two deliberate choices, both of which look like omissions:
+
+- **The variable NAME is preserved.** Masking it too would hide which
+  credentials a deploy expects, and that is a thing people read dry-run
+  output to check.
+- **An EMPTY value is left visible.** `HF_TOKEN=` stays `HF_TOKEN=`. There
+  is nothing to hide, and it is real diagnostic signal -- it says
+  `.secrets` was not picked up, which is otherwise invisible. This
+  distinction earned itself immediately: a manually-redacted paste during
+  the GLM work showed `HF_TOKEN=` and was briefly read as the daemon
+  failing to find the token, when it was the operator's own redaction. An
+  automatic mask that produced the same string for both cases would have
+  made that ambiguity permanent.
+
+**The part worth reading twice, from #94.** A redaction test **must assert
+the secret string is absent, never that a marker appeared.** #94 redacted
+`authorization: <value>` with `\S+`, which absorbed the word `Bearer` and
+wrote the actual credential immediately after a `***REDACTED***` marker --
+output that looks *more* redacted than an untouched line. A
+marker-presence assertion passes on that. An absence assertion cannot.
+`verify_secret_masking.py` section 6 reconstructs that exact bug shape and
+demonstrates both: the marker test passes on it, the absence test fails.
+That section exists to prove the harness is measuring the right thing, not
+to test the code.
+
+**Two smaller things landed in the same pass, both from operator friction
+rather than from a defect:**
+
+`orchestrator_version` is now the first field after `status` in a dry-run
+response. A dry-run is read to decide whether to commit to a real deploy,
+and the first question is "is this the code I think it is" -- and a dry-run
+produced by a stale daemon looks identical to one produced by a current
+one. Per WS-7, this hashes `dgx-orchestrator.py` only, so it answers "which
+orchestrator", not "which entire codebase".
+
+Duplicate `-e` detection. The orchestrator injects a fixed set of env vars
+and then appends the recipe's `env_vars` verbatim, so a recipe naming a
+variable the orchestrator already sets produces two `-e NAME=` flags and
+docker silently takes the last. Same-value duplicates go in the dry-run
+response only -- every 2-node recipe in the catalog has four right now,
+which is K7's premise made visible -- while **different**-value duplicates
+print on real deploys too, naming both values. That second case is the
+recipe overriding a cluster-derived value with nothing else in the system
+reporting it, and it is what K7 exists to prevent.
+
 ### 137. The benchmark checkbox stayed editable for the entire model-boot window, long after its value had already been sent
 
 **Trap:** `updateBenchmarkControl(clusterReady)` rendered the "Auto-run

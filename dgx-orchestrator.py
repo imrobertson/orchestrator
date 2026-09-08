@@ -19,7 +19,7 @@ import datetime
 # is what actually answers "did my push/pull/restart take" now -- it's
 # derived, not typed, so it can't be forgotten the way this slug already
 # has been.
-ORCHESTRATOR_VERSION_SLUG = "2026-09-07-recipe-image-escape-hatches-serving-host"
+ORCHESTRATOR_VERSION_SLUG = "2026-09-08-dryrun-hardening-gpu-ceiling-enforce"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
@@ -3823,9 +3823,99 @@ def _resolve_host_image_tag(host: str, ip: str, base_image: str, mod_names: list
     return ensure_mods_baked(host, ip, base_image, mod_names)
 
 
-def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
+_SECRET_ENV_NAME_RE = re.compile(
+    r"^[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|_KEY|^KEY)[A-Z0-9_]*$"
+)
+
+
+def _mask_secret_argv(argv: list) -> list:
+    """
+    Return a copy of a `docker run` argv with credential VALUES replaced.
+
+    Applied wherever an argv is about to enter a response dict -- today
+    that is `--dry-run`'s docker_run_commands, the only surface that
+    reaches an operator. Real deploys pass the unmasked list to run_ssh.
+
+    #86: `--dry-run` reads as "nothing real happens", which makes its
+    output feel safe to paste. It embeds `-e HF_TOKEN=<real token>`
+    whenever get_hf_token() finds one, and a live credential reached a
+    conversation that way once already.
+
+    Two deliberate choices:
+
+    - An EMPTY value is left alone (`HF_TOKEN=` stays `HF_TOKEN=`). There
+      is nothing to hide, and seeing it empty is real diagnostic signal --
+      it says .secrets was not picked up, which is otherwise invisible.
+    - The variable NAME is preserved. Masking the name too would hide
+      which credentials a deploy expects, which is exactly what someone
+      reading dry-run output is checking.
+
+    #94 is the cautionary precedent for how to test this: a redaction test
+    must assert THE SECRET STRING IS ABSENT, never that a marker appeared.
+    Redacting `authorization: <value>` with `\\S+` once absorbed the word
+    `Bearer` and emitted the real credential immediately after the marker
+    -- output that looked more redacted than an untouched line, and a
+    marker-presence assertion passed on it.
+    """
+    out = []
+    for arg in argv:
+        name, sep, value = str(arg).partition("=")
+        if sep and value and _SECRET_ENV_NAME_RE.match(name.upper()):
+            out.append(f"{name}=***MASKED***")
+        else:
+            out.append(arg)
+    return out
+
+
+def _env_flag_collisions(env_flags: list) -> dict:
+    """
+    Find env vars set more than once in a single `docker run` argv.
+
+    The orchestrator injects a fixed set (NCCL/GLOO interface names, cache
+    dirs, offline switches) and then appends the recipe's own `env_vars`
+    verbatim, so a recipe naming a variable the orchestrator already sets
+    produces two `-e NAME=...` flags. Docker takes the LAST occurrence, so
+    the recipe silently wins.
+
+    Returns {name: {"values": [...], "conflicting": bool}} for duplicated
+    names only. `conflicting` distinguishes the two cases, which are not
+    equally serious:
+
+      - same value twice: harmless today, but noise in an argv an operator
+        is reading to verify a deploy, and a sign the recipe is carrying
+        something cluster_config.yaml already derives (WS-8/K7's premise
+        -- every 2-node recipe hardcodes NCCL_SOCKET_IFNAME while
+        cluster_config.yaml also declares network.interface).
+      - different values: the orchestrator's derived value is being
+        overridden by the recipe with no indication anywhere. That is the
+        failure K7 exists to prevent, and it would be invisible without
+        this check.
+    """
+    seen: dict = {}
+    order: list = []
+    i = 0
+    while i < len(env_flags) - 1:
+        if env_flags[i] == "-e":
+            name, _, value = str(env_flags[i + 1]).partition("=")
+            if name not in seen:
+                seen[name] = []
+                order.append(name)
+            seen[name].append(value)
+            i += 2
+        else:
+            i += 1
+    return {
+        name: {"values": seen[name], "conflicting": len(set(seen[name])) > 1}
+        for name in order
+        if len(seen[name]) > 1
+    }
+
+
+def _execute_deployment_impl(
+model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
     deploy_start_time = time.time()
     docker_run_commands: dict = {}
+    env_collisions: dict = {}
     # Populated only for hosts whose mod set is non-empty (see
     # _resolve_host_image_tag() / Task MC) -- stays {} for every existing
     # recipe (mods: [] everywhere), so it is only added to the dry_run
@@ -3866,6 +3956,92 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
     if not dry_run:
         _record_hf_path(model, hf_path)
     gpu_util = model_config.get("gpu_util", 0.75)
+
+    # gpu_util vs cluster_config.yaml's gpu_util_ceiling.
+    #
+    # HISTORY, because the default here looks wrong without it: until
+    # 2026-09-08 nothing anywhere enforced this ceiling. common/config.py
+    # said so in its own module docstring -- carried as data only, a
+    # deliberate scoping decision from the config extraction, not an
+    # oversight. ClusterConfig required the field, so it had to be present
+    # and well-formed, and then no code read it. Honest in the source,
+    # invisible from the YAML, which is the worst combination for
+    # something that reads like a safety limit.
+    #
+    # `gpu_util_ceiling_enforce` therefore DEFAULTS TO "off", which is
+    # byte-identical to that prior behaviour. Shipping an enforcing guard
+    # and auditing the catalog afterwards is how a working catalog breaks
+    # on upgrade; audit first (`grep -H "^gpu_util:" recipes/local/*.yaml`),
+    # then flip to warn, then to error. The default being "off" is a
+    # migration stance, not an opinion that the ceiling shouldn't bind.
+    #
+    # The four cases:
+    #
+    #   within ceiling                  -> proceed, silent
+    #   over, not exempt, enforce=off   -> informational note (today)
+    #   over, not exempt, enforce=warn  -> warning, proceeds
+    #   over, not exempt, enforce=error -> REFUSE
+    #   over, exempt                    -> proceed, one-line note, always
+    #
+    # NEVER CLAMPS, in any mode. Clamping would silently change what a
+    # validated recipe launches -- _glm-5.3-flash-nvfp4-tp2 asks 0.85
+    # because that is where upstream measured its published numbers, and
+    # quietly serving it 0.75 produces a deploy that is neither the recipe
+    # nor an error. That is how an unexplained performance regression
+    # shows up six weeks later with nothing in the logs.
+    #
+    # Severity is split deliberately. An exempt recipe emits a note on
+    # every deploy forever -- GLM will -- so it must not be a WARNING, or
+    # it becomes errata rule 3's "a warning that always fires is a warning
+    # nobody reads" and trains the eye past the unexempt case that
+    # actually matters. Same visibility, different volume.
+    gpu_util_ceiling_note = None
+    try:
+        _cfg = load_cluster_config()
+        _ceiling = _cfg.gpu_util_ceiling
+        _mode = getattr(_cfg, "gpu_util_ceiling_enforce", "off")
+    except Exception:
+        _ceiling, _mode = None, "off"
+
+    _exempt = bool(model_config.get("gpu_util_ceiling_exempt", False))
+
+    if _ceiling is not None and gpu_util > _ceiling:
+        _over = f"gpu_util {gpu_util} exceeds cluster_config.yaml's gpu_util_ceiling {_ceiling}"
+        if _exempt:
+            gpu_util_ceiling_note = (
+                f"'{model}' runs at {gpu_util}, above the cluster ceiling {_ceiling}. "
+                f"Permitted by gpu_util_ceiling_exempt: true in the recipe."
+            )
+            print(f"[i] {gpu_util_ceiling_note}")
+        elif _mode == "error":
+            return {
+                "status": "error",
+                "code": "gpu_util_ceiling",
+                "model": model,
+                "gpu_util": gpu_util,
+                "ceiling": _ceiling,
+                "message": (
+                    f"Refusing to deploy '{model}': {_over}, and the recipe does not "
+                    f"set gpu_util_ceiling_exempt: true. Either add that field to the "
+                    f"recipe (if the higher value is validated and intended), lower the "
+                    f"recipe's gpu_util, or raise the ceiling in cluster_config.yaml. "
+                    f"Set gpu_util_ceiling_enforce: warn to downgrade this to a warning."
+                ),
+            }
+        elif _mode == "warn":
+            gpu_util_ceiling_note = (
+                f"'{model}' requests {_over}, and does not set "
+                f"gpu_util_ceiling_exempt: true. Proceeding because "
+                f"gpu_util_ceiling_enforce is 'warn' -- this would REFUSE under 'error'."
+            )
+            print(f"[!] {gpu_util_ceiling_note}")
+        else:
+            gpu_util_ceiling_note = (
+                f"'{model}' requests {_over}. gpu_util_ceiling_enforce is 'off', so the "
+                f"CEILING is what gets ignored here, not the recipe's request -- "
+                f"{gpu_util} is what will be used."
+            )
+            print(f"[i] {gpu_util_ceiling_note}")
     max_model_len = topo_config.get("max_model_len", 32768)
     tp_size = topo_config.get("tp_size", 1)
     pp_size = topo_config.get("pp_size", nodes)
@@ -4058,7 +4234,8 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         ] + jit_mounts + extra_mount_flags + env_flags + entrypoint_flag + [host_image_tag] + container_args
 
         res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
-        if dry_run: docker_run_commands[head] = docker_cmd
+        env_collisions[head] = _env_flag_collisions(env_flags)
+        if dry_run: docker_run_commands[head] = _mask_secret_argv(docker_cmd)
         elif res.returncode != 0: return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
     else:
         vllm_head_args = None
@@ -4159,7 +4336,8 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             ] + jit_mounts + extra_mount_flags + env_flags + entrypoint_flag + [host_image_tag] + entrypoint_cmd
 
             res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
-            if dry_run: docker_run_commands[host] = docker_cmd
+            env_collisions[host] = _env_flag_collisions(env_flags)
+            if dry_run: docker_run_commands[host] = _mask_secret_argv(docker_cmd)
             elif res.returncode != 0: return {"status": "error", "message": f"Docker run failed on {host}: {res.stderr}"}
 
         if use_ray and vllm_head_args and not dry_run:
@@ -4177,9 +4355,36 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
             vllm_exec_cmd = ["docker", "exec", "-d", ContainerRole.HEAD, "bash", "-c", f"{exec_str} > /proc/1/fd/1 2>&1"]
             run_ssh(head_ip, None, vllm_exec_cmd, timeout=30)
 
+    # A CONFLICTING duplicate is worth saying out loud on a real deploy,
+    # not only in a dry-run someone may never run: it means the recipe
+    # overrode a value the orchestrator derived from cluster_config.yaml,
+    # docker silently took the recipe's, and nothing else anywhere reports
+    # it. Same-value duplicates are deliberately NOT printed here -- they
+    # are noise on every 2-node deploy in the catalog today (K7), and a
+    # warning that always fires is a warning nobody reads.
+    for _h, _cols in env_collisions.items():
+        for _name, _info in _cols.items():
+            if _info["conflicting"]:
+                print(f"[!] {_h}: {_name} is set more than once with DIFFERENT values "
+                      f"{_info['values']} - docker uses the last, so the recipe's "
+                      f"env_vars override the orchestrator-derived value.")
+
     if dry_run:
         dry_run_result = {
             "status": "dry_run",
+            # First field after status deliberately: a dry-run is read to
+            # decide whether to commit to a real deploy, and the very
+            # first question is "is this the code I think it is". Having
+            # to open the dashboard badge or curl /api/status to answer
+            # that is friction at exactly the wrong moment -- and a
+            # dry-run produced by a stale daemon looks identical to one
+            # produced by a current one.
+            #
+            # Same string the dashboard badge shows. Note the caveat from
+            # WS-7: this hashes dgx-orchestrator.py only, so a change
+            # confined to common/*.py will not move it. It answers "which
+            # orchestrator", not "which entire codebase".
+            "orchestrator_version": ORCHESTRATOR_VERSION,
             "message": f"Dry-run for {model} across {nodes} node(s) - no SSH connections made, nothing executed.",
             "targets": target_hosts,
             "head": head,
@@ -4195,6 +4400,15 @@ def _execute_deployment_impl(model: str, nodes: int, head: str, user_id: str, wa
         # Task MC's dry-run requirement.
         if mods_report:
             dry_run_result["mods"] = mods_report
+        # Same "absent unless there is something to say" discipline: a
+        # recipe that sets no variable the orchestrator already injects
+        # produces no key at all.
+        reportable = {h: c for h, c in env_collisions.items() if c}
+        if reportable:
+            dry_run_result["env_var_collisions"] = reportable
+        # Absent unless the recipe actually exceeds the declared ceiling.
+        if gpu_util_ceiling_note:
+            dry_run_result["gpu_util_ceiling_warning"] = gpu_util_ceiling_note
         return dry_run_result
 
     time.sleep(4)

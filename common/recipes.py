@@ -261,6 +261,33 @@ class RecipeConfig(BaseModel):
     # each other the way mods do, so reordering them changes nothing about
     # what launches.
     extra_mounts: list[str] = Field(default_factory=list)
+    # Permission to exceed cluster_config.yaml's gpu_util_ceiling.
+    #
+    # Named `exempt` rather than `force` deliberately. In this repo `force`
+    # means "override a guard for exactly one request, held nowhere" --
+    # `--force`, the dashboard confirm dialog, the menu's y/N. All three
+    # cannot outlive the request that set them, and that property is the
+    # whole point (TOMBSTONES #131). A durable YAML field using the same
+    # verb would muddy a vocabulary that has otherwise stayed consistent.
+    # This is closer to `reserved:` -- a standing property of the thing,
+    # reviewed when the file is reviewed.
+    #
+    # DELIBERATELY EXCLUDED FROM compute_config_hash(), and this exclusion
+    # is dated rather than inherited: verified 2026-09-08 by tracing that
+    # this value cannot reach `docker run`, the entrypoint, or anything
+    # else that changes what the container executes. It gates only WHETHER
+    # a deploy proceeds. Two recipes differing only in this field launch
+    # byte-identical containers whenever both are permitted, so hashing it
+    # would orphan every recorded launch for no behavioural difference --
+    # the third such orphaning in three days if it were included.
+    #
+    # State the check, not just the conclusion, because "inert metadata,
+    # safe to exclude" is exactly the premise that went stale for `mods`
+    # (which turned out to reach _resolve_host_image_tag() and substitute
+    # the image) and is still open for `capability` (WORKSTREAMS K4 Q2).
+    # If this field ever gains a second meaning, re-run that trace before
+    # trusting this comment.
+    gpu_util_ceiling_exempt: bool = False
     gpu_util: float
     capability: CapabilityConfig = Field(default_factory=CapabilityConfig)
     # Each entry is a bare directory name, resolved against the repo-root
@@ -534,6 +561,18 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
         mods: bind mounts don't overwrite each other, so reordering them
         doesn't change what launches.
 
+    DELIBERATELY EXCLUDED, with the reasoning dated so it is not inherited
+    as an assumption the way the `mods` exclusion was:
+
+      - gpu_util_ceiling_exempt (verified 2026-09-08) -- gates whether a
+        deploy proceeds, never what the container runs. Two recipes
+        differing only in it launch byte-identical containers whenever
+        both are permitted. Hashing it would orphan every recorded launch
+        for no behavioural difference.
+      - capability -- excluded on the same premise, NOT re-verified. See
+        WORKSTREAMS K4 Q2; that one is still an open question, not a
+        settled exclusion.
+
     Deliberately EXCLUDED:
       - capability -- authoring metadata, still never reaches the container.
         Verify that remains true before trusting it; the same assumption
@@ -720,6 +759,11 @@ def build_catalog_response() -> dict:
                 model_entry["model_path_override"] = recipe.model_path_override
             if recipe.extra_mounts:
                 model_entry["extra_mounts"] = list(recipe.extra_mounts)
+            # Truthy-guarded like extra_mounts: False is the default, so a
+            # recipe that doesn't claim the exemption produces no key and
+            # its catalog entry stays byte-identical to before this field.
+            if recipe.gpu_util_ceiling_exempt:
+                model_entry["gpu_util_ceiling_exempt"] = True
             if recipe.notes is not None:
                 model_entry["notes"] = recipe.notes
 

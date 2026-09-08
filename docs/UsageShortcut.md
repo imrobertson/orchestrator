@@ -62,7 +62,19 @@ Not sure a model/topology combo is valid, or want to sanity-check what will actu
 
 dgx-config deploy --model MODEL --nodes N --dry-run
 
+'''Dry-run output is now safe to paste.''' Credential values are masked before they reach the response (`HF_TOKEN=***MASKED***`), so you no longer have to trim it by hand. The variable '''name''' is kept so you can still see which credentials a deploy expects, and an '''empty''' value is left as-is — `HF_TOKEN=` means the token genuinely wasn't found, which is worth seeing. The response also leads with `orchestrator_version`, so you can confirm the daemon is running the code you think it is without checking the badge separately. See `docs/TOMBSTONES.md` #138.
+
 Note that `--dry-run` is '''not''' exempt from the reserved-host check. It reports what a real deploy would do, so it reports the refusal a real deploy would hit rather than printing a command that would in fact be blocked.
+
+=== GPU utilisation ceiling ===
+
+`cluster_config.yaml` declares `gpu_util_ceiling` (0.75) and `gpu_util_ceiling_enforce`. '''Enforcement is currently `off`''', which is exactly how this behaved before 2026-09-08 — the ceiling was declared, required, and read by nothing at all. Leaving it off is deliberate; the machinery exists so that turning it on can be a decision.
+
+Four recipes sit above the ceiling and carry `gpu_util_ceiling_exempt: true`: `_glm-5_3-flash-nvfp4-tp2` (0.85) and the three DeepSeek-V4-Flash recipes (0.80). Those are validated values, not oversights — the ceiling is held at a conservative 0.75 for the catalog as a whole rather than raised to match its highest member.
+
+Deploying one of those prints a one-line '''informational''' note every time. That is intentional and not a warning: it fires on every deploy of those recipes forever, and a warning that always fires is a warning nobody reads. A recipe over the ceiling '''without''' the exemption is the case worth noticing, and it warns or refuses depending on `gpu_util_ceiling_enforce`.
+
+'''Nothing ever clamps.''' A recipe asking for more than the ceiling is either permitted or refused — it is never quietly served a different number than it asked for. See `docs/TOMBSTONES.md` #139.
 
 '''Some recipes need more than `hf_path`/`image`/`vllm_args` to launch correctly.''' Two escape hatches exist in the recipe schema for images that don't fit the usual conventions:
 * `entrypoint:` — set to `""` (with the quotes) if the recipe's `notes` or header comments say the image needs its ENTRYPOINT neutralized. This is required for any image built on the official `vllm/vllm-openai` base, which sets `ENTRYPOINT ["vllm","serve"]` — without it, the orchestrator's own argv gets silently appended to that instead of replacing it, and the failure looks unrelated to entrypoints at all (see `docs/TOMBSTONES.md` #133).

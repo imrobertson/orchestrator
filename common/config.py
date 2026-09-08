@@ -5,8 +5,18 @@ This module is the single source of truth for cluster host inventory,
 replacing the hardcoded HOSTS dicts previously duplicated across
 dgx-orchestrator.py, cache_cluster_assets.py, and benchmark.py.
 
-Nothing in this module enforces gpu_util_ceiling; it is carried as data
-only, per the task's constraints.
+gpu_util_ceiling is enforced as of 2026-09-08, gated on
+gpu_util_ceiling_enforce (off|warn|error, default "off"). Before that date
+it was carried as data only, per the original task's constraints -- the
+field was required and validated and then never read by anything, which is
+why the enforce switch defaults to "off": that value reproduces the prior
+behaviour exactly, so adding this changes nothing until it is deliberately
+turned up.
+
+Enforcement itself lives in dgx-orchestrator.py's deploy path, not here;
+this module supplies the mode. It never clamps in any mode -- a recipe
+asking for more than the ceiling is either permitted (and says so) or
+refused, never silently served a different number than it asked for.
 """
 
 from __future__ import annotations
@@ -92,6 +102,28 @@ class ClusterConfig(BaseModel):
     ssh_key_name: str
     default_image: str
     gpu_util_ceiling: float
+
+    # How gpu_util_ceiling is applied to a recipe that exceeds it.
+    #
+    #   "off"   -- informational note only; the recipe's value is used.
+    #              THE DEFAULT, because it is byte-identical to this
+    #              field's behaviour before 2026-09-08, when nothing read
+    #              gpu_util_ceiling at all. Ship inert, audit the catalog,
+    #              then turn it up.
+    #   "warn"  -- warning printed, deploy proceeds.
+    #   "error" -- deploy refused unless the recipe sets
+    #              gpu_util_ceiling_exempt: true.
+    #
+    # A recipe with gpu_util_ceiling_exempt: true proceeds under every
+    # mode and emits a one-line informational note each time. That note is
+    # deliberately NOT a warning: an exempt recipe emits it on every
+    # deploy forever, and a warning that always fires is a warning nobody
+    # reads (errata.yaml linter rule 3).
+    #
+    # Validated below rather than with a pydantic Literal, to keep this
+    # module agnostic about pydantic v1 vs v2 and to keep the error text
+    # in the existing "name the file and the specific problem" style.
+    gpu_util_ceiling_enforce: str = "off"
     ports: dict[str, int]
     container_names: dict[str, str]
     hosts: dict[str, HostConfig]
@@ -175,6 +207,16 @@ def load_cluster_config(path: Optional[Path] = None) -> ClusterConfig:
     # this module stays agnostic about pydantic v1 vs v2 validator APIs,
     # and so the error text keeps the existing "name the file and the
     # specific problem" convention.
+    valid_modes = ("off", "warn", "error")
+    if cfg.gpu_util_ceiling_enforce not in valid_modes:
+        raise ValueError(
+            f"Cluster config file {config_path}: "
+            f"gpu_util_ceiling_enforce must be one of {valid_modes}, got "
+            f"{cfg.gpu_util_ceiling_enforce!r}. Omit it entirely for the "
+            f"default 'off', which matches the behaviour before this field "
+            f"existed."
+        )
+
     target = cfg.default_deploy_target
     if target is not None:
         active = {name for name, host in cfg.hosts.items() if host.active}

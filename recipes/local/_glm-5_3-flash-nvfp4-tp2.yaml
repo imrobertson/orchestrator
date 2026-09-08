@@ -114,6 +114,25 @@ model_path_override: /models/GLM-5.3-Flash-NVFP4
 extra_mounts:
 - /var/tmp/glm-5.3-flash-nvfp4:/models/GLM-5.3-Flash-NVFP4
 gpu_util: 0.85
+# Permits this recipe's gpu_util above cluster_config.yaml's
+# gpu_util_ceiling (0.75 as of 2026-09-08). Not a workaround: this value is
+# the validated one for this recipe, and the ceiling is deliberately kept
+# conservative for the catalog as a whole rather than raised to match its
+# highest member.
+#
+# Effect depends on cluster_config.yaml's gpu_util_ceiling_enforce:
+#   off   -- the default today; nothing is enforced, this is documentation
+#   warn  -- suppresses the warning this recipe would otherwise emit
+#   error -- required, or the deploy is refused
+#
+# An exempt recipe emits a one-line INFORMATIONAL note on every deploy,
+# never a warning: it would fire every single time, and a warning that
+# always fires is a warning nobody reads (errata.yaml linter rule 3).
+#
+# Deliberately NOT part of compute_config_hash() -- it gates whether a
+# deploy proceeds, never what the container runs, so adding it does not
+# orphan this recipe's launch history.
+gpu_util_ceiling_exempt: true
 notes: |
   LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt token corruption (vLLM #54150) — use RedHatAI/GLM-5.3-Flash-NVFP4 instead.
   KV pool ~507K at fp8 + gmu 0.85 with MTP active; two concurrent 512K requests exceeds budget — max 1 full-length at a time.
