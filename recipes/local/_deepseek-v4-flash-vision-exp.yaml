@@ -48,7 +48,8 @@ recipe_version: '1'
 #      our proven text dspark recipe) should fit; drop max_model_len if OOM.
 # ============================================================================
 hf_path: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
-image: hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d
+# image: hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d
+image: ghcr.io/anemll/dspark-vllm-gx10:0.1.1
 gpu_util: 0.80
 # Permits this recipe's gpu_util above cluster_config.yaml's
 # gpu_util_ceiling (0.75 as of 2026-09-08). Not a workaround: this value is
