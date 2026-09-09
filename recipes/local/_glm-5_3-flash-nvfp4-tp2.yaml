@@ -249,7 +249,7 @@ topologies:
     # boot -- see the MAX CONTEXT NOTE in the header for the engine's own
     # refusal message and the memory accounting. Raise this only after
     # testing --kv-cache-memory, and re-benchmark if you do.
-    max_model_len: 98304
+    max_model_len: 262144
     tp_size: 2
     pp_size: 1
     env_vars:
