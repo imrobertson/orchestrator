@@ -88,6 +88,95 @@ then observed in a boot log, which is the ordering this file has been
 asking for.
 -->
 
+<!--
+Reconciliation note (2026-09-09): #142-#143 added, 27-143 contiguous.
+#142 is a config trap with a one-line cause and a symptom that names
+nothing. #143 is a process finding rather than a defect, filed here
+because both instances were real measurements and the near-miss is the
+record worth keeping.
+-->
+
+### 143. Two numbers were nearly written into recipe headers as findings, and neither survived a repeat
+
+**Trap:** not a defect. A habit, caught twice in one session.
+
+`benchmark.py` runs three passes and prints a warm average, which reads as
+a settled result. It is one sample of a distribution nobody had measured.
+
+**Instance 1.** GLM-5.3 at `max_model_len` 262144 measured **21.3 tok/s**
+warm, against 22.7 at 98304. That is a clean ~8% story: more context costs
+some throughput, which is exactly what one expects and therefore exactly
+what one stops questioning. It was about to be written into the recipe
+header as the cost of the larger context. Two further runs gave **23.2**
+and **22.5**. The spread within 262144 alone (21.3-23.2, 9%) is larger than
+any difference between the settings. **There is no measurable cost**, and
+the recipe would have carried a fabricated trade-off.
+
+**Instance 2.** `gemma4-26b-a4b-nvfp4` measured **51.9**, then **55.3** on
+an identical rerun -- same recipe, same host, same prompt, 6.5% apart.
+Either figure alone would have looked authoritative.
+
+**What makes this worth an entry rather than a shrug:** in both cases the
+first number was plausible, matched a prior expectation, and would not have
+been questioned. Instance 1 is the worse of the two because the wrong
+reading was the *expected* one -- a cost where a cost was predicted. A
+number that confirms what you already believe is the one least likely to
+get a second run.
+
+**The rule, now in WORKSTREAMS F-o:** two runs minimum before a number goes
+in a recipe header, and record the RANGE rather than the mean. Every claim
+from 2026-09-08/09 that survived scrutiny had repeats; every one that
+shifted had a single sample.
+
+This is F-e's standing complaint ("every throughput number in the doc set
+is a single measurement") arriving in a case where the repeats existed and
+disagreed. F-e asked for repeats; this says what to do when you get them --
+publish the interval, not the average of it.
+
+Measured values now live in `docs/REFERENCE-decode-speeds.md`, with ranges.
+
+---
+
+### 142. `default_deploy_target` naming a reserved host takes the daemon down at startup, and the only symptom is "API disconnected"
+
+**Trap:** `cluster_config.yaml` carries both `reserved: true` per host and a
+cluster-wide `default_deploy_target`. Swapping which host is reserved is a
+two-field edit, and doing only the first half is the natural mistake --
+`reserved:` is the thing you came to change; `default_deploy_target` is
+somewhere else in the file and refers to the same host by name.
+
+`load_cluster_config()` validates the combination and raises:
+
+> A reserved host cannot be the default target for unqualified deploys.
+
+which is correct, and is exactly the contradiction `default_deploy_target`
+was introduced to prevent (#131's split: the node you most want to stay
+authoritative is then also the node a bare `deploy` would flatten). But it
+raises **at import**, before FastAPI binds `:5001`. So:
+
+- the daemon never starts,
+- the dashboard shows only **"API disconnected"**,
+- nothing in the dashboard, the CLI, or the browser console names the
+  config, the field, or the file.
+
+The message exists and is good. It is in `docker logs
+dgx-orchestrator-api` and nowhere else.
+
+**Fix:** none needed in the validation -- it is right to refuse. What was
+missing is the pointer. `UsageShortcut.md`'s Reserved Hosts section now
+says to update `default_deploy_target` in the same edit, and that the
+symptom of not doing so is a dead API with the reason only in the container
+log.
+
+**Worth noting the diagnostic pattern**, because it recurs: a startup-time
+config failure is invisible to every surface built to report *runtime*
+state. `orchestrator_version` in `/api/status`, the dashboard badge, the
+health probes -- all of them require the daemon to be running to tell you
+anything. When the dashboard says "API disconnected" and nothing else,
+`docker ps -a` (not `docker ps`) and `docker logs` are the first two
+commands, because a crash-looping or exited container looks identical to a
+network problem from the browser.
+
 ### 141. The benchmark button aimed at the headless worker, because the same hidden dropdown was read in a second place nobody checked
 
 **Trap:** #134 fixed `triggerDeploy()` reading a hidden `headSelect`

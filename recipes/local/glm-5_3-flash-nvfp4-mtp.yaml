@@ -7,14 +7,29 @@ recipe_version: '1'
 # token corruption (vLLM #54150); RedHatAI is uncorrupted and loads ~2x faster
 # (11 large shards vs 120 small).
 #
-# VALIDATED ON HARDWARE 2026-09-08, spark-3 (head) + spark-4 (worker):
-#   - 23.1 tok/s warm decode, TTFT 0.22 s, MTP acceptance 36.9% live
-#   - 22.3 tok/s on an independent earlier run -- TWO runs, not one sample
-#   - max_model_len 98304, KV pool 312,785 tokens, 3.18x concurrency
+# VALIDATED ON HARDWARE, spark-3 (head) + spark-4 (worker).
+#
+# 262,144 VALIDATED 2026-09-09 -- the current configuration:
+#   - 21.3, 23.2, 22.5 tok/s warm across three 3-pass runs. RANGE, not a
+#     mean: the spread here is larger than the difference from 98304, so
+#     quote the interval. TTFT 0.23-0.25 s.
+#   - KV available 2.88 GiB on the worker (down from 3.94 at 98304), peak
+#     activation up 2.82 -> 3.03 GiB. Margin is real but not large.
 #   - boot ~11 min (weights ~6 min/rank, then JIT + cudagraph capture)
-#   The MTP figure REPRODUCES upstream's ~21.8 tok/s / ~0.24 s TTFT, so the
-#   throughput claim below is confirmed. The KV-pool claim is not -- see the
-#   MAX CONTEXT NOTE.
+#
+# 98,304 measured 2026-09-08, superseded:
+#   - 22.3, 23.1 tok/s warm, TTFT 0.22 s
+#   - KV pool 312,785 tokens, 3.18x concurrency, MTP acceptance 36.9% live
+#
+# THE TWO CONTEXT SETTINGS ARE INDISTINGUISHABLE at this sample size --
+# 2.67x the context for no measurable throughput cost. 262144 is also
+# upstream's own shipping TP2 configuration. See TOMBSTONES #143 for why
+# this is stated as a range: the first 262144 run measured 21.3 and read as
+# a clean ~8% penalty, which is what one expects and therefore what one
+# stops questioning. Two further runs killed that reading.
+#
+# The MTP throughput figure REPRODUCES upstream's ~21.8 tok/s / ~0.24 s
+# TTFT. Their KV-pool figure does not -- see the MAX CONTEXT NOTE.
 #
 # Community benchmarks (tonyd2wild), for comparison:
 #   - fp8 KV + MTP-4: ~21.8 tok/s, 507K KV pool  <- tok/s reproduced, KV NOT
@@ -92,13 +107,38 @@ recipe_version: '1'
 #   token budget at both 524288 and 98304, so it does not scale with
 #   context and is not the missing memory.
 #
-#   NOT YET TRIED, and the most promising lead: vLLM itself suggests
-#   `--kv-cache-memory=9166886912` (8.54 GiB) "to fully utilize gpu memory"
-#   -- more than double what the gpu_memory_utilization heuristic allocated,
-#   because that heuristic reasons about a 121.69 GiB device while ~14 GiB
-#   sits unused. Setting it explicitly (sized to the TIGHTER rank) is the
-#   plausible route back to a larger context. Try before concluding 512K is
-#   unreachable on this hardware.
+#   RESOLVED 2026-09-09 -- and the recommendation this note used to carry
+#   was WRONG in a way worth leaving visible.
+#
+#   The context problem was never memory. It was that nobody tried the
+#   middle: 524288 refuses to boot, 98304 was chosen to get the recipe
+#   serving, and 262144 -- upstream's own shipping TP2 value -- boots and
+#   costs nothing measurable. Two sessions of memory accounting went into a
+#   question that a different max_model_len answered.
+#
+#   THE RETRACTED RECOMMENDATION: this note previously said vLLM's own
+#   `--kv-cache-memory=9166886912` suggestion ("to fully utilize gpu
+#   memory") was "the most promising lead" and should be tried. DO NOT.
+#   Upstream documents that concurrency is bounded by free-memory HEADROOM
+#   rather than by the pool: at `--kv-cache-memory 4445787956` -- LESS than
+#   the value suggested here -- a 3-way 20K-token prefill drove
+#   MemAvailable to 3.06 GB and their anti-OOM watchdog killed the engine.
+#   Their shipping pin (3221225472, a 310,292-token pool) is deliberately
+#   LOWER than what fits, for headroom under load. The heuristic here
+#   arrives at 2.88 GiB unpinned, close enough that pinning has not been
+#   necessary.
+#
+#   Still unexplained, and left recorded rather than tidied away: the
+#   head/worker KV asymmetry above (5.09 vs 3.94 GiB at 98304). Under TP2
+#   these should match and the cluster is limited by the smaller.
+#
+#   The real performance lever is DFlash2, not memory: 46.9 tok/s vs 21.8
+#   for MTP-4 at this exact context upstream (2.15x) at 74.1% acceptance,
+#   and it costs ZERO KV pool -- its layers slot-share the MLA tensors the
+#   way GLM's own mamba layers do, so context is unaffected. Needs a
+#   different image (this build ships DFlash1 and predates DFlash2,
+#   upstream PR #52816) plus the 2.2 GB incoai/GLM-5.3-Flash-DFlash2
+#   drafter staged on both hosts. Tracked in WORKSTREAMS.
 #
 # DEPLOY SEQUENCE:
 #   Upstream's procedure is worker-first with a ~25 s gap, then the head.
@@ -197,7 +237,8 @@ gpu_util: 0.85
 gpu_util_ceiling_exempt: true
 notes: |
   LibertAIDAI/GLM-5.3-Flash-NVFP4 has ModelOpt token corruption (vLLM #54150) — use RedHatAI/GLM-5.3-Flash-NVFP4 instead.
-  KV pool ~507K at fp8 + gmu 0.85 with MTP active; two concurrent 512K requests exceeds budget — max 1 full-length at a time.
+  262,144 context validated 2026-09-09: 21.3–23.2 tok/s warm across three 3-pass runs, TTFT ~0.24 s, MTP acceptance ~37%. Indistinguishable from 98304, so the larger context is free.
+  The upstream ~507K KV-pool claim does NOT hold here — 524288 refuses to boot. See the recipe's MAX CONTEXT NOTE and docs/REFERENCE-decode-speeds.md.
   Not applicable: Tombstone #38 (Marlin MXFP4 KeyError) only affects mixed-precision activations; this is weight-only NVFP4.
 capability:
   task: null
@@ -245,10 +286,16 @@ topologies:
     #   field. Disable per-request with chat_template_kwargs: {"enable_thinking": false}.
     #
     # --enable-prefix-caching: RedHatAI recommends this for GLM-5.3.
-    # 98304, not the 524288 this recipe originally carried. 524288 does not
-    # boot -- see the MAX CONTEXT NOTE in the header for the engine's own
-    # refusal message and the memory accounting. Raise this only after
-    # testing --kv-cache-memory, and re-benchmark if you do.
+    # 262144. Not the 524288 this recipe originally carried (does not boot),
+    # and not the 98304 it passed through while being brought up. See the
+    # MAX CONTEXT NOTE in the header for the engine's refusal at 524288 and
+    # the three-run comparison showing 262144 costs nothing measurable.
+    #
+    # Do not raise this again without re-benchmarking. The margin at 262144
+    # is real but not large: KV available fell 3.94 -> 2.88 GiB on the
+    # worker and peak activation rose 2.82 -> 3.03 GiB. And do NOT reach
+    # for --kv-cache-memory to buy more -- see the retraction in that same
+    # note.
     max_model_len: 262144
     tp_size: 2
     pp_size: 1

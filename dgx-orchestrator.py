@@ -19,7 +19,7 @@ import datetime
 # is what actually answers "did my push/pull/restart take" now -- it's
 # derived, not typed, so it can't be forgotten the way this slug already
 # has been.
-ORCHESTRATOR_VERSION_SLUG = "2026-09-08-positional-model-parse-benchmark-target"
+ORCHESTRATOR_VERSION_SLUG = "2026-09-09-ceiling-note-severity"
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import getpass
@@ -4508,8 +4508,20 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
         if reportable:
             dry_run_result["env_var_collisions"] = reportable
         # Absent unless the recipe actually exceeds the declared ceiling.
+        #
+        # Key is `_note` with a separate `severity`, NOT `_warning`. An
+        # exempt recipe emits this on EVERY deploy forever, and anything
+        # parsing for a key literally named "warning" would take a
+        # sanctioned exception as a problem every single time -- the
+        # always-fires trap (errata linter rule 3) sneaking back in through
+        # the machine-readable surface rather than the console one. The
+        # console already distinguishes these with [i] vs [!]; this makes
+        # the JSON do the same.
         if gpu_util_ceiling_note:
-            dry_run_result["gpu_util_ceiling_warning"] = gpu_util_ceiling_note
+            dry_run_result["gpu_util_ceiling_note"] = {
+                "severity": "info" if _exempt else ("error" if _mode == "error" else "warning"),
+                "message": gpu_util_ceiling_note,
+            }
         return dry_run_result
 
     time.sleep(4)

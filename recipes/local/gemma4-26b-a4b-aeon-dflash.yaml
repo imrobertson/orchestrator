@@ -63,15 +63,29 @@ image: ghcr.io/aeon-7/aeon-vllm-ultimate:2026-06-18-v0.23.0-dflashfix
 # quotes are required -- a bare `entrypoint:` parses as null, i.e. as if
 # the field were absent.
 #
-# UNVERIFIED ASSUMPTION, flag this if the deploy fails at launch: the
-# validated standalone script used `--entrypoint vllm` + `serve <path>`,
-# NOT the module path. The recipe schema hardcodes the
-# `python3 -m vllm.entrypoints.openai.api_server` prefix and has no field
-# to change it, so this recipe assumes that module path is present and
-# equivalent inside AEON's image. Every vLLM install ships it, so this is
-# very likely fine -- but it is inference, not something observed on this
-# image. Confirm before trusting:
-#   docker run --rm --entrypoint "" <image> python3 -c "import vllm.entrypoints.openai.api_server"
+# ASSUMPTION RESOLVED 2026-09-09. This recipe previously warned that the
+# module path (`python3 -m vllm.entrypoints.openai.api_server`) was
+# inferred rather than observed for AEON's image, and that the schema would
+# need a fourth field if it turned out wrong. It does not: deployed and
+# benchmarked at 49.2, 49.2, 48.8 tok/s warm across three 3-pass runs,
+# TTFT 0.08 s.
+#
+# That reproduces deploy_gemma4_dflash.py's own validated 49.3 tok/s on the
+# same prompt, which was the remaining condition for retiring that script.
+#
+# No `launch_argv_prefix` needed here. That field (schema 5) exists for
+# images where `vllm serve` is REQUIRED -- specifically a multi-node
+# headless worker, where the module path parses --headless and then ignores
+# it (TOMBSTONES #140). This recipe is 1-node, so there is no --headless
+# and both entry points reach the same code.
+#
+# One cold-start caveat worth knowing: the first-ever request against a
+# freshly-built kernel cache paid 52.11 s TTFT on this recipe. Every
+# subsequent cold start was 0.08-0.44 s. The JIT caches persist across
+# container restarts via bind mounts, so this appears to be once per
+# image/kernel-cache generation rather than once per deploy -- not
+# confirmed, but it fits both observations. Decode was unaffected (49.5
+# cold vs 49.2 warm), so it is purely a prefill-path compile.
 entrypoint: ""
 # 0.65, NOT this cluster's usual 0.75/0.85. Validated at exactly this
 # value across all 16 runs above. AEON-7's own production notes for this

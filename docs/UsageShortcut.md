@@ -127,6 +127,12 @@ All runs are automatically appended to `benchmark_ledger.csv` with precise Time-
 
 '''If a deploy's "auto-run benchmark when ready" doesn't seem to have fired,''' check `benchmark_ledger.csv` for an entry near the deploy's timestamp before assuming the feature is broken. Two known, distinct causes: (1) the checkbox was checked after the deploy was already sent — see the Dashboard Usage Notes above, this is expected behavior, not a bug; (2) `wait_for_cluster_ready()`'s timeout (`tuning.deploy_wait_timeout_sec`, 900s by default) can expire silently if a model takes longer than that to boot, skipping the benchmark trigger with no visible error. If it's (2), the manual "Run Benchmark Suite Now" button (appears once the dashboard shows the cluster as ready) gets you the numbers regardless.
 
+=== How fast should this model be? ===
+
+`docs/REFERENCE-decode-speeds.md` has every measured number from this cluster in one table, with ranges rather than means, plus what explains the 8x spread between the fastest and slowest recipes (MoE vs dense costs ~2.4x; NVFP4 vs bf16 costs ~3.2x; they compound). Consult it before concluding a model is misconfigured — `gemma-4-31b` at 6.7 tok/s is the correct number for a dense bf16 model on this hardware, not a fault.
+
+Two caveats it repeats and that are worth knowing here: `benchmark.py` sends '''one general-prose prompt''', so it cannot see workload-dependent differences (DFlash beats MTP 2.8x on extraction and ties on prose — this benchmark only measures the tie), and it '''does not exercise tool-calling''' at all, so a tools-enabled recipe benchmarking fine says nothing about whether its parser works.
+
 == A/B Testing Two Recipes ==
 
 Skip the manual deploy/benchmark/teardown cycle — `tests/ab_test.py` does the whole thing for one or two variants automatically, logs everything regardless of pass/fail, and prints a side-by-side comparison if you gave it two:
