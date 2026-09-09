@@ -596,6 +596,7 @@ evidence. Ordered by what each unblocks.
 | Cache integrity retrospection | **OPEN, wants ground truth** | One concrete artifact: a `tilelang` entry named `tmp` with an implausible ~56-year age. The heuristic needs real Triton/TileLang/DeepGEMM cache-layout contracts before it can be trusted. |
 | `serving_host` ignored container run state | **LANDED 2026-09-07** | #136. The selection loop matched `active_container` by name regardless of `is_crashed`, so a stale `EXITED` container on an earlier-listed host shadowed a genuinely serving one and reported the whole cluster not-ready. Survived both #130 and #131 untouched -- neither had reason to distinguish running from dead until host order changed. Now gated on `not is_crashed`. Adjacent to *Engine health monitoring* above: that row's "container RUNNING, engine absent" case is this one's mirror image and is **not** caught by this fix. |
 | `wait_for_cluster_ready()` timeout fails silently | **OPEN, new 2026-09-07** | `_execute_deployment_impl()` wraps both load-time recording and the auto-benchmark trigger in a single `if is_ready:`. A `deploy_wait_timeout_sec` expiry (900s default) drops both with no error surfaced to dashboard, CLI, or toast -- indistinguishable from "auto-benchmark is broken". Suspected but **not confirmed** as a second cause of missed auto-benchmarks alongside #137; the evidence to settle it is `benchmark_ledger.csv` timestamps against deploy logs. At minimum, log and surface the timeout distinctly from success. |
+| `ab_test.py` cannot run a 2-node comparison while a host is reserved | **OPEN, blocks K12** | 2-node variants span both hosts; `spark-3` is reserved; `ab_test.py` has no `--force` and that omission is deliberate (a force flag surviving in a saved benchmark invocation is exactly what the reserved-host design rejects). So the MTP-vs-DFlash2 comparison K12 is built around cannot run through it today. Options, in rough order of preference: (a) an explicit `--force-reserved` that must be passed per-invocation and is refused if it appears in a saved/scripted call, (b) teach it to run the comparison sequentially through `dgx-orchestrator.py deploy --force` rather than its own deploy path, (c) accept manual sequential benchmarking for 2-node and document it. Decide before K12 rather than during. |
 | Long operations write their output at the end and check writability never | **OPEN, new 2026-09-09** | A 3-pass `benchmark.py` run completed, printed its numbers, and then failed with `Permission denied: benchmark_ledger.csv` — the file was root-owned from the container writing through the bind mount. The run is simply lost, and the error arrives AFTER the results have scrolled past, so it is easy to miss entirely. Cheap fix: check the output path is writable BEFORE doing the work, in `benchmark.py` and anything else with a write-at-the-end shape (`ab_test.py`, the run-log archival path). |
 | A fix to a shared element must be preceded by an audit of its other readers | **PRACTICE, adopted 2026-09-08** | #141. #134 fixed one reader of `headSelect` and left another broken for a day, which then aimed the benchmark at a headless worker. `grep -n "headSelect'" index.html` returns seven hits and takes five minutes; doing it at fix time would have caught #141 immediately, and it also establishes which other readers are already safe (two were) rather than leaving that to assumption. Cheap, mechanical, and it does not depend on having a browser harness — which is the other open row above, still unaddressed. |
 | Three fixes never verified in their real UI path, two of them to one element | **OPEN, small — worse than when this row was written** | #78's teardown error toast (no failing teardown existed to test against) and #66's `headSelect` sync (only `node --check`'d). Now three: #137's benchmark-checkbox state window was landed with control flow read by hand and brace balance checked, never opened in a browser. And #134 -- also unverified — is the **same element as #66**, plus #132 was a third failure of that same control from a different direction. Four bugs in one dropdown, two fixes to it never exercised. This is the argument for a minimal DOM-level harness over a fourth careful read. |
@@ -743,7 +744,8 @@ New 2026-09-07. Three fields landed, `_CONFIG_HASH_SCHEMA` 2 -> 4. See
 | `entrypoint: Optional[str]` | **LANDED** | `docker run --entrypoint` override. `None` = no flag (byte-identical to prior behaviour for every existing recipe); `""` = neutralize the image's ENTRYPOINT; other = executable. `""` vs `None` is load-bearing -- all tests `is not None`, never truthiness. `run_ssh()`'s `shlex.quote()` renders `""` as `''` and preserves it as a real empty arg, round-trip verified. |
 | `model_path_override: Optional[str]` | **LANDED** | Literal `--model` value when it must differ from `hf_path`. `hf_path` stays the recipe's identity for ledger, `_record_hf_path()`, cache bookkeeping, catalog display. Deliberately not unioned with `hf_path` -- collapsing them would surface a container filesystem path where the dashboard shows a repo id. |
 | `extra_mounts: list[str]` | **LANDED** | Additional bind mounts, host-symmetric, applied identically on every target host. Sorted before hashing (unlike `mods`): mounts don't overwrite each other, so order is not semantic. |
-| `launch_argv_prefix` | **LANDED, hardware-validated** | #140. Schema 4 -> 5. `None` = the historical module path; a `{model}` token is substituted and suppresses `--model`. Required for any multi-node WORKER on an image where `vllm serve` is the entry point -- the module path parses `--headless` and ignores it, then dies on `collective_rpc`. Confirmed by source read (serve.py:146/177/262) BEFORE the fix, then observed in a boot log (serve.py:216) after. Teardown's `pkill` pattern had to widen too, which was not predicted -- see #140. |
+| `launch_argv_prefix` | **LANDED, hardware-validated** |
+| `AB_TEST_USAGE.md` claimed the schema has no entrypoint override | **CORRECTED 2026-09-09** | The doc said an image with a non-stock entrypoint *must* go through `--a-entrypoint` (raw docker run) and called it "a structural limit of the deploy path". True until schema 3. `entrypoint` and `launch_argv_prefix` now exist and `glm-5_3-flash-nvfp4-mtp.yaml` uses both on the normal path. The stale advice pushed users onto raw-docker, which silently disables mods, forbids `--a-nodes 2`, and bypasses the reserved-host guard — so it was not merely out of date, it steered toward the worse path. Instance of WS-0's pattern: docs behind code, in a file nobody re-read after the schema changed. | #140. Schema 4 -> 5. `None` = the historical module path; a `{model}` token is substituted and suppresses `--model`. Required for any multi-node WORKER on an image where `vllm serve` is the entry point -- the module path parses `--headless` and ignores it, then dies on `collective_rpc`. Confirmed by source read (serve.py:146/177/262) BEFORE the fix, then observed in a boot log (serve.py:216) after. Teardown's `pkill` pattern had to widen too, which was not predicted -- see #140. |
 | `_glm-5.3-flash-nvfp4-tp2` deploys | **VALIDATED 2026-09-08** | Serving on spark-3 (head) + spark-4 (worker). 23.1 tok/s warm, TTFT 0.22 s, MTP acceptance 36.9%, two independent benchmark runs. REPRODUCES upstream's ~21.8 tok/s MTP figure. Logged to `benchmark_ledger.csv` under key `GLM-5.3-Flash-NVFP4` — the E019 basename constraint doing its job, since a lowercase mount would have orphaned the entry. |
 | GLM-5.3 at 262,144 context | **VALIDATED 2026-09-09** | 2.67x the context for no measurable throughput cost: 21.3, 23.2, 22.5 tok/s across three 3-pass runs versus 22.3, 23.1 at 98304. The spread within 262144 is larger than the difference between settings. 262144 is also upstream's own shipping TP2 config. The context problem was never memory — nobody had tried the middle between 524288 (refuses to boot) and 98304 (chosen to get it serving). Supersedes the row below. |
 | DFlash2 for GLM-5.3 | **OPEN, the real performance lever** | 46.9 tok/s vs 21.8 for MTP-4 at TP2/262K upstream — 2.15x — at 74.1% acceptance, and it costs ZERO KV pool (layers slot-share the MLA tensors like GLM's own mamba layers), so context is unaffected. NOT a config change: this image's vLLM (`0.1.dev20051+g487ecf187`) ships DFlash1 and predates DFlash2 (upstream PR #52816). Needs a different image plus the 2.2 GB `incoai/GLM-5.3-Flash-DFlash2` drafter staged on both hosts and an `extra_mounts` entry. The schema already supports all of that — this is a staging-and-image project, not a code change. |
@@ -1813,6 +1815,205 @@ keeps getting lost.
 > pointed at the same always-on dashboard — which is precisely the
 > multi-surface staleness problem #131 rejected a persistent force checkbox
 > over.
+
+---
+
+## K12 — DFlash2 for GLM-5.3: 2.15x decode at zero KV cost
+
+Highest-value open item on the cluster. See `docs/REFERENCE-decode-speeds.md`
+for the current baseline and `TOMBSTONES.md` #133/#140/#143 for the traps
+this prompt is written to avoid.
+
+> ### Context
+>
+> Repo `imrobertson/orchestrator`, two-node DGX Spark (GB10, SM121) cluster:
+> `spark-3` (10.0.14.41, head, **reserved**) and `spark-4` (10.0.14.43).
+>
+> `glm-5_3-flash-nvfp4-mtp.yaml` is in production: 2-node TP2, 262,144
+> context, **21.3–23.2 tok/s** warm decode across three 3-pass runs, MTP-5
+> at ~37% acceptance. That is the baseline to beat.
+>
+> Upstream measured **46.9 tok/s vs 21.8 for MTP-4 on the same hardware at
+> the same context — 2.15x — at 74.1% acceptance**, using DFlash2 block-
+> diffusion speculative decoding. Critically it **costs zero KV pool**: the
+> drafter's layers slot-share the MLA tensors the way GLM's own mamba
+> layers do, so context is unaffected. This is the single largest available
+> performance win on this cluster and the reason for this session.
+>
+> ### What blocks it
+>
+> The image currently in the recipe
+> (`ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8`) ships vLLM
+> `0.1.dev20051+g487ecf187`, which supports DFlash1 and **predates DFlash2**
+> (upstream PR #52816, merged 2026-08-21). So this is not a `vllm_args`
+> change. It needs:
+>
+> - a different image — `radixark/vllm-glm53-flash:sm121-v8-dflash2-tony`
+>   is referenced by the TP4 community deploy; tonyd2wild's TP2 repo carries
+>   its own overlay. **Establish which is actually right for TP2 before
+>   pulling 180 GB of anything.**
+> - the drafter `incoai/GLM-5.3-Flash-DFlash2` (~2.2 GB) staged on **both**
+>   hosts, with an `extra_mounts` entry for it
+> - `--speculative-config` changed from `{"method":"mtp",...}` to the
+>   DFlash2 form
+>
+> The recipe schema should already be sufficient — `entrypoint`,
+> `launch_argv_prefix`, `extra_mounts` and `model_path_override` all exist
+> and were each added because a community image needed one. If you find
+> yourself wanting a sixth field, that is a real finding; say so rather than
+> working around it.
+>
+> ### Do these two checks BEFORE writing any recipe
+>
+> Both are one command and both would have saved most of a day when this
+> image was first brought up (`TOMBSTONES.md` #133):
+>
+> ```
+> docker run --rm --entrypoint "" <image> python3 -c "import ray; print(ray.__version__)"
+> docker inspect <image> --format '{{.Config.Entrypoint}}'
+> ```
+>
+> The current image has **no ray** and sets `ENTRYPOINT ["vllm","serve"]`.
+> If the DFlash2 image differs on either, the recipe's `entrypoint` and
+> `launch_argv_prefix` need to change with it — and note that a multi-node
+> **worker** specifically requires the `vllm serve` CLI, because the
+> `api_server` module path parses `--headless` and then ignores it, starting
+> an APIServer that dies on `collective_rpc` nine minutes into weight
+> loading (`TOMBSTONES.md` #140, confirmed by source read at
+> `vllm/entrypoints/cli/serve.py:146/177/262`).
+>
+> ### Constraints that are not negotiable
+>
+> **Do not raise `--kv-cache-memory` to "fully utilize gpu memory".** vLLM
+> suggests ~8 GiB; upstream documents that concurrency is bounded by
+> free-memory *headroom* rather than by the pool, and at `4445787956` —
+> less than vLLM's suggestion — a 3-way 20K-token prefill drove
+> MemAvailable to 3.06 GB and an anti-OOM watchdog killed the engine. Their
+> shipping pin is deliberately lower than what fits. The heuristic here
+> lands at 2.88 GiB unpinned. DFlash2 should not need more, since it costs
+> no KV pool.
+>
+> **`spark-3` is reserved.** Every 2-node deploy spans both hosts and needs
+> `--force`. That is intended, not an obstacle to route around.
+>
+> **Weight staging is manual and unverified by anything.** Docker silently
+> creates a missing bind-mount source as an empty directory rather than
+> failing, which produces a `FileNotFoundError` deep in model loading with
+> no hint that the mount was the problem. Verify with `ls` on the specific
+> file, on both hosts, before deploying.
+>
+> ### Measurement discipline
+>
+> **Two runs minimum before any number goes in a recipe header, and record
+> the range rather than the mean** (`TOMBSTONES.md` #143, `WORKSTREAMS.md`
+> F-o). Two numbers nearly became findings on 2026-09-09 and neither
+> survived a repeat — the worse one *confirmed an expectation*, which is the
+> kind least likely to get a second run.
+>
+> `benchmark.py --host 10.0.14.41 --nodes 2` sends **one general-prose
+> prompt**. Upstream's 46.9 figure is single-stream; their coding peak is
+> higher. If DFlash2's advantage is workload-dependent the way DFlash's was
+> for Gemma4 (2.8x on extraction, tied on prose), a prose benchmark will
+> understate it. `tests/ab_test.py --prompts all --repeats 3` is the honest
+> comparison and MTP-vs-DFlash2 on identical hardware is exactly what it
+> exists for. Note `--repeats N` already does fully independent
+> deploy+benchmark+teardown N times per variant and prints mean/range per
+> prompt -- use it rather than reasoning from a single 3-pass run.
+>
+> **Before planning on `ab_test.py`, read this:** 2-node variants span both
+> hosts, `spark-3` is reserved, and **`ab_test.py` has no `--force`** --
+> deliberately, because a force flag surviving in a saved benchmark
+> invocation is what the reserved-host design exists to prevent. So the
+> two-sided comparison this section recommends **cannot run through
+> `ab_test.py` as things stand.** See the WS-7 row. Either resolve that
+> first, or benchmark the two recipes sequentially by hand via
+> `dgx-orchestrator.py deploy --force` + `benchmark.py`, which is what was
+> done for every number in `REFERENCE-decode-speeds.md`. Do not discover
+> this after staging 180 GB of image.
+>
+> `--a-nodes 2` itself IS supported for a pure named-recipe passthrough
+> with a `2_node` topology, which both GLM recipes are -- the blocker is
+> the reserved host, not the topology.
+>
+> Also worth checking, since it is free once the thing is up: **acceptance
+> rate**. Upstream reports 74.1% with per-position figures. If yours is far
+> off, that is a signal the drafter is loaded but not working properly —
+> which is a real failure mode here, not hypothetical.
+>
+> ### What to report back
+>
+> Whether it works, at what tok/s **with the range**, at what acceptance
+> rate, and at what context. If it does not work, the failure and the
+> mechanism — but mark mechanism claims as inferred unless the code path was
+> actually read. Four mechanism claims were stated as fact on 2026-09-08 and
+> all four were wrong; `WORKSTREAMS.md` F-m has the pattern.
+>
+> ### Do not
+>
+> Do not change `glm-5_3-flash-nvfp4-mtp.yaml`. It is in production and
+> validated. DFlash2 is a **new recipe file** — the two should be A/B
+> comparable, and `-mtp` in the current name exists precisely so a `-dflash2`
+> sibling can sit beside it.
+>
+> Do not delete `deploy_gemma4_dflash.py` as part of this work even though
+> it is now retirable; that is a separate, unrelated cleanup.
+>
+> ### Known upstream caveat worth reading before starting
+>
+> Their NVFP4-KV port of the same overlay serves and drafts correctly —
+> 334,161-token pool, 35.9 tok/s, acceptance 0.563 — **but any prompt
+> requiring chunked prefill (>3K tokens) kills the rank-0 worker with no
+> traceback, no CUDA error and no OOM entry.** That is on the NVFP4-KV lane,
+> not the fp8/marlin lane this cluster runs, so it should not apply. Know it
+> exists so a silent rank-0 death is not mistaken for something new.
+
+---
+
+# 3a. Open items, consolidated (2026-09-09)
+
+An INDEX, not a second source of truth. Every item below is recorded in a
+workstream above; this exists so the next session can see the whole surface
+without reading the file end to end. **If you close something, close it in
+its workstream and strike it here** — a divergent index is exactly what
+WS-0 exists to prevent.
+
+Ordered by value, not by workstream.
+
+| # | Item | Where | Cost |
+|---|---|---|---|
+| 1 | **DFlash2 for GLM-5.3** — 2.15x decode, zero KV cost | K12, WS-10 | image + drafter staging; a session |
+| 2 | **`wait_for_cluster_ready()` 900s timeout fails silently** — drops load-time recording AND the auto-benchmark trigger from one `if is_ready:`, no error anywhere | K11 pt 1, WS-7 | diagnosis is free: `benchmark_ledger.csv` timestamps vs deploy logs |
+| 3 | **Tool-calling never exercised on any recipe that declares a parser** — GLM's `--tool-call-parser glm` silently swallowing calls (#133) is why this matters | WS-10, REFERENCE-decode-speeds | one `curl` with a `tools` array |
+| 4 | **`awaitingReady` does not survive a page reload** — benchmark checkbox returns as editable for an in-flight launch, #137's own condition | K11 pt 2, WS-10 | needs `/api/status` to expose deploy-in-flight |
+| 5 | **Head/worker KV asymmetry** — 5.09 vs 3.94 GiB under TP2 where they should match; the cluster is limited by the smaller | WS-10 | unexplained; investigation |
+| 6 | **Long operations check writability never** — a completed 3-pass benchmark was lost to a root-owned `benchmark_ledger.csv`, error arriving after the results scrolled past | WS-7 | small: check before doing the work |
+| 7 | **Two `index.html` fixes never exercised in a browser** (#134, #137), plus #141 | WS-7 | minimal DOM harness |
+| 8 | **A conditionally-visible control should be cleared or disabled when hidden** — four bugs in one dropdown, two partial fixes; structural rather than another patch | F-n | design decision first |
+| 9 | **Image-ENTRYPOINT lint** — two catalog images confirmed affected; needs `docker inspect`, so an on-demand audit script, not the load path | WS-3, errata E020 | `tools/audit_recipe_images.py` |
+| 10 | **`model_path_override` staging has no pre-flight check** — docker silently creates a missing mount source as an empty dir | WS-3 | `test -f` over SSH before `docker run` |
+| 11 | **`cache_cluster_assets.py` ignores `extra_mounts`** — offline deploys of those recipes silently under-fetch | WS-3 | prefetcher extension |
+| 12 | **`gpu_util_ceiling_enforce` still `off`** — audit done, four recipes exempted, so `warn` then `error` should both be no-ops | WS-10 | flip a field, deliberately |
+| 13 | **`gemma-4-31b` runs unquantized** — 6.7 tok/s; NVFP4 should land near Muse Glimmer's 21.4 | REFERENCE-decode-speeds | quantization work, untested |
+| 14 | **Retire `deploy_gemma4_dflash.py`** — both conditions met | WS-10 | deletion |
+| 15 | **`d8401e1a` reserved-host work has no workstream entry** — only its author can write it | F-l | needs that session |
+
+**Not on this list, deliberately:** extending `tests/ab_test.py` so a
+MTP-vs-DFlash2 or tools-parser comparison is a single repeatable invocation
+rather than a manual sequence. That would make items 3 and K12's workload
+comparison much cheaper. Not ranked, because it is enabling work whose
+value depends on which of the above gets picked up first.
+
+*(Correction, same day: an earlier version of this paragraph cited
+`BACKLOG-generalize-metest.md` and its `STAGE_SPECS` refactor as the
+unblocked enabling work. **That file does not exist; verified against
+docs/ on 2026-09-09.** The two BACKLOG files present are
+`BACKLOG-dspark-sm120-image.md` and `BACKLOG-session-tracker-multi-model.md`,
+and `AB_TEST_USAGE.md` is present while nothing metest-related is --
+consistent with metest having been retired in favour of `ab_test.py`. The
+reference was written from memory and not checked. Recorded rather than
+silently deleted because a pointer to a nonexistent file costs the next
+session real time, and because this is the same failure F-m names: a claim
+adjacent to correct material, stated with the same confidence.)*
 
 ---
 

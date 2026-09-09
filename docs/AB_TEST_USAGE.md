@@ -121,10 +121,25 @@ while you test on the other.
 
 ## Things worth knowing before you run it
 
-- **No entrypoint override in the recipe schema.** Any image whose
-  default entrypoint isn't the stock vLLM API server *must* go through
-  `--a-entrypoint` (raw docker run). This is a structural limit of the
-  deploy path, not something this script can paper over.
+- **~~No entrypoint override in the recipe schema.~~ STALE AS OF
+  2026-09-07 -- the schema now has one.** `RecipeConfig.entrypoint`
+  (schema 3) passes a value to `docker run --entrypoint`, and
+  `launch_argv_prefix` (schema 5) replaces the hardcoded
+  `python3 -m vllm.entrypoints.openai.api_server` argv prefix. An image
+  with a non-stock entrypoint can now be a normal recipe on the normal
+  deploy path -- `glm-5_3-flash-nvfp4-mtp.yaml` sets both and deploys
+  through `_execute_deployment_impl()` like anything else.
+
+  The original text said such an image *must* use `--a-entrypoint` (raw
+  docker run). That is no longer true, and it matters here because the
+  raw-docker path has real costs this one does not: mods are silently
+  inert, `--a-nodes 2` is unavailable, and the orchestrator's
+  reserved-host guard never sees the deploy. **Prefer a recipe with
+  `entrypoint`/`launch_argv_prefix` over `--a-entrypoint`** unless you
+  specifically need the raw path.
+
+  `--a-entrypoint` remains correct for a genuinely ad-hoc image you do not
+  want a recipe file for.
 - **Mods only apply on the recipe path.** `--a-mods` and a catalog
   recipe's own `mods:` list are silently inert in raw-docker mode --
   that path never touches `_execute_deployment_impl()`'s mod-baking
