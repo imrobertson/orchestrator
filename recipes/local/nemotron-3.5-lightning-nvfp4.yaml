@@ -1,4 +1,15 @@
 recipe_version: '1'
+# 2026-09-09: removed a standalone --speculative-model flag that these
+# builds reject (errata E023). The drafter now lives in
+# --speculative-config's `model` key, which is the only form vLLM accepts
+# here. The crash this caused was diagnosed and written up in
+# _deepseek-v4-flash-vision-exp.yaml's header -- "This build REJECTS a
+# separate --speculative-model flag (confirmed: our nemotron-3.5 recipe
+# crashed on exactly that)" -- and never fixed in the recipe it names.
+# num_speculative_tokens stays at 5: E006 requires >= dspark_block_size.
+#
+# UNMEASURED. This recipe has never launched successfully, so the
+# config_hash change costs no launch history.
 hf_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
 image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.70
@@ -16,7 +27,6 @@ topologies:
     - OMP_NUM_THREADS=16
     - VLLM_CPU_OMP_THREADS=16
     vllm_args: >-
-      --trust-remote-code --kv-cache-dtype fp8 --max-num-seqs 4 
+      --trust-remote-code --kv-cache-dtype fp8 --max-num-seqs 4
       --compilation-config '{"mode": 0}'
-      --speculative-model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
-      --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
+      --speculative-config '{"method":"dspark","model":"nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark","num_speculative_tokens":5}'

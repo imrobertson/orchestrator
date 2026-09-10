@@ -1,5 +1,33 @@
 #!/usr/bin/env python3
 """
+=========================================================================
+OBSOLETE -- CANNOT RUN, AND MUST NOT BE "FIXED" INTO RUNNING. 2026-09-09.
+=========================================================================
+
+Kept as the provenance for Phase 2 Task 2C, not as a live harness. It
+proved the recipes/ path was equivalent to the models.yaml path at the
+moment of the switch. That switch is complete and its inputs are gone:
+
+  - models.yaml was deleted (TOMBSTONES #112, step 6), so
+    _write_models_yaml_with_flags() fails at read_text().
+  - MODELS_YAML_PATH no longer exists in dgx-orchestrator.py -- zero
+    occurrences as of 2026-09-09 -- so `mod.MODELS_YAML_PATH = ...` now
+    sets an attribute nothing reads.
+
+THE DANGEROUS PART, and the reason for this banner rather than a delete:
+`old_load_model_catalog = mod.load_model_catalog` captures whatever that
+name resolves to today, which is the NEW recipes-backed implementation.
+Restore a models.yaml and this harness compares the new path against
+ITSELF and reports EQUIVALENT -- a green run proving nothing. That is
+exactly TOMBSTONES #83: two broken checks agreeing and producing a PASS.
+
+If a future migration needs this shape of proof, write a new harness
+against both real implementations. Do not resurrect this one.
+
+-------------------------------------------------------------------------
+Original docstring follows.
+-------------------------------------------------------------------------
+
 Proves the new recipes/ + common.recipes.build_catalog_response() path
 produces results identical to the old models.yaml + load_model_catalog()
 path, before Task 2C switches dgx-orchestrator.py / cache_cluster_assets.py
@@ -44,7 +72,7 @@ from pathlib import Path
 
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]   # tools/verify/ -> repo root
 sys.path.insert(0, str(REPO_ROOT))
 
 import common.config as config_mod

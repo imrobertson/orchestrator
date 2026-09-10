@@ -5,9 +5,19 @@ backlog role of `ARCHITECTURE-MIGRATION-PLAN.md`. For direction and
 decisions of record see `DIRECTION.md`; for per-fix history see
 `TOMBSTONES.md`; for machine-readable recipe rules see `errata.yaml`.
 
-Revision 4, 2026-09-08 (second session). Built from `TOMBSTONES.md` #27–#139,
-`TROUBLESHOOTING.md` #1–14, `model_ledger.json`, and verification against
-`dgx-orchestrator.py`, `common/recipes.py`, `tests/ab_test.py`.
+Revision 5, 2026-09-09. Built from `TOMBSTONES.md` #27–#143,
+`TROUBLESHOOTING.md` #1–14, `errata.yaml` E001–E022, `model_ledger.json`, and
+verification against `dgx-orchestrator.py`, `common/recipes.py`,
+`common/config.py`, `common/ssh.py`, `tests/ab_test.py`, `benchmark.py`,
+`cache_cluster_assets.py`, `html/index.html`, and every file in
+`recipes/local/`.
+
+Revision 4 stayed at 2026-09-08/#139 while 2026-09-09 content was added in
+three places (§3a's correction, WS-7's writability row, WS-10's CORRECTED
+row). That is the fifth instance of F-k, in the file that documents F-k.
+Note also what Revision 4 listed as verified against: `benchmark.py` and
+`cache_cluster_assets.py` were not on it, and both turned out to hold
+defects this revision records.
 
 Revision 3 adds WS-11 and D-9 (reserved-host state correctness and control
 surfaces, `TOMBSTONES.md` #129–#132) and flags F-l/F-m. The header had stayed
@@ -47,12 +57,12 @@ which means entries were being read as open work after the work was done.
 |---|---|
 | `DIRECTION.md` written (replaces `ROADMAP.md` + `ARCHITECTURE-MIGRATION-PLAN.md`) | **LANDED** — drafted, not yet committed |
 | `WORKSTREAMS.md` written (this file) | **LANDED** |
-| `errata.yaml` written (replaces `TROUBLESHOOTING.md`'s tuning reference) | **LANDED** — 17 rules, each with provenance |
+| `errata.yaml` written (replaces `TROUBLESHOOTING.md`'s tuning reference) | **LANDED** — 22 rules as of 2026-09-09 (17 when written), each with provenance |
 | Retire `ROADMAP.md`, `ARCHITECTURE-MIGRATION-PLAN.md`, `BACKLOG-*.md`, `PHASE-MODS-PROMPTS.md`, `SESSION-*.md`, `M*-REVIEW.md` | **OPEN** |
 | Trim `TROUBLESHOOTING.md` to the incident log only | **OPEN** |
 | Append MA/MB/MC results to the mods record before archiving `PHASE-MODS-PROMPTS.md` | **OPEN** |
 | Update in-code doc pointers that name retired files | **OPEN** — several exist in `dgx-orchestrator.py` and `recipes.py` docstrings |
-| Retire `models.yaml` and its code paths (Phase 2's last remnant) | **DONE in code, 2026-09-03** — see WS-0a |
+| Retire `models.yaml` and its code paths (Phase 2's last remnant) | **DONE in code, 2026-09-03; second file found and cleared 2026-09-09** — see WS-0a |
 
 **Stale claims to correct, with evidence** (all verified against attached code):
 
@@ -94,7 +104,28 @@ which means entries were being read as open work after the work was done.
 8. **`recipes/eugr/` is empty** — it contains a `.gitkeep` and nothing else.
    Every document reference to `recipes/eugr/*.yaml` (in `ROADMAP.md`, the
    mods sequence, and the status-marker scope) describes an empty directory.
-   The catalog is `recipes/local/`, 24 files, entirely (25 as of the models.yaml removal pass, minus the deleted nemotron duplicate).
+   The catalog is `recipes/local/`, entirely — **35 files as of 2026-09-09**
+   (it was 24 after the models.yaml removal pass; it has grown steadily since,
+   and every count written into this file has gone stale within days).
+8c. **`REFERENCE-control-surfaces.md` has an expiry condition recorded
+    only inside itself.** It says to retire it when the interface spike
+    lands, and is deliberately absent from the doc map so it can be deleted
+    without leaving a dangling reference. That is good practice and it has
+    one flaw: nothing outside the file knows the condition, so if the spike
+    lands the doc simply stays. **Retire it when the interface spike lands.**
+    The archive sweep should skip it and say why, rather than moving it --
+    moving it to `docs/archive/` would imply it is dead, and it is not.
+
+8b. **This file's own tables have two spliced cells and two duplicated
+    rows.** In WS-3, the `cache_cluster_assets.py only knows the shared HF
+    cache` row's Notes cell ends with the *next* row's text, leaving
+    `Near-duplicate catalog key detection at load` with an empty Notes cell.
+    In WS-10, `launch_argv_prefix`'s Notes ended up appended to the
+    `AB_TEST_USAGE.md` row. Both repaired 2026-09-09. Two WS-10 rows also
+    appeared twice with contradictory statuses; the superseded copies are
+    now marked rather than deleted, matching the convention the
+    GLM-5.3-context row already set.
+
 9. **Documents cite deleted recipes.** `TROUBLESHOOTING.md` names
    `deepseek-v4-flash-0731-nvfp4.yaml` as the working example for its
    validated fp8-on-MLA rule; that file was deleted in the DSpark catalog
@@ -234,6 +265,42 @@ port 5001 — not FastAPI's default 8000, corrected mid-verification):
    part is resolved by construction, since only one recipe with that
    `hf_path` remains.
 
+**REOPENED 2026-09-09, then closed again.** The verification above is sound
+and its conclusions hold — but its **surface map was incomplete.** The
+touchpoint table lists six locations, all in `dgx-orchestrator.py` plus the
+repo-root file. `cache_cluster_assets.py` was never in it, and still
+contained the entire legacy path: `MODELS_YAML_PATH`,
+`_extract_manifest_legacy()` (a full `models.yaml` parser preserved verbatim
+as a rollback lever), and a live `USE_LEGACY_CATALOG == "1"` branch in
+`extract_manifest()`.
+
+This is worse than dead code. `_extract_manifest_legacy()` opens with
+`if not MODELS_YAML_PATH.exists(): sys.exit(...)`, and step 6 above deleted
+`models.yaml` from the repo — so the advertised rollback lever had become a
+guaranteed hard exit. Anyone reaching for it during an incident would have
+found it broken, in the one situation where nobody has time to read why.
+
+**K10's own verification step would have caught this.** Its closing line
+reads: `grep -rn "USE_LEGACY_CATALOG\|models\.yaml" .` should come back
+clean apart from `TOMBSTONES.md` history. That grep returns
+`cache_cluster_assets.py` immediately. AST equivalence and the live argv diff
+— both genuinely stronger checks — were run and passed, and the cheap
+repo-wide grep that scopes *where* to run them was not. The lesson is not
+that the verification was weak; it is that a rigorous check applied to an
+incomplete surface produces a confident wrong answer, and the
+surface-defining step was the trivial one.
+
+**Resolved 2026-09-09.** `cache_cluster_assets.py` rewritten:
+`_extract_manifest_legacy()`, `MODELS_YAML_PATH`, the `USE_LEGACY_CATALOG`
+branch and the now-unused `yaml`, `os` and `Path` imports removed;
+`extract_manifest()` collapsed to the recipes path directly. The unused
+`resolve_user_identity_key` import was also dropped — `run_ssh()` resolves
+the identity key itself. Three unrelated defects in the same file were fixed
+in the same pass; see WS-3. `grep -rn "USE_LEGACY_CATALOG\|models\.yaml" .`
+now returns only `TOMBSTONES.md` history and two explanatory comments in
+`dgx-orchestrator.py` (3377, 4546), both of which correctly describe the
+removed path in the past tense.
+
 ---
 
 ## WS-1 — Qwen topology (TP vs PP) and MTP validation
@@ -261,6 +328,8 @@ see D-1.
 | Convert other `pp_size: 2` recipes to TP | **DECISION REVERSED for `llama-4-fp8` — do not convert.** For `qwen-2_5-coder-32b`, TP is proven ~2x faster on identical hardware and image; convert or retire that PP file. For `llama-4-fp8`, the analogous A/B surfaced a real TP-side defect instead of a throughput answer — see the new row directly below and #116. **PP remains the only reliable topology for this model today.** |
 | `llama-4-fp8-tp` — its own A/B, as WS-1 flagged it would need | **CLOSED BY DECISION (#122), AND #119's mechanism is now DISCONFIRMED (#125), not just doubted — the real root cause of the original hang is genuinely unknown.** 3-run `ab_test.py` (2026-09-04): PP 3/3 clean (11.8–12.0 tok/s). TP 1/3 succeeded (16.9/16.7/16.8/16.5 tok/s — **not a valid PP-vs-TP data point**), 2/3 hung, killed by the 900s poll ceiling; a full manual deploy crashed with a Gloo TCP transport failure after ~48 minutes. Diagnosis arc, ten entries: #116 (mid-hang trace → `_profile_single_kernel`'s `all_reduce`) → #117 (outer `world.barrier()` confirmed symmetric) → #118 (a *second*, per-tactic `all_reduce` reopens the mechanism) → #119 (~~confirmed~~: `MoERunner._cache_key_extras()` bakes `local_expert_offset` into the cache key — real code, but its applicability to this deploy did not hold up) → #120 (why rank-divergent cache results can't persist — mechanism stands independent of whether it applied here, general pattern, see WS-9) → #121 (correction: fixable via two real paths against the image itself, neither a change to this repo) → #122 (decision: neither path pursued — no relationship with the fork's maintainer, limited time, working PP fallback already exists) → #123 (reopening: `enable_expert_parallel` defaults `False`, never overridden in this deploy's boot log) → #124 (further evidence: `parallel_state.py`, the file printing the `EP rank` label, has zero reference to the flag under its primary name) → **#125 (CLOSED): the renaming gap #124 left open is resolved — `parallel_state.py` has no reference to the flag under any name, including `enable_ep`; the only two conditionals near the print gate on `enable_eplb`, a different flag entirely. The `EP rank` boot-log label is confirmed unconditional bookkeeping. EP was not active on this deploy. #119's mechanism did not cause this incident's hang.** **The real cause remains unknown** — TP0's instant cache hit against TP1's ~48-minute live sweep before the crash is real and unexplained by anything confirmed in this arc; closing the EP hypothesis supplied no replacement one. `llama-4-fp8` stays on PP=2 regardless — **#122's decision stands, now with less to reopen it, since there is no confirmed mechanism left to fix even if time became available.** Full record: #116–#125. |
 | Boot-log backend scan | **BROKEN, fires on every run** | All six deploys reported `boot_log_hit=False` — "no keyword matched". That is 6 of the run's 6 failed checks (48/54 passed); everything else was clean. The scan's keyword list does not match what these recipes emit, so it produces a false alarm every time, which is the "warning that always fires" failure mode. Consequence: the `TROUBLESHOOTING.md` standard of "we confirmed vLLM *resolved* the backend" is **not** met for this result — only "we set the flags". Recoverable: the full container logs were saved (`a-...-155759.log`, 124632 bytes, and siblings). Grep those rather than re-running. |
+| **Two recipes still pair MTP with `pp_size: 2`** | **OPEN — live E005 violations, found 2026-09-09** | `qwen-3.8-27b::2_node` and `qwen-3.8-27b-nvfp4-sqk2::2_node` both set `pp_size: 2` with `--speculative-config '{"method":"qwen3_next_mtp",...}'`. E005 is `confidence: known_bad, enforce: error` and the row at the top of this table already records the verdict as LIVE. The remedy is precedent twice over: #104's own victim `qwen-3.6-27b-nvfp4` was rebuilt as TP (now `qwen-3_6-27b-nvfp4-tp`), and #107 retired `qwen-3.5-122b.yaml` and rebuilt its siblings as TP. These two were missed in that sweep. **This is not a new rule — it is an existing `error`-grade rule with two live violations and no linter to fire it**, which makes it the strongest single argument for WS-3's linter. They fail cheaply, at config validation before any GPU cost, which is why nobody noticed. Also supplies the concrete list the *Convert other `pp_size: 2` recipes to TP* row above has been asking for. |
+| **`qwen-3.8-27b::2_node` rebuilt as TP2 and never run** | **OPEN — needs one deploy, 2026-09-09** | Was MTP + pp_size 2 (E005), no ray flag (E003), and no `image:` at all (E004). Rebuilt TP2 + ray + `image: eugr/spark-vllm-b12x:latest`, matching the shape of its `-nvfp4` sibling. **The rebuild removes a known-dead config; it does not produce a known-good one** -- the sibling's TP2 block is itself unmeasured, so there is no validated 2-node Qwen 3.8 configuration anywhere in the catalog to compare against. Setting `image:` also moved 1_node off `default_image` onto b12x and reset its `config_hash`, since `image` is recipe-level and `build_config_payload()` includes it -- so 1_node wants a confirming run too, not just 2_node. `--dry-run` both, then deploy 1_node, then 2_node. Record whatever comes back in `MODELS.md`, which currently shows both as blank. |
 | `--{side}-tp-size` / `--{side}-pp-size` overrides | **OPEN, would pay for itself** | Would make this comparison a one-off command instead of a permanent second catalog entry each time. |
 
 **Structural constraint, worth knowing before touching `ab_test.py`:** only
@@ -288,6 +357,13 @@ remains, and it now has a customer: the linter.
 | Image cache drift between hosts | **LIVE** | Ray 2.58.0 vs 2.57.0, deterministic across 6/6 attempts on two unrelated recipes. #106, incident #14. |
 | Drift can recur from any other path | **OPEN by design** | `ab_test.py` is fixed; nothing generalizes the guarantee to manual `docker pull` habits or other deploy paths. |
 | **`VLLM_USE_V1=0`: is it required, inert, or harmful?** | **RESOLVED on the current build, 2026-09-03** | `vllm.envs` no longer defines the name at all on `v0.1.dev20482+g83cb22a0e.d20260903` — TOMBSTONES #113, `errata.yaml` E015 (now `enforce: warn`, `confidence: known_bad`, scoped to that exact build string). K9's two-recipe A/B is no longer needed to answer the question; it closed by direct inspection instead. Historical positions (required / no-effect / not-needed, all from the older `builds.original_pin`) are preserved in E015's `positions` list, not deleted. |
+
+### Found 2026-09-09
+
+| Item | Status | Evidence |
+|---|---|---|
+| `qwen-3.8-27b` has no `image:` field | **OPEN — live E003 + E004 violation** | Its `2_node` topology inherits `default_image` (`ngc_default`, `ships_ray: false` in errata's own `images:` block) **and** omits `--distributed-executor-backend ray`. Both rules at once. E004's evidence note reads "Confirmed fixed live on llama-3.3-70b, llama-4-fp4, llama-4-fp8" (#103), and `nemotron-3_5-lightning-bf16`'s header describes adding `image:` proactively "rather than let it recur a third time." This is the fourth instance. Second in line behind the E005 failure in WS-1, which fires earlier. |
+| `VLLM_USE_V1=0` survives in five recipes | **OPEN — E015 violations, but do NOT sweep** | `llama-4-fp4`, `llama-4-fp8`, `llama-4-fp8-tp`, `qwen-2_5-coder-32b`, `_llama-4-fp8-tp-noep`. E015 (`enforce: warn`) covers this and its remedy is explicit: strip **opportunistically as each recipe is re-validated, never as a catalog-wide sweep**, because every `env_vars` change alters `compute_config_hash()` and resets that recipe's launch history — and F-j records two orphaning bumps already. Recorded so the count is known, not as a task. |
 
 ### Why `VLLM_USE_V1=0` is worth the time
 
@@ -330,20 +406,34 @@ half is unbuilt.
 
 | Item | Status | Notes |
 |---|---|---|
-| `errata.yaml` — structured rules with provenance | **LANDED** | 17 rules. Each carries `confidence`, `enforce`, `scope`, and `evidence`. Rules scoped to a specific build or image must not fire outside it. |
+| `errata.yaml` — structured rules with provenance | **LANDED** | 22 rules (E001–E022; was 17 when this row was written). Each carries `confidence`, `enforce`, `scope`, and `evidence`. Rules scoped to a specific build or image must not fire outside it. |
 | Linter reading `errata.yaml` | **OPEN** | Soft warning at `load_recipes()` time or `tools/lint_recipes.py` in CI. **Never a hard failure** — `build_catalog_response()` fails closed and one exception empties the whole catalog (#41). |
 | Render the human tuning reference *from* `errata.yaml` | **OPEN** | Do not maintain both by hand. Maintaining two copies is precisely how `TROUBLESHOOTING.md`'s tuning section came to contradict its own incident log. |
 | Per-recipe/topology `status:` marker | **OPEN** | Schema field defaulting to `unconfirmed`, auto-promoting from `PENDING_LAUNCH_STATE`'s `config_hash`-keyed success tracking, surfaced as a badge in the dashboard dropdown and `dgx-config status`. Prerequisite already paid — see D-2. |
-| Initial `status:` values across the catalog | **UNBLOCKED, 2026-09-03** | The catalog is 24 files in `recipes/local/` — `recipes/eugr/` contains only a `.gitkeep` and is empty, so every doc reference to `recipes/eugr/*.yaml` describes nothing. Readable directly via the GitHub connector. The pass has not been done, but nothing prevents it now. |
+| Initial `status:` values across the catalog | **UNBLOCKED, 2026-09-03** | The catalog is 35 files in `recipes/local/` as of 2026-09-09 (24 when this row was written) — `recipes/eugr/` contains only a `.gitkeep` and is empty, so every doc reference to `recipes/eugr/*.yaml` describes nothing. Readable directly via the GitHub connector. The pass has not been done, but nothing prevents it now. |
 | Unknown-`VLLM_*` boot-log scraper | **OPEN** | Parse the boot log, don't maintain an allow-list — vLLM already emits the warning for the build actually running. Check recipe `env_vars` only; image-inherited hits report differently or not at all. Much cheaper once WS-7's log retention exists. |
 | Normalize `--speculative-config`'s embedded JSON in `config_hash` | **OPEN, small** | The one genuinely live piece of the otherwise-stale ROADMAP hash entry. #92 left it deliberately: flag values are opaque strings to the canonicalizer, so reformatting the JSON inside changes the hash. |
-| Near-duplicate catalog key detection at load | **OPEN** |
+| Near-duplicate catalog key detection at load | **OPEN** | Exact stem collisions already raise; nothing flags edit-distance-close keys or a shared `hf_path`. `find_cached_models()` already computes the `hf_path → catalog_key` map — build it as a shared helper. |
 | Policy-consistency checks are NOT errata rules | **DECIDED 2026-09-08, no code** | `errata.yaml` catalogs things that BREAK — every rule traces to a failure. A recipe exceeding `gpu_util_ceiling` breaks nothing; the cluster simply is not doing what its own config says. It does not clear the `mechanism_confirmed` tier either, since rule 6 requires an observed CONSEQUENCE and the consequence here is a deploy refusal, which is designed behaviour rather than a bug. Filing it as errata would blur what that file means. If `tools/lint_recipes.py` grows this check it belongs in a separate policy-consistency section that reads `cluster_config.yaml` alongside the recipe, not as an `E0xx` rule. Coverage exists at both ends meanwhile: `--dry-run` reports it, and under `enforce: error` the deploy itself refuses, which cannot be skipped. See #139. |
+| **`--speculative-model` alongside `--speculative-config`** | **OPEN — no errata rule covers this yet; two live violations** | `nemotron-3.5-lightning-nvfp4` and `_nemotron-3.5-lightning-nvfp4-tools` both pass it. `_deepseek-v4-flash-vision-exp.yaml`'s header states the diagnosis outright: "This build REJECTS a separate `--speculative-model` flag (confirmed: our nemotron-3.5 recipe crashed on exactly that)." The crash was diagnosed and written down **in a different recipe**, and the broken one was never fixed. That is the linter's case in one sentence: the knowledge existed, in the repo, and did not reach the file that needed it. Proposed as **E023**, `known_bad`, `enforce: error` — distinct from E006/E007, which are DSpark parameter rules. |
+| **`--moe-backend marlin` on a mixed FP8/NVFP4 checkpoint** | **OPEN — proposed E024** | `marlin` is NVFP4-only. The unsloth `Qwen3.6-35B-A3B-NVFP4` quant is mixed (group_0 FP8 for attention/linear_attn/lm_head plus MoE experts on layers 32–39; group_1 NVFP4 for MoE gate/up/down on all layers), and vLLM's resolver refuses it with `moe_backend='marlin' is not supported for unquantized MoE`. Provenance: `qwen-3.6-35b-a3b-nvfp4.yaml`'s header; caused both 2026-09-05 load failures. Remedy: omit the flag, let vLLM auto-select. |
+| **A third ENTRYPOINT-bearing image is in the catalog and absent from errata's `images:` block** | **SUSPECTED, 2026-09-09** | `muse-glimmer-30b` runs `vllm/vllm-openai:nightly` with no `entrypoint: ""`. That base sets `ENTRYPOINT ["vllm","serve"]` — E020's exact mechanism (#133). E020's notes say the `images:` block "now records `entrypoint:` for both known-affected images, so an audit script can resolve this statically for images it already knows"; this is a third affected image and is not in that block. Adding `vllm_openai_nightly` there makes it statically checkable. Not reproduced on hardware. |
+| **Three recipes declare `_TEST` in their header but are not `_`-prefixed** | **OPEN — policy check, explicitly not errata** | `gemma4-26b-a4b-nvfp4-tools`, `muse-glimmer-30b-nvfp4-dflash-tools`, `qwen-3.6-35b-a3b-hauhaucs-nvfp4-nospec`. Per the **DECIDED 2026-09-08** row above, `errata.yaml` catalogs things that BREAK; this breaks nothing. Belongs in `tools/lint_recipes.py`'s policy-consistency section, alongside the `gpu_util_ceiling` check and the stem-dot validator K3 Part 2 already proposes. Note the fix is a **rename**, which orphans ledger keys — do it inside K3's rename pass, not separately. |
+| **E018's `known_intentional` list is missing five live pairs** | **OPEN, trivial** | It lists four. Also sharing an `hf_path` today: `qwen-3.8-27b-nvfp4` / `-sqk2`, `qwen-3.6-35b-a3b-nvfp4` / `-nothink`, `muse-glimmer-30b-nvfp4` / `-dflash-tools`, `gemma4-26b-a4b-nvfp4` / `-tools`, and `_llama-4-fp8-tp-noep` alongside the already-listed `llama-4-fp8` / `-tp`. All intentional; all would fire E018 as unexplained today. |
+| **The prefetcher missed every drafter declared in `--speculative-config`** | **FIXED 2026-09-09** | Independent of the `extra_mounts` row below, in the same file. `cache_cluster_assets.py` found draft models by regexing **`--speculative-model`** out of `vllm_args`. Every working spec-decode recipe declares its drafter inside `--speculative-config`'s JSON, so `z-lab/gemma-4-26B-A4B-it-DFlash`, `google/gemma-4-26B-A4B-it-assistant` and `meta-models/Muse-Glimmer-30B-assistant` were never fetched and the offline deploy failed at load. The only drafters it *did* catch belonged to the two nemotron recipes above — i.e. the ones that cannot launch. Now parses the JSON, and **prints a warning** when it cannot, since silent under-fetch is what made this invisible. |
+| **The prefetcher hardcoded `tetrel` and the cache mount** | **FIXED 2026-09-09** | `run_ssh(meta["ip"], "tetrel", ...)` and a literal `vol_mount`, rather than letting `common/ssh.py` resolve `ssh_user` (pass `None`, as every call site in `dgx-orchestrator.py` does) and reading `load_cluster_config().hosts[host].volume_mount`. #73 class. Agreed with the current config; would not have on another. |
 | Image-ENTRYPOINT mismatch detection | **OPEN, new 2026-09-07** | A recipe whose `image` sets a non-empty ENTRYPOINT but omits `entrypoint: ""` fails at container start with an error naming an unrelated flag (#133: argparse prefix-matched `--block` to `--block-size`). Found only by a failed deploy today. `docker inspect <image> --format '{{.Config.Entrypoint}}'` is the check; it needs registry access or a local pull, so a `load_recipes()` hook is the wrong place -- `tools/audit_recipe_images.py` over the catalog's distinct images, run on demand, is the right one. Two catalog images are known-affected (`ghcr.io/tonyd2wild/vllm-glm53-flash`, `ghcr.io/aeon-7/aeon-vllm-ultimate`), so this is not hypothetical. |
 | `model_path_override` staging has no pre-flight check | **OPEN, new 2026-09-07** | A recipe setting `model_path_override`/`extra_mounts` depends on a manual `huggingface-cli download --local-dir` on **every** target host, with nothing verifying it happened. An unstaged or half-staged directory fails inside the container (ENOENT on a file the mount should have provided) rather than at deploy time. Cheap fix: `test -f <mount_source>/config.json` over SSH per target host before `docker run`, in the same place `_validate_mod_name()` already aborts early. |
-| `cache_cluster_assets.py` only knows the shared HF cache | **OPEN, new 2026-09-07** | The prefetcher assumes every recipe's weights live under the per-host `volume_mount` HF cache. Recipes using `extra_mounts` to stage weights at a separate local path are invisible to it, so "pre-cache assets then go offline" silently under-fetches for them and the offline deploy fails at load with no prior warning. | Exact stem collisions already raise; nothing flags edit-distance-close keys or a shared `hf_path`. `find_cached_models()` already computes the `hf_path → catalog_key` map — build it as a shared helper. |
+| `cache_cluster_assets.py` only knows the shared HF cache | **OPEN, new 2026-09-07** | The prefetcher assumes every recipe's weights live under the per-host `volume_mount` HF cache. Recipes using `extra_mounts` to stage weights at a separate local path are invisible to it, so "pre-cache assets then go offline" silently under-fetches for them and the offline deploy fails at load with no prior warning. **Still open** — the 2026-09-09 pass on this file fixed three other defects in it but not this one, which needs a decision about where staging paths come from. |
 
 ---
+
+### Role-derivation linter (transcribed from `SESSION-HANDOFF-2026-09-06.md` Sec 4 item 6)
+
+| Item | Status | Notes |
+|---|---|---|
+| Grep-shaped check for topology or role decided by host identity, ordering, or count | **OPEN** | Flag any site deriving a topology or role from *which* host or *how many* hosts, rather than from `ContainerRole` or the deployment record. **Would have caught both #127 and #128** — that session found three separate derivations of topology and two were wrong. Belongs alongside the known-bad-flag linter and the per-recipe `status:` marker above; same tool, third rule class. Note the handoff's own architectural conclusion: declarative config is not the guarantee — all three derivations would still have been wrong had each site interpreted a config file for itself. The guarantee is that derived state is computed once, recorded, and **read**. |
+| Extend it to ledger keys, not just topology | **OPEN** | `SESSION-HANDOFF` Sec 4 item 4 and `BACKLOG-dspark` item 5 are the same failure in two different ledgers — `model_ledger.json` keyed on a derived topology, `benchmark_ledger.csv` keyed on a derived model name. Both are "keyed on something derived rather than recorded." The 2026-09-09 pass found two more instances in WS-12. |
 
 ## WS-4 — Ledger and key identity
 
@@ -355,7 +445,8 @@ justify a refactor.
 | **`nemotron-3.5-lightning-bf16` two-key split (#110)** | **CLOSED end to end, 2026-09-03/04** | Duplicate `hf_path` recipe deleted; `errata.yaml` E018 guards the class going forward; `clean_ledger.py` extended, applied to production, verified live-read, committed. See below for the full record. |
 | Naming convergence, dot vs underscore | **DECIDED, sequenced** | Underscore. See below. |
 | `tools/reconcile_ledger.py` (read-only) | **OPEN** | The prerequisite for the rename pass. |
-| `benchmark_ledger.csv` `--model-key` mismatch | **OPEN** | Confirmed once: the DSpark validation run logged under `deepseek-v4-flash-0731-1M` while validating `-dspark`. Fix: have the orchestrator's own benchmark caller always pass `--model-key` derived from the recipe actually being benchmarked, plus warn loudly when the `model_id.split("/")[-1]` fallback matches nothing in the catalog. An audit of existing rows has never been done. |
+| `benchmark_ledger.csv` `--model-key` mismatch | **OPEN — proposed fix already exists; the real defect is elsewhere. Sharpened 2026-09-09.** | Confirmed once: the DSpark validation run logged under `deepseek-v4-flash-0731-1M` while validating `-dspark`. This row previously proposed "have the orchestrator's own benchmark caller always pass `--model-key`". **It already does** — `_run_benchmark_worker()` appends `--model-key` whenever `model_key` is set, and `triggerBenchmarkNow()` posts `{head, nodes, model}`. The defect is the *value*: `triggerBenchmarkNow()` reads `modelSelect.value`, which auto-follows what is serving only until the operator touches it (`modelSelectTouched`, #132). Select a different recipe, click **Run Benchmark Suite Now**, and it benchmarks what is actually serving while logging under the selected key — right measurement, wrong label, no symptom. Fix: send `detectActiveRecipeKey(data)`. A plausible mechanism for the confirmed mislabel, not a proven one. Still true: warn loudly when the `model_id.split("/")[-1]` fallback matches nothing in the catalog, and an audit of existing rows has never been done. |
+| `ab_test.py` benchmark rows never join the catalog — and it is a **third** naming convention | **OPEN, new 2026-09-09** | `run_benchmark_suite()` calls `run_real_benchmark(ip, f"{model_key}-{name}", ...)`, so a catalog passthrough of `qwen-3.6-35b-a3b-nvfp4` logs as `qwen-3.6-35b-a3b-nvfp4-default`. The suffix is deliberate — otherwise multiple prompts in one run overwrite each other — but `enrich_catalog()` looks up the bare `m_key`, so **every ab_test row is invisible to `historical_tps`**. WS-0 item 4 already documents two scratch-naming conventions in this script (`_scratch-{label}` prefix, `{label}-scratch` suffix); this prompt suffix is a third, layered on the second. The docstring's claim that a passthrough "shares its `historical_tps` ledger entry with normal dashboard deploys" is true of the deploy and false of the benchmark. Fix shape: a separate prompt column, or a documented convention that the lookup strips a known preset suffix. |
 | Orphan keys from renames | **Expected, not cleaned** | The ledger keys on stem and never deletes — deliberate. Currently visible: `deepseek-v4-flash-0731-dspark-sm120`, `-dspark-gb10-hazyumps-512k` (renames per #91's own correction), `qwen-3.5-122b::2_node` (recipe retired by #107). |
 
 ### #110: root cause CONFIRMED and the duplicate recipe RESOLVED, 2026-09-03
@@ -560,6 +651,92 @@ shipping: #93–#100.
 
 ---
 
+### Multi-model session tracking (transcribed from `BACKLOG-session-tracker-multi-model.md`, 2026-09-09)
+
+Fallout from #127. Fixing the count-based topo derivation stopped the ledger
+being poisoned with fabricated `<model>::2_node` keys, but did not make the
+tracker able to see two models. It converted **corruption into
+under-counting** — strictly better, and recoverable — and this is the
+remainder. Priority MEDIUM: not a correctness bug and not data loss, but it
+is visible every day now that two independent 1-node deploys are the normal
+operating mode.
+
+| Item | Status | Notes |
+|---|---|---|
+| `SESSION_TRACKER` is one module-level instance with one `self.model` / `self.topo` | **OPEN — the root** | `_compute_cluster_status_impl()` picks a single `serving_host` by iterating `HOSTS` and taking the first with a `STANDALONE`/`HEAD` container, then feeds only that host's `/metrics` to the tracker. The loser is invisible: no tokens, no session, and `session_stats` reports the winner's numbers as the cluster's. The dashboard's `SESSION SPEED` / `system_tps` share the blind spot. |
+| Which host wins is decided by YAML ordering | **OPEN — same root as F-l** | `PRIMARY_HOST = next(iter(HOSTS))`. That ordering is load-bearing and meaningful for the Ray head role; for telemetry it is incidental and silently decides whose tokens count. **Note the concrete example in the source document is now inverted** — it was written when hermes was on spark-4, and the 2026-09-07/08 swap moved it to spark-3. The mechanism is unchanged; the example's host names are stale. |
+| **(1) Make the telemetry host preference explicit** | **OPEN, small, worth doing alone** | Even without multi-model support, `serving_host` selection should state what it chooses and why — most plausibly "prefer the reserved host if it is serving, else the first serving host", so the long-lived service keeps accruing. Self-contained, and removes an invisible dependency on YAML ordering. Do this one first; it is useful whether or not (2) ever happens. |
+| **(2) Per-host tracker instances** | **OPEN, larger** | Replace the global with a dict keyed on host, each with its own model/topo/baselines/flush state, and update every serving host. `_commit_session()` already writes per-`<model>::<topo>` keys, so **the ledger format needs no change** — this is a fan-out at the caller, not a schema migration. |
+
+Three things to watch when doing (2), carried over verbatim in substance:
+
+- `execute_teardown()`'s survivor gate exists because one global tracker
+  could not tell "my host went away" from "some host went away". With
+  per-host trackers that gate gets **simpler** — a host's tracker
+  deactivates when that host is torn down, full stop. Simplify it rather
+  than leaving both mechanisms in place.
+- `session_stats` in `/api/status` is a single object today and
+  `index.html` reads it directly (`latestSessionStats.active`, `.tps`,
+  `.mtp_rate`). Making it per-host is an API shape change: keep a
+  merged/primary view for compatibility, or update the dashboard in the
+  same pass. Do not ship the shape change without one of the two.
+- The 600 s idle timeout and 3600 s flush interval are per-session, so N
+  sessions run them independently. Correct, but it means N times the
+  ledger writes. Fine at N=2; worth a glance if `HOSTS` grows.
+
+Explicitly **not** in scope: revisiting the topo derivation (#127 settled
+it — role-based, from `ContainerRole`, at all three sites; a fourth site
+deriving topology from host counts is a #127 regression, not this item);
+blocking Phase 3 on it (orthogonal, can land either side); and
+reconstructing historically missed tokens as part of the code change (run
+`correct-ledger` against the specific host deliberately instead).
+
+### Out-of-band containers are invisible to `ACTIVE_DEPLOYMENT_STATE`
+
+Transcribed from `SESSION-HANDOFF-2026-09-06.md` Sec 4 item 7 and Sec 8. The
+handoff explicitly asked for this to sit next to the per-host tracker work,
+because both turn on what "a host is serving something" actually means.
+
+| Item | Status | Notes |
+|---|---|---|
+| A container the orchestrator did not launch has no record, and two mechanisms silently assume it does | **OPEN — observed live, not hypothetical** | 2026-09-06 15:51 UTC: spark-3 RUNNING `vllm-standalone` serving `Gemma-4-26B-A4B-NVFP4` with `active_recipe_key: null` and `active_config_hash: null`. Consequence 1: `execute_teardown()`'s survivor gate reads `ACTIVE_DEPLOYMENT_STATE`, so an unrecorded container cannot hold the session open — tearing down the other host computes zero survivors and deactivates `SESSION_TRACKER` while this one keeps serving. Consequence 2: a reserved-host refusal naming such a host falls back to "contents unknown" instead of naming the model. |
+| Making the survivor gate robust is a design change, not a tweak | **OPEN** | It would mean consulting live container state rather than recorded deployment state. The alternative framing, which the handoff preferred: decide whether out-of-band deploys should **register themselves** in `ACTIVE_DEPLOYMENT_STATE`. That fixes the root cause rather than the symptom, and the raw-docker paths exist for legitimate reasons (entrypoint overrides the schema could not express — note that reason has since weakened, since schema 3/5 added `entrypoint` and `launch_argv_prefix`). |
+| **Was hermes deploying through the orchestrator or shelling `docker run`?** | **OPEN QUESTION — needs Ian, decisive check below** | Sets how much weight `ACTIVE_DEPLOYMENT_STATE` can carry as a source of truth, and therefore how urgent the row above is. No longer load-bearing for data integrity: the `model_ledger.json` audit came back clean (22 `::2_node` keys, 17 ok, 5 orphaned-by-rename, **0 fabricated**). |
+
+**The decisive check, verbatim from the handoff.** The orchestrator always
+launches `python3 -m vllm.entrypoints.openai.api_server --model <hf_path>`
+against the image's default entrypoint; a raw `docker run` from either
+script overrides it. So the container records which path created it:
+
+```bash
+ssh spark-3 'docker inspect vllm-standalone   --format "{{.Created}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}|{{.Config.Image}}"'
+cat active_deployment_state.json
+ls -lt run_logs/ | head -20
+```
+
+`active_deployment_state.json` is disk-backed, so a `null` there means the
+deploy was genuinely never recorded rather than lost to a restart. No
+matching `run_logs/` entry corroborates that it never went through
+`_execute_deployment_impl()`.
+
+**One clue, flagged as worth not over-reading:** the served name looked like
+NVIDIA's official checkpoint, not AEON's. `deploy_gemma4_dflash.py` passes
+`--served-model-name gemma4-aeon-uncensored`, which is not what showed;
+`ab_test.py`'s raw-docker path needs an explicit `--a-entrypoint`; and both
+of `ab_test.py`'s recipe paths go through `cli deploy`, which *would* have
+recorded state. **None of the obvious candidates fit cleanly**, which is the
+reason to look rather than guess.
+
+**Caveat carried forward:** the ledger audit's clean result has one residual
+it cannot disprove. For the 17 `ok` models, a 1-node run while the other host
+had a container would have landed poisoned tokens in that model's
+*legitimate* `::2_node` key — same key, same counters, no marker, undetectable
+after the fact. `qwen-3.8-27b-nvfp4` is the one with real exposure. For any
+model whose numbers matter, re-baseline rather than trust. And an
+argument-free `correct-ledger` run while two containers were up used the same
+bad heuristic to pick which key to repair, so past repairs may themselves have
+written to the wrong entry.
+
 ## WS-6 — Mods / derived-image bake
 
 Built and wired. The remaining items are small.
@@ -585,6 +762,7 @@ evidence. Ordered by what each unblocks.
 | Item | Status | Notes |
 |---|---|---|
 | Retain the full vLLM container log per deploy | **OPEN — highest leverage here** | Docker already persists stdout via `json-file`; containers run `-d` without `--rm`, so nothing needs flushing. Design: capture at teardown before `docker rm`, plus a low-frequency incremental `docker logs --since` net (60s, must be incremental). **Do not** `docker logs -f` from the daemon — orphaned children are an existing bug class (#81). Storage: reuse `~/.cache/ray-logs/<deploy_run_id>/<host>/`, with its own `vllm_log_retention_hours` (default 24) — not `crash_log_retention_days`, since Ray dumps are tiny and vLLM logs are not. Keep whole logs initially: a head/tail policy would discard exactly the hours in which slow degradations are visible. **Check first** whether `/etc/docker/daemon.json` sets `log-opts max-size`/`max-file`; if it does, the whole premise changes. |
+| **`earlyoom` as a userspace OOM guard — never evaluated** | **OPEN, new 2026-09-09** | eugr bakes the `earlyoom` daemon into their image with tuned thresholds, exposed as `launch-cluster.sh --earlyoom`. Recorded because we have the problem it addresses and they do not appear to: TOMBSTONES #71 is Ray's memory monitor OOM-killing a worker as unified-memory headroom ran out over hours, WS-9's 512K soak exists to watch for that exact mode, and tonyd2wild's `--kv-cache-memory` finding is their own watchdog killing an engine at 3.06 GB MemAvailable. A killer acting on a threshold we choose, ahead of the kernel's, is a plausible mitigation. **Wants it as a host service, not a mod** — same shape as `drop-caches`: a host-level tool wrapped as a container concern because an on-node container was eugr's only execution surface, and we have an off-node control plane that already runs commands over SSH. Nobody here has run it; the in-container mechanics (host `/proc/meminfo` visible, signalling confined to its own PID namespace) are reasoned, not observed. See `docs/reference/community-sources.md`. |
 | `/api/status` reports nothing about `common/` | **OPEN** | `docker-compose.yml` bind-mounts `.:/app`, so a `common/*.py` edit lands on disk instantly while the daemon keeps running the imported version. `orchestrator_version` cannot catch this — it hashes `dgx-orchestrator.py` only. Cost a real debugging round. Options: a `modules` block hashing what was loaded at import time, or simply always restarting the API container on deploy (cheaper, strictly more reliable). |
 | Engine health monitoring | **Partial** | `_detect_crash_signature()` catches tracebacks and argparse errors. Nothing checks whether the engine **process** is alive — a segfault, OOM-kill, or silent hang produces neither signature. Track the `docker exec -d`'d PID; treat "container RUNNING, engine absent, health never passed" as unambiguously CRASHED. Keep the log scan as a fast path: it reports the *reason*. |
 | `--dry-run` embeds live `HF_TOKEN` | **LANDED 2026-09-08** | #86, #138. Masked at source via `_mask_secret_argv()`, before the argv enters any response dict — so `--dry-run`, `docker_run_commands`, and any future JSON or log surface are safe by construction rather than by the operator remembering. Variable NAMES preserved (you still need to see which credentials a deploy expects) and EMPTY values left visible (`HF_TOKEN=` is real signal that `.secrets` was not picked up). `verify_secret_masking.py` asserts the secret string is ABSENT from the whole output, never that a marker appeared, per #94 — its section 6 reconstructs #94's bug shape and shows the marker test passing on it while the absence test fails. Closes an item open since Task MC, whose standing workaround was "trim it by hand every time". |
@@ -617,6 +795,8 @@ Hardware-gated. Only two items should move before the hardware.
 
 ---
 
+| `CLUSTER_OP_LOCK` is still cluster-global | **OPEN — explicitly Phase 3, not attempted** | A host-scoped teardown serializes against any deploy anywhere, because the lock does not know about hosts. Transcribed from `SESSION-HANDOFF-2026-09-06.md` Sec 4 item 8. Named here rather than in WS-7 because per-host locking is also what removes the need for the `maestro2`-per-pool stopgap (see DIRECTION.md's Phase 3 section), so the two should be scoped together. |
+
 ## WS-9 — DSpark, engines, and image selection
 
 `BACKLOG-dspark-sm120-image.md` is folded in here and can be archived. Its
@@ -628,7 +808,7 @@ survive**, so archiving it without transcribing them would have lost work.
 | DSpark on the GB10-native image | **LIVE, two context sizes** | `hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d` (jasl PR #41834 SM12x enablement, GB10-native prebuilt). `deepseek-v4-flash-0731-dspark` (384K, `max_num_seqs: 4`): 3-pass, temp=0, cold **44.7 tok/s** / TTFT 0.12s, warm avg **42.7 tok/s** / TTFT 0.13s — ~3× the ~14 tok/s stock `eugr/spark-vllm-b12x` baseline, which has no working spec-decode path at all. Confirmed via draft-model load, active Markov sampler, and per-request acceptance metrics, not just a clean boot. Auto-selects FlashInfer SM120 sparse-MLA decode + MARLIN MoE with no explicit backend flags; Ray works. |
 | `orthozany/vllm-jasl-dsv4:pr41834-2026-05-13` | **Dead end, recorded** | x86_64-only, no arm64 build exists, `Exec format error` on GB10. Don't revisit unless an arm64 tag appears. |
 | Catalog trim | **DONE** | The backlog's item 6 recommended cutting `deepseek-v4-flash-0731-b12x-nospec.yaml` and `deepseek-v4-flash-0731-nvfp4.yaml`, leaving `dspark` / `dspark-512k` / `1M`. Verified against the repo: exactly those three remain. `-sm120.yaml` is also gone, confirming #91's rename correction. |
-| **512K long-session soak** | **OPEN** | `deepseek-v4-flash-0731-dspark-512k` (524288, `max_num_seqs: 1`, deliberately conservative) boots and serves, but only a short benchmark — never soaked. Watch specifically for #7's failure mode: Ray's memory monitor OOM-killing a worker as unified-memory headroom runs out over hours. Not production-ready until this runs. |
+| **512K long-session soak** | **OPEN** | `deepseek-v4-flash-0731-dspark-512k` (524288, `max_num_seqs: 1`, deliberately conservative) boots and serves, but only a short benchmark — never soaked. Watch specifically for **#71's** failure mode: Ray's memory monitor OOM-killing a worker as unified-memory headroom runs out over hours. (The `#7` this row previously cited was propagated from `BACKLOG-dspark-sm120-image.md`; the incident is recorded inside #71's Fix section, and `deepseek-v4-flash-0731-dspark-512k.yaml` cites #71 correctly.) Not production-ready until this runs. |
 | **JIT warmup gap** | **OPEN, unquantified** | Several kernels JIT-compile mid-inference on first real requests rather than during startup warmup. Likely explains lower/noisier early-request throughput vs. steady state. Never measured separately. |
 | **Missing tuned FP8 kernel config** | **OPEN** | Shape `N=4096,K=12288` on `NVIDIA_GB10` falls back to generic W8A8 block-FP8. Worth generating a tuned config if the shape proves hot in real traffic. |
 | **Re-benchmark under `probabilistic` sampling** | **OPEN** | Current numbers are one prompt shape under greedy. Third-party data shows acceptance ranging 33% (prose) to 78% (templated bulk generation), so our 38–46% is probably prompt-dependent rather than a ceiling. Use `--repeats` and multiple prompt categories. |
@@ -744,9 +924,10 @@ New 2026-09-07. Three fields landed, `_CONFIG_HASH_SCHEMA` 2 -> 4. See
 | `entrypoint: Optional[str]` | **LANDED** | `docker run --entrypoint` override. `None` = no flag (byte-identical to prior behaviour for every existing recipe); `""` = neutralize the image's ENTRYPOINT; other = executable. `""` vs `None` is load-bearing -- all tests `is not None`, never truthiness. `run_ssh()`'s `shlex.quote()` renders `""` as `''` and preserves it as a real empty arg, round-trip verified. |
 | `model_path_override: Optional[str]` | **LANDED** | Literal `--model` value when it must differ from `hf_path`. `hf_path` stays the recipe's identity for ledger, `_record_hf_path()`, cache bookkeeping, catalog display. Deliberately not unioned with `hf_path` -- collapsing them would surface a container filesystem path where the dashboard shows a repo id. |
 | `extra_mounts: list[str]` | **LANDED** | Additional bind mounts, host-symmetric, applied identically on every target host. Sorted before hashing (unlike `mods`): mounts don't overwrite each other, so order is not semantic. |
-| `launch_argv_prefix` | **LANDED, hardware-validated** |
-| `AB_TEST_USAGE.md` claimed the schema has no entrypoint override | **CORRECTED 2026-09-09** | The doc said an image with a non-stock entrypoint *must* go through `--a-entrypoint` (raw docker run) and called it "a structural limit of the deploy path". True until schema 3. `entrypoint` and `launch_argv_prefix` now exist and `glm-5_3-flash-nvfp4-mtp.yaml` uses both on the normal path. The stale advice pushed users onto raw-docker, which silently disables mods, forbids `--a-nodes 2`, and bypasses the reserved-host guard — so it was not merely out of date, it steered toward the worse path. Instance of WS-0's pattern: docs behind code, in a file nobody re-read after the schema changed. | #140. Schema 4 -> 5. `None` = the historical module path; a `{model}` token is substituted and suppresses `--model`. Required for any multi-node WORKER on an image where `vllm serve` is the entry point -- the module path parses `--headless` and ignores it, then dies on `collective_rpc`. Confirmed by source read (serve.py:146/177/262) BEFORE the fix, then observed in a boot log (serve.py:216) after. Teardown's `pkill` pattern had to widen too, which was not predicted -- see #140. |
-| `_glm-5.3-flash-nvfp4-tp2` deploys | **VALIDATED 2026-09-08** | Serving on spark-3 (head) + spark-4 (worker). 23.1 tok/s warm, TTFT 0.22 s, MTP acceptance 36.9%, two independent benchmark runs. REPRODUCES upstream's ~21.8 tok/s MTP figure. Logged to `benchmark_ledger.csv` under key `GLM-5.3-Flash-NVFP4` — the E019 basename constraint doing its job, since a lowercase mount would have orphaned the entry. |
+| `launch_argv_prefix` | **LANDED, hardware-validated** | #140. Schema 4 -> 5. `None` = the historical module path; a `{model}` token is substituted and suppresses `--model`. Required for any multi-node WORKER on an image where `vllm serve` is the entry point -- the module path parses `--headless` and ignores it, then dies on `collective_rpc`. Confirmed by source read (serve.py:146/177/262) BEFORE the fix, then observed in a boot log (serve.py:216) after. Teardown's `pkill` pattern had to widen too, which was not predicted -- see #140. |
+| `AB_TEST_USAGE.md` claimed the schema has no entrypoint override | **CORRECTED 2026-09-09** | The doc said an image with a non-stock entrypoint *must* go through `--a-entrypoint` (raw docker run) and called it "a structural limit of the deploy path". True until schema 3. `entrypoint` and `launch_argv_prefix` now exist and `glm-5_3-flash-nvfp4-mtp.yaml` uses both on the normal path. The stale advice pushed users onto raw-docker, which silently disables mods, forbids `--a-nodes 2`, and bypasses the reserved-host guard — so it was not merely out of date, it steered toward the worse path. Instance of WS-0's pattern: docs behind code, in a file nobody re-read after the schema changed. |
+| **`tests/ab_test.py`'s own docstring makes the same claim, and was not corrected** | **OPEN, found 2026-09-09** | Its "Structural constraint" section says an image needing a different entrypoint "can only ever go through the raw-docker-run path... **permanently**, until/unless the recipe schema itself grows an entrypoint field." The row above was raised against `AB_TEST_USAGE.md`; the script was never checked. Same consequence, same steer toward the worse path, in the file a user is more likely to read `--help` from than the doc. |
+| `glm-5_3-flash-nvfp4-mtp` deploys | **VALIDATED 2026-09-08** | Serving on spark-3 (head) + spark-4 (worker). 23.1 tok/s warm, TTFT 0.22 s, MTP acceptance 36.9%, two independent benchmark runs. REPRODUCES upstream's ~21.8 tok/s MTP figure. Logged to `benchmark_ledger.csv` under key `GLM-5.3-Flash-NVFP4` — the E019 basename constraint doing its job, since a lowercase mount would have orphaned the entry. |
 | GLM-5.3 at 262,144 context | **VALIDATED 2026-09-09** | 2.67x the context for no measurable throughput cost: 21.3, 23.2, 22.5 tok/s across three 3-pass runs versus 22.3, 23.1 at 98304. The spread within 262144 is larger than the difference between settings. 262144 is also upstream's own shipping TP2 config. The context problem was never memory — nobody had tried the middle between 524288 (refuses to boot) and 98304 (chosen to get it serving). Supersedes the row below. |
 | DFlash2 for GLM-5.3 | **OPEN, the real performance lever** | 46.9 tok/s vs 21.8 for MTP-4 at TP2/262K upstream — 2.15x — at 74.1% acceptance, and it costs ZERO KV pool (layers slot-share the MLA tensors like GLM's own mamba layers), so context is unaffected. NOT a config change: this image's vLLM (`0.1.dev20051+g487ecf187`) ships DFlash1 and predates DFlash2 (upstream PR #52816). Needs a different image plus the 2.2 GB `incoai/GLM-5.3-Flash-DFlash2` drafter staged on both hosts and an `extra_mounts` entry. The schema already supports all of that — this is a staging-and-image project, not a code change. |
 | Do NOT pin `--kv-cache-memory` to vLLM's "fully utilize" suggestion | **DECIDED 2026-09-09** | The engine offers `8017442816` as "to fully utilize gpu memory" and an earlier note in the recipe recommended trying it. Upstream documents that concurrency is bounded by free-memory HEADROOM rather than by the pool: at `4445787956` a 3-way 20K-token prefill drove MemAvailable to 3.06 GB and their anti-OOM watchdog killed the engine. Their shipping pin (3221225472) is deliberately lower than what fits. The heuristic here lands at 2.88 GiB unpinned, close enough that pinning is unnecessary. |
@@ -754,11 +935,12 @@ New 2026-09-07. Three fields landed, `_CONFIG_HASH_SCHEMA` 2 -> 4. See
 | Retire `deploy_gemma4_dflash.py` | **UNBLOCKED 2026-09-09** | Both conditions met: the schema-native recipe is flag-for-flag identical to the script's validated argv AND now benchmarked at the value the script produced. Nothing blocks deletion. |
 | GLM-5.3 context is a fifth of what the recipe claimed | **SUPERSEDED — see the 262,144 row above** | Header claimed ~507K KV pool at fp8 + gmu 0.85. Reality: 524288 does not boot (needs 3.82 GiB KV, has 1.36), engine's own estimate of max reachable length is 119808. Running at 98304 with a 312,785-token pool and 3.18x concurrency. Encoder-cache theory RULED OUT (identical 32242-token budget at both context sizes). Head/worker KV asymmetry (5.09 vs 3.94 GiB) is real and unexplained — under TP2 they should match. Most promising lead, untried: vLLM suggests `--kv-cache-memory=9166886912` to reclaim ~14 GiB the utilization heuristic leaves unused. |
 | `--block-size 2304` is overridden to 4608 | **OPEN, cosmetic today** | The engine sets 4608 "to ensure that attention page size is >= mamba page size" and pads the mamba page 2.86%. The recipe's DeepGEMM-alignment rationale for 2304 therefore does not survive contact with this build. Flag kept (removing it is a separate untested change), comment corrected. |
-| `_glm-5.3-flash-nvfp4-tp2` deploys | **BLOCKED on weight staging** | All three fields set, ray flag removed. `verify_glm_recipe.py` proves the argv shape for both ranks. Not hardware-validated: weight staging to `/var/tmp/glm-5.3-flash-nvfp4` on both hosts was incomplete at time of writing, and the non-Ray `--nnodes`/`--node-rank` path is inferred from upstream, not observed on this image. |
-| Retire `deploy_gemma4_dflash.py` | **BLOCKED on validation** | Its stated reason to exist (no `--entrypoint` field) is gone. `gemma4-26b-a4b-aeon-dflash.yaml` is the schema-native replacement, flag-by-flag diffed against the script's validated argv -- every flag reproduced, no extras, and it launched `READY` on spark-4 2026-09-07. **Do not delete the script until that recipe is also benchmarked**, and note one unverified assumption: the recipe uses `python3 -m vllm.entrypoints.openai.api_server` where the validated script used `--entrypoint vllm` + `serve <path>`. If that module path is absent in AEON's image, the schema has no field to change the argv prefix and this needs a fourth field, not a recipe tweak. |
+| `glm-5_3-flash-nvfp4-mtp` deploys | **SUPERSEDED — see the VALIDATED 2026-09-08 row above** | All three fields set, ray flag removed. `verify_glm_recipe.py` proves the argv shape for both ranks. Not hardware-validated: weight staging to `/var/tmp/glm-5.3-flash-nvfp4` on both hosts was incomplete at time of writing, and the non-Ray `--nnodes`/`--node-rank` path is inferred from upstream, not observed on this image. |
+| Retire `deploy_gemma4_dflash.py` | **DONE 2026-09-10** — file deleted from the repo. Two documentation references remain (`TOMBSTONES.md`, `WORKSTREAMS.md`); both are historical narrative and correct as written. |
+| Retire `deploy_gemma4_dflash.py` | **SUPERSEDED — see the UNBLOCKED 2026-09-09 row above** | Its stated reason to exist (no `--entrypoint` field) is gone. `gemma4-26b-a4b-aeon-dflash.yaml` is the schema-native replacement, flag-by-flag diffed against the script's validated argv -- every flag reproduced, no extras, and it launched `READY` on spark-4 2026-09-07. **Do not delete the script until that recipe is also benchmarked**, and note one unverified assumption: the recipe uses `python3 -m vllm.entrypoints.openai.api_server` where the validated script used `--entrypoint vllm` + `serve <path>`. If that module path is absent in AEON's image, the schema has no field to change the argv prefix and this needs a fourth field, not a recipe tweak. |
 | Argv-prefix override (`python3 -m vllm...` vs `vllm serve`) | **OPEN, contingent** | Only needed if the assumption above fails. Deliberately not built speculatively -- the same discipline `deploy_gemma4_dflash.py`'s docstring applied to `entrypoint`: wait for a second real case. One case is currently hypothetical. |
 | `gpu_util_ceiling_enforce` / `gpu_util_ceiling_exempt` | **LANDED, inert by default** | #139. `cluster_config.yaml` gains `off\|warn\|error` (default `off`, byte-identical to prior behaviour); `RecipeConfig` gains `gpu_util_ceiling_exempt: bool`. Never clamps in any mode — permits, warns, or refuses, never silently serves a different number than the recipe asked for. NOT in `config_hash` (exclusion traced and dated 2026-09-08: it gates whether a deploy proceeds, never what the container runs), so no schema bump and no third orphaning of launch history in three days. |
-| Four recipes exempted, ceiling held at 0.75 | **DONE 2026-09-08** | `_glm-5_3-flash-nvfp4-tp2` (0.85) and the three DeepSeek-V4-Flash recipes (0.80). Deliberately exempt-and-hold rather than raise the ceiling to 0.80: `deepseek-v4-flash-0731-dspark` is the validated production recipe and 0.80 is its measured-good value, but that evidence is one model family on one image — a 0.80 ceiling would assert it generally. Keeping 0.75 and marking four exceptions asserts less. |
+| Four recipes exempted, ceiling held at 0.75 | **DONE 2026-09-08; list corrected 2026-09-09** | `glm-5_3-flash-nvfp4-mtp` (0.85) and three DeepSeek-V4-Flash recipes at 0.80 — `-dspark`, `-dspark-512k` and `_deepseek-v4-flash-vision-exp`. **Not** `-1M`, which is 0.75 and carries no exemption; the identical wording in `UsageShortcut.md` had the same two errors, so one copied the other. Deliberately exempt-and-hold rather than raise the ceiling to 0.80: `deepseek-v4-flash-0731-dspark` is the validated production recipe and 0.80 is its measured-good value, but that evidence is one model family on one image — a 0.80 ceiling would assert it generally. Keeping 0.75 and marking four exceptions asserts less. |
 | Flip `gpu_util_ceiling_enforce` past `off` | **OPEN, deliberate** | The audit is done and the four exemptions are in, so `warn` then `error` should both be no-ops for the current catalog. Left off until someone wants it, because turning it on is a decision and the machinery exists precisely so it can be one. |
 
 ## WS-11 — Reserved-host protection: state correctness and control surfaces
@@ -797,6 +979,42 @@ arrangement, and four separate pieces of code still assumed one. Same root as
 | `launch_history` before 2026-09-06 is incomplete | **OPEN — feeds D-2** | Not sparse: CLI-only and non-`serving_host` deploys recorded nothing. Absence is not evidence a recipe never launched. See D-9's counter-pressure. |
 | `resolve_deploy_head()` silently substitutes on falsy `head` | **OPEN, small** | An empty-string `head` falls through to `DEFAULT_DEPLOY_HOST`. It was hypothesis (2) in #132's investigation and could not be ruled out by reading — a request that names a target and gets a different host should fail loudly, not substitute. |
 | Reserved-host guard does not cover raw `docker run` over SSH | **OPEN, by construction** | Bypasses the orchestrator entirely. `tests/ab_test.py` does its own check for this reason; anything hand-rolled will not. |
+
+---
+
+## WS-12 — Benchmark harness: the hand-run path and the orchestrator path diverge
+
+New 2026-09-09. Written after reading `benchmark.py`,
+`_run_benchmark_worker()`, `execute_standalone_benchmark()`,
+`BenchmarkRequest`, `triggerBenchmarkNow()` and `tests/ab_test.py` end to
+end — not from the comments describing each other.
+
+**The headline is narrower than it first looked, and better.** The
+orchestrator builds `["--host", head_ip, "--nodes", str(nodes)]` and appends
+`--model-key` when it has one, and `triggerBenchmarkNow()` posts
+`{head, nodes, model}` — so **every orchestrator-driven benchmark already
+passes all three arguments**. What remains is the hand-run path and a set of
+labelling questions.
+
+| Item | Status | Notes |
+|---|---|---|
+| **A 2-node `--dry-run` previews only the Ray bootstrap, never the engine** | **OPEN — confirmed on hardware 2026-09-10** | `docker_run_commands` for a 2-node deploy contains two containers running `ray start --head` and `ray start --address=...` and nothing else. The engine is `docker exec`'d in after the Ray cluster forms, so `--model`, `tp_size`/`pp_size` and **every `vllm_args` flag are absent from the preview**. Consequences: (a) `USERMANUAL.md` tells you to `--dry-run` before trusting a deploy-path change, which is materially weaker for 2-node than the text implies; (b) **no errata rule about `vllm_args` — E003, E005, E023, E024, E025 — is checkable from a 2-node dry run**, which removes the cheapest possible enforcement point for exactly the rules with live violations; (c) any verification harness asserting 2-node engine argv is asserting against something the orchestrator never emits at this stage. Fix shape: have `execute_deployment(dry_run=True)` also render the deferred `docker exec` argv into the payload under a separate key. It is pure construction like the rest of the dry run, and it is what makes the linter's rules previewable. |
+| `benchmark.py --host` defaults to the literal `10.0.14.43` | **OPEN, hand-run path only** | Not a hostname, not config-derived — an IP that is `spark-4` only under the current config, and since the 2026-09-07/08 host swap it points at the **worker**, i.e. the node with no guarantee of anything answering (see F-l). A hand-run `python3 benchmark.py` benchmarks whatever is at that address regardless of where the model serves, and `UsageShortcut.md` documented exactly that bare invocation. Same defect class as #66/#141, both fixed by reading the backend's live `serving_host`; the script never was. Fix: default `None` and resolve from `cluster_config.yaml` or `/api/status`, or make it required. |
+| `head_ip` falls back to `PRIMARY_HOST_IP` for an unrecognised host | **OPEN, small** | `head_ip = HOSTS[head]["ip"] if head in HOSTS else PRIMARY_HOST_IP`, in both `_run_benchmark_worker()` and `execute_standalone_benchmark()`. A request naming an unknown host silently benchmarks the primary host. Same silent-substitution class as WS-11's open `resolve_deploy_head()` row — likely the same fix. |
+| `benchmark_results.txt` has one writer, and it is not `benchmark.py` | **OPEN — inconsistent, not broken** | `_run_benchmark_worker()` writes it from captured stdout on success; `benchmark.py` writes only the ledger, and its comment says why — two writers on one path meant the loser's content silently won. A hand-run produces a ledger row and no results file. **The naive fix recreates the documented race.** One writer per path, either direction: an opt-in output path the orchestrator does not pass, or move ownership to `benchmark.py` and drop the orchestrator's write. The second is cleaner but changes the deploy path, so it wants `--dry-run` behind it. Either way the two must agree on **content** — the orchestrator's version captures per-pass lines, so a standalone writer emitting only the summary would close the gap in name only. |
+| `benchmark_results.txt` carries no timestamp, and a failed run leaves the previous one in place | **OPEN, quietly bad** | On non-zero exit the worker returns early — "leave the last good `benchmark_results.txt` untouched" — defensible alone. But the file is raw stdout and its summary block carries only `model_id` and `temperature`. **No date anywhere.** A stale file from a different model is indistinguishable from a fresh one. `BENCHMARK_STATE["last_run"]` holds the timestamp but dies with the daemon. Whichever writer is chosen above, add a timestamp and the resolved target host. |
+| `--nodes` is a ledger label with no functional effect | **OPEN, small, silent** | Default `2`; used only for the `Nodes` column. A hand-run 1-node benchmark without `--nodes 1` is recorded as 2-node permanently, no symptom. |
+| `ab_test.py` labels every benchmark row `--nodes 1`, including 2-node runs | **OPEN, new 2026-09-09** | `run_real_benchmark()` builds its argv with a literal `"--nodes", "1"`. A pure named-recipe passthrough CAN be 2-node (`--{side}-nodes 2`, supported since #105), and its ledger row is then wrong about the topology it measured. Compounds the row above: `--nodes` is a label nothing functional reads, so nothing catches it. Not fixed in the 2026-09-09 doc pass because threading `nodes` through `run_stage` -> `run_benchmark_suite` -> `run_real_benchmark` is three signature changes on a path that cannot be exercised without a cluster. Fix alongside the prompt-suffix key issue in WS-4 -- same function, same ledger row. |
+| Warm result is a mean of two passes, reported and stored as one number | **OPEN, narrower than it looks** | Three passes, run 1 cold, runs 2–3 averaged; pass count is not a flag. **`tests/ab_test.py --repeats N` already implements F-o's interval discipline properly** — independent redeploys with an aggregate printing `n`, mean, `range=min-max` and every value. The gap is that the cheap path (`benchmark.py` directly, and every orchestrator-driven run) cannot express a range while the expensive path can. Consider per-pass values in the ledger so a single run is at least honest about its own spread. |
+| Long operations check writability never | **Cross-reference, see WS-7** | WS-7's 2026-09-09 row covers it — a completed 3-pass run lost to a root-owned `benchmark_ledger.csv`. Named here because it is the same file and belongs in the same edit. |
+
+**Not defects, recorded so they are not re-investigated:** the 1200 s
+subprocess ceiling and the `BENCHMARK_STATE["running"]` re-entry guard are
+both deliberate and documented — without the timeout a wedged socket pins the
+dashboard button on "BENCHMARKING IN PROGRESS" until the daemon restarts.
+`ab_test.py`'s reserved-host refusal with no `--force` of its own is also
+deliberate, with the rationale in a comment, and WS-7 already carries its
+consequence as a K12 blocker.
 
 ---
 
@@ -995,12 +1213,14 @@ RecipeConfig.entrypoint / model_path_override / extra_mounts   LANDED (WS-10)
   ├─> WS-3's image-ENTRYPOINT linter has something to recommend  ← unblocked
   │    (a linter that can only say "this will fail" and not "set
   │     entrypoint: \"\"" is worth much less)
-  ├─> _glm-5.3-flash-nvfp4-tp2 deployable   ← BLOCKED: weight staging
-  │    on BOTH hosts, manual, unverified by anything in the code
-  └─> deploy_gemma4_dflash.py retirable     ← BLOCKED: recipe launched
-       READY but never benchmarked, and carries one unverified
-       module-path assumption that would need a FOURTH schema field
-       if it turns out wrong
+  ├─> glm-5_3-flash-nvfp4-mtp deployable    ← CLEARED 2026-09-08: staged,
+  │    deployed, VALIDATED at 23.1 tok/s warm (WS-10)
+  └─> deploy_gemma4_dflash.py retirable     ← CLEARED 2026-09-09: the
+       schema-native recipe is flag-for-flag identical AND now
+       benchmarked (49.2/49.2/48.8 warm). The unverified module-path
+       assumption did NOT fail, so no fourth schema field was needed
+       for this case -- launch_argv_prefix landed later for the
+       multi-node headless worker case instead (#140).
 
 counter-pressure, same shape as D-2's:
 _CONFIG_HASH_SCHEMA 2 -> 3 -> 4 in one session ──(orphans every hash)──>
@@ -1225,7 +1445,7 @@ keeps getting lost.
 > launched from the dashboard or CLI but are known or suspected to fail,
 > wasting a real cold-start cycle (sometimes 30+ minutes).
 >
-> `errata.yaml` already exists and holds 17 rules distilled from real
+> `errata.yaml` already exists and holds 22 rules distilled from real
 > incidents, each with `confidence`, `enforce`, `scope`, and `evidence`.
 > **You are building the consumer, not the rules.** Do not invent new rules;
 > new ones come from real incidents only.
@@ -1396,7 +1616,36 @@ keeps getting lost.
 > qwen-3.8-27b-nvfp4.yaml         -> qwen-3_8-27b-nvfp4.yaml
 > qwen-3.8-27b-nvfp4-sqk2.yaml    -> qwen-3_8-27b-nvfp4-sqk2.yaml
 > nemotron-3.5-lightning-bf16.yaml -> DELETE (duplicate, see (a))
+> qwen-3.6-35b-a3b-nvfp4.yaml     -> qwen-3_6-35b-a3b-nvfp4.yaml
+> qwen-3.6-35b-a3b-nvfp4-nothink.yaml -> qwen-3_6-35b-a3b-nvfp4-nothink.yaml
+> qwen-3.6-35b-a3b-hauhaucs-nvfp4-nospec.yaml -> qwen-3_6-35b-a3b-hauhaucs-nvfp4-nospec.yaml
+> _nemotron-3.5-lightning-nvfp4-tools.yaml -> _nemotron-3_5-lightning-nvfp4-tools.yaml
 > ```
+>
+>
+> Separately, three recipes declare `_TEST` in their HEADER but have no `_`
+> FILENAME prefix, so the dashboard shows them as production:
+>
+> ```
+> gemma4-26b-a4b-nvfp4-tools.yaml              -> _gemma4-26b-a4b-nvfp4-tools.yaml
+> muse-glimmer-30b-nvfp4-dflash-tools.yaml     -> _muse-glimmer-30b-nvfp4-dflash-tools.yaml
+> qwen-3.6-35b-a3b-hauhaucs-nvfp4-nospec.yaml  -> _qwen-3_6-35b-a3b-hauhaucs-nvfp4-nospec.yaml
+> ```
+>
+> Folded into this pass rather than done standalone (decision 2026-09-09)
+> because a rename orphans the ledger key, which is the whole problem this
+> pass exists to handle. **Check first whether each is still a test** --
+> `gemma4-26b-a4b-nvfp4-tools` in particular looks production-shaped, and
+> dropping `_TEST` from its header may be the correct fix rather than
+> renaming the file. Note the third also needs the dot->underscore change,
+> so it is one rename, not two.
+>
+> The last four were added to the catalog after this list was written
+> (2026-09-09 audit; the catalog grew 24 -> 35 in the same period). **A
+> periodic rename pass cannot converge against a catalog adding dot-form
+> names faster than the list is maintained** — which is the argument for
+> doing the load-time validator below FIRST, then running the rename once
+> against whatever the validator has stopped growing.
 >
 > Then add a load-time validator rejecting `.` in a recipe stem, so
 > recurrence is structurally impossible rather than a convention.
@@ -1996,6 +2245,12 @@ Ordered by value, not by workstream.
 | 13 | **`gemma-4-31b` runs unquantized** — 6.7 tok/s; NVFP4 should land near Muse Glimmer's 21.4 | REFERENCE-decode-speeds | quantization work, untested |
 | 14 | **Retire `deploy_gemma4_dflash.py`** — both conditions met | WS-10 | deletion |
 | 15 | **`d8401e1a` reserved-host work has no workstream entry** — only its author can write it | F-l | needs that session |
+| 16 | **Two Qwen 2-node topologies are dead on arrival** — MTP + PP2, E005's documented hard failure; the same fix was applied twice elsewhere and these were missed | WS-1, WS-3 | rebuild as TP or drop the topology |
+| 17 | **`nemotron-3.5-lightning-nvfp4` carries a flag whose crash report is written up in another recipe** | WS-3 | one line each, plus errata E023 |
+| 18 | **`qwen-3.8-27b` has no `image:`** — fourth recurrence of the default_image-has-no-Ray trap (E003/E004) | WS-2 | one line |
+| 19 | **`benchmark.py --host` defaults to a hardcoded IP** — since the host swap it aims at the worker; hand-run path only | WS-12 | small |
+| 20 | **`benchmark_results.txt` is written only on the orchestrator path and carries no timestamp** — a failed run leaves a stale file indistinguishable from fresh | WS-12 | pick the single writer deliberately |
+| 21 | **Two benchmark paths label ledger rows with keys that cannot join the catalog** — the dashboard sends the form's model, `ab_test.py` suffixes the prompt name | WS-12, WS-4 | small each |
 
 **Not on this list, deliberately:** extending `tests/ab_test.py` so a
 MTP-vs-DFlash2 or tools-parser comparison is a single repeatable invocation
@@ -2165,7 +2420,47 @@ against a framing presented as settled before it can even start, and the
 only reason this one was recoverable is that the receiving session knew
 better and said so.
 
-**F-l — the d8401e1a reserved-host feature still has no workstream entry.**
+**F-l — ANSWERED 2026-09-09 by the operator; the reserved-host rationale
+generalizes, and one coupling remains unenforced.**
+
+**Why `spark-4` was the reserved node:** it was the head. The head always has
+something running on it that will answer; a worker cannot be relied on to.
+Reserving it protected the one node guaranteed to serve a response.
+
+**That makes reserved-ness a derived property, not a per-host preference.**
+The rule is *reserve the node guaranteed to answer*, which is the head, which
+is the first entry under `hosts:`. It follows that `hosts:` ordering,
+`role: head` and `reserved: true` move together, and that
+`default_deploy_target` is always the other node — which is what
+`common/config.py` already validates.
+
+**The 2026-09-07/08 swap therefore follows the rule rather than breaking
+it.** `hosts:` was reordered so `spark-3` is first; `spark-3` became head,
+became the guaranteed-answering node, and became `reserved: true`, with
+`default_deploy_target: spark-4`. This file already uses that layout
+throughout. Documents written before the swap —
+`SESSION-HANDOFF-2026-09-06.md` §3, TOMBSTONES #131's trap description,
+`BACKLOG-session-tracker-multi-model.md`'s prose example — describe the
+earlier arrangement correctly for their date and are stale, not wrong.
+
+**Still open: the coupling, not the decision.** Nothing in code ties `hosts:`
+order to `reserved:`. A future edit reordering one without the other yields a
+cluster where the reserved node is not the head — the exact arrangement this
+rationale exists to prevent — and `common/config.py` would not object,
+because it validates only that `default_deploy_target` is not reserved.
+`SESSION-HANDOFF-2026-09-06.md` §6 named the shape before the rationale was
+known: node identity as a function of YAML ordering is "an accident rather
+than a declaration." It is a declaration now. Cheap check for
+`load_cluster_config()`: warn when the first host is not the reserved one.
+This rationale belongs in `DIRECTION.md` as a decision of record, not only in
+an open-flags section meant to shrink.
+
+**Still unrecovered, and still only answerable by whoever decided it:**
+whether scoped teardown was designed for the resident-agent workflow or
+arrived at afterwards.
+
+**Original text of this flag, retained:** the d8401e1a reserved-host feature
+still has no workstream entry.
 Narrowed from F-k, not closed. WS-11 covers the 2026-09-07 corrections built
 on top of it (#129-#132) and is first-hand; the feature underneath it --
 `reserved:`, `default_deploy_target:`, `check_reserved_hosts()`,

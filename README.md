@@ -1,180 +1,449 @@
-= DGX Cluster Control Plane (`orchestrator`) — Recipe-Based Blackwell Architecture Edition =
-This repository contains the `dgx-config` orchestration suite. It acts as the central control plane for managing distributed vLLM deployments across a twin-node RoCEv2 NVIDIA Grace Blackwell fabric.
+# DGX Cluster Control Plane (`orchestrator`)
 
-== Target Infrastructure & Control Plane Mapping ==
+Recipe-based control plane for managing distributed vLLM deployments across an
+NVIDIA Grace Blackwell (GB10) DGX Spark cluster. Provides a FastAPI
+orchestration daemon, a web dashboard, and the `dgx-config` CLI wrapper.
 
-=== 1. What Runs Where ===
+**Setting up a new control station?** → **[`docs/INSTALL.md`](docs/INSTALL.md)**.
+That guide is written to be followed from scratch on any LAN, not just this one.
 
-* '''`maestro` (Control Station & Web Dashboard Host):'''
- '''Role:''' Central control node. Runs the Docker container stack for the web dashboard, API endpoints, and the `dgx-config` delegate wrapper.
- '''Web Dashboard (Nginx):''' Runs in the `dgx-dashboard-ui` container on port `5000` (`http://maestro:5000`).
- '''API Orchestration Daemon:''' Runs in the `dgx-orchestrator-api` container on port `5001`.
- '''Containerized Environment:''' The Python application is fully isolated within a `python:3.12-slim` image, bypassing PEP 668 host constraints.
-* '''`spark-4` (Head Compute Node):'''
- '''Management IP:''' `10.0.14.43` (`spark-9dbe`).
- '''Role:''' Primary vLLM head execution target (`vllm-head` / `vllm-standalone`).
- '''Hardware:''' NVIDIA Grace Blackwell GB10 (128GB LPDDR5x Unified Memory running headless).
- '''Docker Boot Policy:''' Docker auto-start is disabled to prevent GPU driver panics or OOM loops on host reboot. Start manually via `systemctl start docker`.
-* '''`spark-3` (Worker Compute Node):'''
- '''Management IP:''' `10.0.14.41` (`spark-6e63`).
- '''Role:''' Distributed vLLM worker execution target (`vllm-worker`).
- '''Hardware:''' NVIDIA Grace Blackwell GB10 (128GB LPDDR5x Unified Memory running headless).
- '''Docker Boot Policy:''' Docker auto-start is disabled. Start manually via `systemctl start docker`.
-* '''Host Model Cache Storage:''' `/home/tetrel/.cache/huggingface` is mapped directly to `/root/.cache/huggingface` inside vLLM containers via `volume_mount` to guarantee zero re-downloads across cold restarts. The same host cache root also derives the JIT-compile cache mounts for Triton, TileLang, DeepGEMM, and vLLM (`/root/.cache/{triton,tilelang,deepgemm,vllm}`) plus `/root/.nv/ComputeCache` for the CUDA compute cache. Use `dgx-config cache-inventory` to see current usage per host, and `dgx-config prune-cache` to reclaim space when a host runs low (see CLI reference below).
+---
 
-== Configuration ==
+## Contents
 
-`cluster_config.yaml`, at the repo root, is the single source of truth for:
+- [What runs where](#what-runs-where)
+- [Configuration](#configuration)
+- [Model catalog](#model-catalog)
+- [Deployment & topology architecture](#deployment--topology-architecture)
+- [Network fabric & transport](#network-fabric--transport)
+- [Grace Blackwell (GB10) hardware safeguards](#grace-blackwell-gb10-hardware-safeguards)
+- [Installation](#installation)
+- [User onboarding & key authorization](#user-onboarding--key-authorization)
+- [Interface reference](#interface-reference)
+- [Operational documentation](#operational-documentation)
 
-* '''`hosts:`''' — host inventory (management IP, backplane IP, volume mount, `active` flag). Loaded via `common/config.py`.
-* '''`ports:`''' — `vllm_api`, `orchestrator_api`, `ray`, `master`.
-* '''`tuning:`''' — deploy-time knobs (`shm_size_1node` / `shm_size_2node`, `gpu_clock_lock`, `deploy_wait_timeout_sec`, `jit_cache_maxsize_bytes`).
+---
 
-== Model Catalog ==
+## What runs where
 
-The catalog lives in `recipes/local/*.yaml` and `recipes/eugr/*.yaml` — one file per model. `models.yaml` is deprecated (supported via `USE_LEGACY_CATALOG=1`). This is a living, growing set: new variants (different precisions, context/throughput tradeoffs, single-node vs. multi-node builds of the same base model) get added as needed, not on a fixed schedule — treat `dgx-config status` or the dashboard dropdown as the source of truth over any static documentation, including this file.
+### `maestro` — control station & dashboard host
 
-=== Recipe Schema ===
+Central control node. Runs the Docker Compose stack; needs no GPU.
+
+| Component | Container | Port |
+| --- | --- | --- |
+| Web dashboard (nginx) | `dgx-dashboard-ui` | `5000` |
+| API orchestration daemon | `dgx-orchestrator-api` | `5001` |
+
+The Python application is fully isolated inside a `python:3.12-slim` image,
+bypassing PEP 668 host constraints. The repo directory is bind-mounted to
+`/app`, so a code edit on `maestro` takes effect on the next container restart
+without a rebuild.
+
+The dashboard is served on `5000` but its JavaScript calls the API at
+`http://<same hostname>:5001/api` (`API_PORT` in `html/index.html`). **Both
+ports must be reachable from the browser** — opening only `5000` gives a page
+that loads and then reports "API Connection Lost".
+
+### Compute nodes
+
+Host roles are **read from `cluster_config.yaml`, not hardcoded**.
+`PRIMARY_HOST` / `SECONDARY_HOST` / `PRIMARY_HOST_IP` in `dgx-orchestrator.py`
+are derived from the first/second entry under `hosts:` (see
+`docs/TOMBSTONES.md` #73). Pointing the orchestrator at a different host pair is
+a config change, not a code change.
+
+Current cluster, as declared in `cluster_config.yaml`:
+
+| Host | Alias | Management IP | `role:` | Notes |
+| --- | --- | --- | --- | --- |
+| `spark-3` | `spark-6e63` | `10.0.14.41` | `head` | Listed first → `PRIMARY_HOST`. `reserved: true` (carries the resident hermes agent) |
+| `spark-4` | `spark-9dbe` | `10.0.14.43` | `worker` | `default_deploy_target` — where an unqualified 1-node deploy lands |
+
+Both are NVIDIA Grace Blackwell GB10, 128 GB LPDDR5x unified memory, running
+headless.
+
+**Docker boot policy:** Docker auto-start is disabled on both nodes to prevent
+GPU driver panics or OOM loops on host reboot. Start manually with
+`systemctl start docker`.
+
+**Host model cache:** `/home/tetrel/.cache/huggingface` is mapped to
+`/root/.cache/huggingface` inside vLLM containers via each host's
+`volume_mount`, guaranteeing zero re-downloads across cold restarts. The same
+host cache root also derives the JIT-compile cache mounts for Triton, TileLang,
+DeepGEMM and vLLM (`/root/.cache/{triton,tilelang,deepgemm,vllm}`) plus
+`/root/.nv/ComputeCache` for the CUDA compute cache.
+
+---
+
+## Configuration
+
+`cluster_config.yaml` at the repo root is the single source of truth, loaded and
+validated by `common/config.py`. Validation is strict and happens at load — a
+bad value raises with the file path and the specific problem rather than
+falling back to a default.
+
+| Key | Purpose |
+| --- | --- |
+| `ssh_user` | Account the orchestrator SSHes into the compute nodes as |
+| `ssh_key_name` | Filename of the shared cluster key, expected at the repo root |
+| `default_image` | Cluster-wide container image; overridable per recipe |
+| `gpu_util_ceiling` | Advisory ceiling on a recipe's `gpu_util` |
+| `gpu_util_ceiling_enforce` | `off` (default) / `warn` / `error` |
+| `default_deploy_target` | Host an unqualified **1-node** operation lands on |
+| `global_hf_hub_offline`, `global_transformers_offline` | Cluster-wide offline switches, toggled at runtime by `/api/toggle-network` |
+| `ports:` | `vllm_api`, `orchestrator_api`, `ray`, `master` |
+| `container_names:` | `standalone`, `head`, `worker` |
+| `hosts:` | Per-host inventory — `alias`, `role`, `management_ip`, `backplane_ip`, `volume_mount`, `active`, `reserved` |
+| `network:` | `topology`, `interface`, `nccl_ib_hca` |
+| `tuning:` | Deploy-time knobs — see below |
+
+### Host roles vs. host purpose
+
+Two keys control where unqualified work lands and what it is allowed to
+disturb. Both are optional; omit them and the orchestrator behaves exactly as it
+did before they existed.
+
+- **`default_deploy_target:`** (top level) — which host a 1-node operation goes
+  to when nothing names one. Affects `deploy` with no `--head`,
+  `tests/ab_test.py` with no `--host`, and the interactive menu's default
+  selection. **2-node deploys are not affected**: the Ray head stays on the
+  first host listed under `hosts:`, so the head node is consistent across
+  topologies. Unset, this falls back to that same first host.
+
+  This key exists because the first host under `hosts:` was doing two unrelated
+  jobs — naming the structural head node and the telemetry-authoritative serving
+  host, *and* acting as the fallback target for anything unqualified. Those
+  conflict as soon as one node holds something long-lived: the node you most
+  want to stay authoritative is also the node a bare `deploy` would flatten.
+
+- **`reserved: true`** (per host, under `hosts:`) — marks a host as carrying
+  something that must not be disturbed by routine work. Deploy and teardown both
+  refuse to touch it without `--force`, including whole-cluster teardowns. This
+  is a property of the **machine**, not of any deployment: unlike `role:`, which
+  describes a host's part in one particular topology, being reserved is a
+  statement about what the box is for.
+
+`default_deploy_target` is validated at load to name a known, `active: true`,
+**non-reserved** host. A reserved default target would be self-defeating — every
+unqualified deploy would land on the one host that then refuses it.
+
+Note that 2-node deploys always span both hosts, so any 2-node work needs
+`--force` while either host is reserved, and will take that host's service down.
+That is intended: it should be a decision, not a surprise.
+
+### `tuning:` knobs
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `shm_size_1node` / `shm_size_2node` | `16gb` / `64gb` | `--shm-size` passed to `docker run` |
+| `gpu_clock_lock` | `300,1800` | Passed to `nvidia-smi -lgc` before every deploy, for benchmark consistency |
+| `deploy_wait_timeout_sec` / `deploy_poll_interval_sec` | `900` / `15` | `wait_for_cluster_ready()` budget and cadence under `--wait` / `--benchmark` |
+| `jit_cache_maxsize_bytes` | `10737418240` | `CUDA_CACHE_MAXSIZE` for the mounted JIT cache |
+| `debug_launch_blocking` | `false` | Sets `CUDA_LAUNCH_BLOCKING=1`. Costs real decode throughput — only for chasing a live repro |
+| `crash_log_retention_days` | `7` | Age-based retention for persisted Ray/crash logs |
+
+Omitting the `tuning:` section entirely keeps an older config working unchanged.
+
+---
+
+## Model catalog
+
+The catalog lives in `recipes/local/*.yaml` — one file per model. A recipe's
+catalog key is its filename stem and nothing else; there is no `name:` field
+inside the YAML to drift out of sync with it.
+
+This is a living, growing set: new variants (different precisions,
+context/throughput tradeoffs, single-node vs. multi-node builds of the same base
+model) get added as needed, not on a fixed schedule. **Treat `dgx-config status`
+or the dashboard dropdown as the source of truth over any static documentation,
+including this file.**
+
+### Recipe shape
+
+`common/recipes.py` is the authoritative schema — the model there carries the
+full field set with rationale comments. A representative recipe
+(`recipes/local/gemma4-26b-a4b-nvfp4.yaml`, trimmed):
 
 ```yaml
-recipe_version: '1'
-hf_path: org/Model-Name
-image: eugr/spark-vllm-b12x:latest
+recipe_version: "1"
+hf_path: nvidia/Gemma-4-26B-A4B-NVFP4
+image: eugr/spark-vllm:latest      # overrides cluster_config.yaml's default_image
 gpu_util: 0.75
-capability:
-  task: null
-  context_class: null
-  latency_class: null
 mods: []
+notes: >
+  Free-form. Surfaced in the dashboard under the metadata strip.
 topologies:
-  2_node:
-    max_model_len: 393216
-    tp_size: 2
+  1_node:
+    max_model_len: 32768
+    tp_size: 1
     pp_size: 1
-    env_vars: [...]
+    env_vars: []
     vllm_args: >-
-      --trust-remote-code ...
-
+      --quantization modelopt --kv-cache-dtype fp8 --trust-remote-code
 ```
 
-== Deployment & Topology Architecture ==
+Optional fields, all verified against `common/recipes.py`:
 
-=== 1. Dynamic Container Image Resolution ===
-Image tags are not hardcoded into the Python orchestrator. `cluster_config.yaml` declares a global `default_image` ensuring cluster-wide updates only require a YAML change. Individual recipes can override this with a model-level `image:` key.
+| Field | Purpose |
+| --- | --- |
+| `image:` | Overrides `cluster_config.yaml`'s `default_image` |
+| `entrypoint:` | Passed to `docker run --entrypoint`. `""` neutralizes the image's own ENTRYPOINT — required for anything built on the official `vllm/vllm-openai` base. Absent and `""` are different launches; test with `is not None`, never truthiness |
+| `model_path_override:` | The literal `--model` argv value, when it must be a local directory rather than an HF repo id. Its last path segment must match `hf_path`'s basename, case included |
+| `extra_mounts:` | Extra `-v` bind mounts, applied identically on every host. Usually paired with `model_path_override` |
+| `launch_argv_prefix:` | The argv before the engine flags. Default is `python3 -m vllm.entrypoints.openai.api_server`; a multi-node worker needs `["vllm", "serve", "{model}"]`, because only `vllm serve` honours `--headless` |
+| `gpu_util_ceiling_exempt:` | Standing permission to exceed `gpu_util_ceiling`. Excluded from `config_hash` |
+| `mods:` | Bare directory names under `mods/`, resolved and baked into a derived image tag before launch. **Order-significant** |
+| `capability:` | `task` / `context_class` / `latency_class`. Reserved for Phase 4, deliberately inert |
+| `notes:` | Free-form; surfaced in the dashboard |
+| `topologies.<n>.cluster_only:` | Recipe-authoring metadata. Currently inert — read by nothing |
 
-=== 2. Global Multi-Model GPU VRAM Teardown Guard ===
-To prevent multiple vLLM models from stacking on the same GPU and causing immediate CUDA Out-Of-Memory (OOM) or port `8000` conflicts:
+`compute_config_hash()` is at schema 5. It covers everything that changes what
+actually launches; `capability`, `notes` and `gpu_util_ceiling_exempt` are
+excluded. Every schema bump orphans existing launch history, which is why
+recipes periodically revert to showing as never-launched.
 
-* '''Pre-Deployment Purge:''' Before spawning any container, `execute_deployment` tears down any existing containers across all target nodes first. Teardown is graceful, not an immediate kill: it sends SIGTERM to host processes and issues `docker stop` (allowing each container up to `TEARDOWN_GRACE_SEC` to exit cleanly) before falling back to `docker rm -f` as a backstop for anything still standing. All target hosts are torn down concurrently, not one after another — sequential per-host teardown left a worker node briefly alive and NCCL-connected to an already-vanished head during a prior release, which this concurrency avoids. Expect teardown to take up to roughly `3 x TEARDOWN_GRACE_SEC` seconds on a 2-node deploy; the dashboard's Teardown button reflects live phase progress for the duration.
+---
 
-=== 3. OpenMP Thread Fencing & CPU Scheduling Protections ===
-To prevent PyTorch and vLLM background worker threads from consuming 100% of available Grace ARM CPU cores during multi-node KV cache initialization, multi-node topologies enforce strict CPU thread limits:
+## Deployment & topology architecture
 
-* '''Environment Fencing:''' `OMP_NUM_THREADS=16` and `VLLM_CPU_OMP_THREADS=16` are set per-recipe in `env_vars:`.
-* '''Host System Impact:''' Restricts OpenMP thread pools to 16 cores per socket, guaranteeing sufficient CPU scheduling headroom for `sshd`, system daemons, and status polling threads.
+### 1. Dynamic container image resolution
 
-=== 4. JIT-Compile Caching ===
-Every deploy mounts a persistent JIT-compile cache covering Triton, TileLang, DeepGEMM, and vLLM's own kernel cache, plus the CUDA compute cache, all derived from the same host directory as the HuggingFace cache mount and sized via `cluster_config.yaml`'s `tuning.jit_cache_maxsize_bytes`. Use `dgx-config cache-inventory` to inspect what's cached per host (entry counts, sizes, age, LRU order) — read-only, safe to run against a live cluster at any time. `dgx-config prune-cache` performs LRU eviction of whole cache entries, and only when a host is below a configurable free-space floor; it never touches an individual file within an entry, since partial deletion of a Triton/TileLang cache entry can leave it in a state the loader treats as a hit and then fails to load.
+Image tags are not hardcoded into the Python orchestrator. `cluster_config.yaml`
+declares a global `default_image`, so cluster-wide updates only require a YAML
+change. Individual recipes override this with a model-level `image:` key.
 
-== Network Fabric & Transport ==
+### 2. Global multi-model VRAM teardown guard
 
-=== 1. Network Interface Targets & Gloo/NCCL Bindings ===
+To prevent multiple vLLM models stacking on the same GPU and causing immediate
+CUDA OOM or port `8000` conflicts, `execute_deployment` tears down any existing
+containers across all target nodes before spawning anything.
 
-* '''Management TCP Interface (`enp1s0f0np0`):''' All SSH orchestration, administrative commands, and `dgx-config` calls route strictly across the management subnet (10.0.14.x).
-* '''Master Store Rendezvous:''' The orchestrator binds `--master-addr` to the head node's management IP (`10.0.14.43` for `spark-4`). `--master-port` comes from `cluster_config.yaml`'s `ports.master` (`29500`).
-* '''Gloo & NCCL Interface Binding (`enp1s0f0np0`):''' Multi-node distributed topologies must pass `GLOO_SOCKET_IFNAME=enp1s0f0np0` and `NCCL_SOCKET_IFNAME=enp1s0f0np0`.
-* '''NCCL CUDA Memory Driver Disabling (`NCCL_CUMEM_ENABLE=0`):''' Multi-node Grace Blackwell (GB10) deployments must enforce `NCCL_CUMEM_ENABLE=0` across environment manifests to prevent IPC buffer deadlocks on unified memory architectures.
-* '''RoCEv2 Link Layer (200Gbps ConnectX-7):'''
-'''InfiniBand / HCA Target:''' `rocep1s0f0`
-'''RoCE GID Index:''' `NCCL_IB_GID_INDEX=3`
+Teardown is graceful, not an immediate kill: it sends SIGTERM to host processes
+and issues `docker stop` (allowing each container up to `TEARDOWN_GRACE_SEC` to
+exit cleanly) before falling back to `docker rm -f` as a backstop. All target
+hosts are torn down **concurrently** — sequential per-host teardown left a
+worker briefly alive and NCCL-connected to an already-vanished head during a
+prior release. Expect up to roughly `3 × TEARDOWN_GRACE_SEC` on a 2-node deploy;
+the dashboard's Teardown button reflects live phase progress throughout.
 
-== Grace Blackwell (GB10) Hardware Safeguards ==
+### 3. OpenMP thread fencing
 
-=== 1. LPDDR5x Unified Memory Telemetry ===
-NVIDIA Grace Blackwell architectures utilize LPDDR5x Unified Memory shared between the Grace CPU and Blackwell GPU. Standard queries return `[N/A]`. The telemetry parser isolates temperature and utilization integers, reporting VRAM memory metrics safely as `Unified / 131072 MB`.
+To stop PyTorch and vLLM background worker threads consuming 100% of the Grace
+ARM cores during multi-node KV cache initialization, multi-node topologies set
+`OMP_NUM_THREADS=16` and `VLLM_CPU_OMP_THREADS=16` per-recipe in `env_vars:`.
+This guarantees CPU scheduling headroom for `sshd`, system daemons, and status
+polling threads.
 
-=== 2. Headless Target Mode & DRM Semaphore Lock Prevention ===
-DGX compute nodes must never run desktop GUI display managers (`gdm3`, `gnome-shell`).
-Convert via `sudo systemctl set-default multi-user.target && sudo systemctl stop gdm3`.
+### 4. JIT-compile caching
 
-== Installation & Setup Guide ==
+Every deploy mounts a persistent JIT-compile cache covering Triton, TileLang,
+DeepGEMM and vLLM's own kernel cache, plus the CUDA compute cache — all derived
+from the same host directory as the HuggingFace cache mount and sized via
+`tuning.jit_cache_maxsize_bytes`.
 
-=== 1. Clone Repository ===
+`dgx-config cache-inventory` inspects what is cached per host (entry counts,
+sizes, age, LRU order) — read-only, safe against a live cluster.
+`dgx-config prune-cache` performs LRU eviction of **whole cache entries**, and
+only when a host is below a configurable free-space floor. It never deletes an
+individual file within an entry, since a partially-deleted Triton/TileLang entry
+can leave a state the loader treats as a hit and then fails to load.
+
+### 5. Crash log persistence
+
+Every deploy binds a per-run, per-host directory
+(`~/.cache/ray-logs/<deploy_run_id>/<host>`) to each container's `/tmp/ray`, so
+a crashed worker's Ray session logs — stdout/stderr included — survive container
+teardown. This is the difference between a crash being diagnosable and
+permanently a mystery.
+
+`dgx-config prune-ray-logs --retention-days N --dry-run` reclaims this space on
+an age basis (default 7 days) rather than waiting on free-space pressure, since
+these logs stay small enough to otherwise accumulate indefinitely.
+
+### 6. Version tracking & deploy confirmation
+
+`ORCHESTRATOR_VERSION` in `dgx-orchestrator.py` is a hand-bumped string surfaced
+in four places: daemon startup logs, every `/api/status` response, the CLI
+`status` summary line, and a badge in the dashboard header next to Server Time.
+
+This exists because "the code was edited but never actually deployed" is a real
+failure mode here — the deploy workflow (`git push` locally → `git pull` on
+`maestro` → restart the container) has a step where a forgotten `git push`
+silently leaves the daemon running old code with no error anywhere. **Check the
+version badge after any deploy of a `dgx-orchestrator.py` change** rather than
+assuming it landed.
+
+Caveat: this hashes `dgx-orchestrator.py` only, so a change confined to
+`common/*.py` will not move it. It answers "which orchestrator", not "which
+entire codebase".
+
+### 7. Status cache staleness
+
+`/api/status` responses carry `stale` / `stale_for_seconds`, reflecting how long
+the currently-served snapshot has actually been in use. A wedged internal
+computation surfaces this instead of silently serving a frozen snapshot
+indefinitely. **If the dashboard ever looks frozen, check these two fields
+first.** Not yet surfaced as a dashboard banner; API-only.
+
+---
+
+## Network fabric & transport
+
+- **Management TCP interface (`enp1s0f0np0`)** — all SSH orchestration,
+  administrative commands, and `dgx-config` calls route strictly across the
+  management subnet (`10.0.14.x`).
+- **Master store rendezvous** — the orchestrator binds `--master-addr` to the
+  head node's management IP. `--master-port` comes from `ports.master`
+  (`29500`). This rides the management network, not the RoCE fabric.
+- **Gloo & NCCL interface binding** — multi-node topologies must pass
+  `GLOO_SOCKET_IFNAME=enp1s0f0np0` and `NCCL_SOCKET_IFNAME=enp1s0f0np0`.
+- **`NCCL_CUMEM_ENABLE=0`** — multi-node GB10 deployments must set this across
+  environment manifests to prevent IPC buffer deadlocks on unified memory.
+- **RoCEv2 link layer (200 Gbps ConnectX-7)** — HCA target `rocep1s0f0`, GID
+  index `NCCL_IB_GID_INDEX=3`.
+
+---
+
+## Grace Blackwell (GB10) hardware safeguards
+
+### LPDDR5x unified memory telemetry
+
+GB10 shares LPDDR5x unified memory between the Grace CPU and Blackwell GPU.
+Standard VRAM queries return `[N/A]`. The telemetry parser isolates temperature
+and utilization integers and reports memory as `Unified / 131072 MB`.
+
+### Headless target mode
+
+Compute nodes must never run a desktop GUI display manager (`gdm3`,
+`gnome-shell`) — DRM semaphore locks otherwise interfere with the GPU. Convert
+with:
+
+```bash
+sudo systemctl set-default multi-user.target
+sudo systemctl stop gdm3
+```
+
+---
+
+## Installation
+
+Full step-by-step guide, including standing up a control station on a different
+LAN and preparing fresh compute nodes: **[`docs/INSTALL.md`](docs/INSTALL.md)**.
+
+Short version, for a `maestro` on an already-configured cluster:
 
 ```bash
 mkdir -p ~/docker && cd ~/docker
-git clone [https://github.com/imrobertson/orchestrator.git](https://github.com/imrobertson/orchestrator.git)
+git clone https://github.com/imrobertson/orchestrator.git
 cd orchestrator
 
-```
-
-=== 2. Configure Essential Secrets (`HF_TOKEN`) ===
-
-```bash
-echo 'HF_TOKEN="hf_your_actual_token_here"' > .secrets
+cp .secrets.example .secrets      # then edit in your real HF_TOKEN
 chmod 600 .secrets
 
-```
-
-=== 3. Lock Down Master Key Permissions ===
-
-```bash
+cp /path/to/id_dgx_orchestrator . # shared cluster SSH key
 chmod 600 id_dgx_orchestrator
 
-```
-
-=== 4. Deploy Docker Compose Stack ===
-
-```bash
 docker compose up -d --build
 sudo ln -sf ~/docker/orchestrator/dgx-config /usr/local/bin/dgx-config
 
+dgx-config status                 # verify
 ```
 
-== User Onboarding & Key Authorization ==
+---
 
-=== Default Workflow: SSO & Tailscale SSH ===
-Users accessing `maestro` via Tailscale SSH require zero local setup. The `dgx-config` wrapper automatically captures the host shell's `$USER` and injects it into the execution container (`-e USER`).
+## User onboarding & key authorization
 
-=== Local Network / Admin Users ===
+### Default workflow: SSO & Tailscale SSH
+
+Users reaching `maestro` over Tailscale SSH need zero local setup. The
+`dgx-config` wrapper captures the host shell's `$USER` and injects it into the
+execution container (`-e USER`) for attribution.
+
+### Local network / admin users
+
 If bypassing Tailscale SSH, authorize your personal SSH key:
 
 ```bash
 dgx-config authorize-key --key ~/.ssh/id_ed25519.pub
-
 ```
 
-== Interface Reference Guide ==
+This authorizes the key for cluster access. It does **not** make per-deploy
+attribution cryptographically verified — see `docs/USERMANUAL.md`'s
+troubleshooting section if that distinction matters for your use case.
 
-=== Interactive CLI Menu (`dgx-config menu`) ===
+---
 
-* Renders active runtimes, throughput/queue-depth, and GPU telemetry across all Spark nodes.
-* Prompts model selection directly from `recipes/local/` and `recipes/eugr/`.
+## Interface reference
 
-=== Web Dashboard (`http://maestro:5000`) ===
+### Web dashboard — `http://<maestro>:5000`
 
-* Dynamic API routing via `window.location.hostname`.
-* Displays real-time Docker logs in a full-width bottom panel.
-* Deploy, Teardown, and benchmark controls lock each other out while any one of them is in flight — Teardown shows live phase progress (signaling, stopping, removing) for the duration rather than a static "in progress" label.
+- API routing is dynamic via `window.location.hostname`, so the dashboard works
+  under any hostname the browser can also reach on port `5001`.
+- Live per-host telemetry, model status, and load ETA (monotonically clamped so
+  the countdown never runs backwards between polls).
+- Real-time Docker logs in a full-width bottom panel, with a Copy button that
+  falls back to `execCommand` on plain-HTTP origins where the Clipboard API is
+  unavailable.
+- Deploy, Teardown and benchmark controls lock each other out while any one is
+  in flight. Teardown shows live phase progress (signaling → stopping →
+  removing).
+- Reserved hosts are badged, and a deploy or teardown that would disturb one
+  raises a per-action confirm dialog driven by the server's HTTP 423 refusal —
+  deliberately **not** a persistent "force" checkbox, which could be left
+  silently armed for a later operation.
 
-=== CLI Command Options ===
+### Interactive CLI menu — `dgx-config menu`
 
-* '''Check Status:''' `dgx-config status`
-* '''Purge Active Runtimes:''' `dgx-config teardown`
-* '''Deploy Model:''' `dgx-config deploy --model deepseek-v4-flash-0731-nvfp4 --nodes 2`
-* '''Deploy and Block Until Healthy:''' `dgx-config deploy --model deepseek-v4-flash-0731-nvfp4 --nodes 2 --wait`
-* '''Preview Deploy (Dry Run):''' `dgx-config deploy --model deepseek-v4-flash-0731-nvfp4 --nodes 2 --dry-run`
-* '''View Remote Container Logs:''' `dgx-config logs --host spark-4 --tail 100`
-* '''Authorize SSH Key:''' `dgx-config authorize-key --key ~/.ssh/id_ed25519.pub`
-* '''Inspect JIT Cache Usage (read-only):''' `dgx-config cache-inventory`
-* '''Reclaim JIT Cache Space:''' `dgx-config prune-cache --min-free-gb 50 --headroom-gb 20` (add `--dry-run` to preview without deleting anything — safe against a live cluster)
+Renders active runtimes, throughput/queue depth and GPU telemetry across all
+nodes, and prompts model selection directly from the recipe catalog.
 
-== Operational Documentation & Incident History ==
+### CLI commands
 
-For detailed failure mode resolutions, migration specs, and historical release logs, refer to the `docs/` repository:
+| Task | Command |
+| --- | --- |
+| Check status | `dgx-config status` |
+| Deploy a model | `dgx-config deploy --model <key> --nodes 2` |
+| Deploy and block until healthy | `dgx-config deploy --model <key> --nodes 2 --wait` |
+| Preview a deploy | `dgx-config deploy --model <key> --nodes 2 --dry-run` |
+| Deploy onto a reserved host | add `--force` |
+| Tear down one host | `dgx-config teardown --host spark-4` |
+| Tear down everything | `dgx-config teardown --all` |
+| Remote container logs | `dgx-config logs --host spark-4 --tail 100` |
+| Authorize an SSH key | `dgx-config authorize-key --key ~/.ssh/id_ed25519.pub` |
+| Inspect JIT cache (read-only) | `dgx-config cache-inventory` |
+| Reclaim JIT cache space | `dgx-config prune-cache --min-free-gb 50 --headroom-gb 20 --dry-run` |
+| Reclaim crash log space | `dgx-config prune-ray-logs --retention-days 7 --dry-run` |
+| Sweep orphaned IPC segments | `dgx-config sweep-ipc-orphans --dry-run` |
+| Repair a ledger undercount | `dgx-config correct-ledger --dry-run` |
 
-* **Hardware & Runtime Diagnostics:** `docs/TROUBLESHOOTING.md`
-* **Release Tombstones & Fix History:** `docs/TOMBSTONES.md`
-* **Catalog Migration & Architecture Plan:** `docs/ARCHITECTURE-MIGRATION-PLAN.md`
-* **Upstream Reference Notes:** `docs/EUGR-REFERENCE-NOTES.md`
-* **Runtime Robustness Roadmap (v4 -> v5):** `docs/ROADMAP.md`
+`teardown` deliberately has **no default scope** — it requires either `--host`
+or `--all`. Most read-only-ish commands accept `--dry-run` and are safe to run
+against a live cluster.
+
+---
+
+## Operational documentation
+
+| Document | Contents |
+| --- | --- |
+| [`docs/DOCMAP.md`](docs/DOCMAP.md) | Which document owns what, and where a new fact goes. Paste it at the start of a session |
+| [`docs/INSTALL.md`](docs/INSTALL.md) | Control-station and compute-node setup, from scratch |
+| [`docs/USERMANUAL.md`](docs/USERMANUAL.md) | Operating the cluster: dashboard, `dgx-config`, deploy, teardown, offline mode, benchmarking, troubleshooting |
+| [`docs/MODELS.md`](docs/MODELS.md) | The catalog: topology, context, concurrency, architecture, speculative method and depth, measured speed, validation status |
+| [`docs/DIRECTION.md`](docs/DIRECTION.md) | Where the system is going, phase status, decisions of record. Supersedes `ROADMAP.md` and `ARCHITECTURE-MIGRATION-PLAN.md` |
+| [`docs/WORKSTREAMS.md`](docs/WORKSTREAMS.md) | The canonical backlog: status, evidence, dependencies, kickoff prompts |
+| [`docs/TOMBSTONES.md`](docs/TOMBSTONES.md) | Append-only per-fix history and incident log, newest and highest-numbered first |
+| [`docs/errata.yaml`](docs/errata.yaml) | Machine-readable recipe rules — the linter's source of truth |
+| [`docs/SMOKE-TEST-PLAYBOOK.md`](docs/SMOKE-TEST-PLAYBOOK.md) | Post-change verification procedure |
+| [`docs/AB_TEST_USAGE.md`](docs/AB_TEST_USAGE.md) | A/B benchmark harness usage |
+| [`docs/reference/`](docs/reference/) | Durable notes on third-party dependencies: `community-sources.md` (where every image, checkpoint and fix came from, with URLs) and `flashinfer-autotune-internals.md` |
+| [`tools/verify/`](tools/verify/) | The verification harnesses behind individual tombstone entries. Not a test suite — see its `purpose.md` |
+
+`UsageShortcut.md` is folded into `USERMANUAL.md`, `REFERENCE-decode-speeds.md`
+into `MODELS.md`, and the EUGR notes into `docs/reference/community-sources.md`.
+`TROUBLESHOOTING.md` is being dissolved into `TOMBSTONES.md` and `errata.yaml`.
+
+Anything in `docs/` not listed above is archive material — see
+[`docs/DIRECTION.md`](docs/DIRECTION.md)'s documentation map for the disposition
+of every file.

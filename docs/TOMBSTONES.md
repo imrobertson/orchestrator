@@ -1,6 +1,43 @@
 # Control Plane Release Tombstones & Fix Log
 
 <!--
+NUMBERING AND CITATION CONVENTIONS (settled 2026-09-09)
+
+WHY THIS FILE STARTS AT #27, and it is not a loss. Traced through git on
+2026-09-09 because the gap had been bothering the operator for weeks. The
+file was created on 2026-08-22 in commit 46e77a3b, and the version tags on
+its oldest entries place them at V4.5.0 (#27) through V4.8.0 (#41). Its
+FIRST committed revision already began at #27 -- there is no earlier
+revision, no earlier path, and no root-level copy; the repo root on
+2026-08-20 (784a6752) contains neither TOMBSTONES.md nor TROUBLESHOOTING.md.
+#1-#26 therefore correspond to work predating V4.5.0 and predating this
+repository. They were never in git and cannot be recovered from it. If they
+exist at all they are in pre-git notes. STOP LOOKING.
+
+TWO NUMBER SERIES EXIST AND THEY ARE NOT THE SAME SERIES.
+  - This file: #27-onward. Cite as a bare `#N`, or `tombstone #N` where a
+    sentence would otherwise be ambiguous.
+  - docs/TROUBLESHOOTING.md: Incident #1-onward, created the same day and
+    numbered independently from 1. ALWAYS cite as `Incident #N`, never as
+    a bare `#N`.
+The series overlap in range and share the `#N` syntax, so a bare number is
+genuinely ambiguous. This has already cost real time: BACKLOG-dspark cited
+a bare `#7` meaning tombstone #71, and the error propagated into
+WORKSTREAMS WS-9 before it was caught. If TROUBLESHOOTING.md is ever merged
+into this file, DO NOT renumber the incidents -- two entries here cite
+Incident #1 and Incident #11, and renumbering breaks them along with every
+external citation. Keep the numbers, keep the prefix, and record the
+mapping.
+
+FIELD LABELS. Normalized 2026-09-09 to `**Trap:**` / `**Fix:**` so the file
+is greppable by field. Use those for anything added. Two deliberate
+exceptions were left alone: #82 splits `Symptom` from `Cause`, which is
+information a single Trap field would lose, and #107-#109 are follow-up
+confirmations using `Context` / `Confirmed, <date>` rather than incident
+reports.
+-->
+
+<!--
 Reconciliation note (2026-09-03/09-05): #111-#126 added across this session, appended
 above #110 per usual (newest/highest on top). #111 resolves #110's open
 question -- #110 itself is left as originally written, uncorrected, since
@@ -95,6 +132,237 @@ nothing. #143 is a process finding rather than a defect, filed here
 because both instances were real measurements and the near-miss is the
 record worth keeping.
 -->
+
+<!--
+Reconciliation note (2026-09-09, second pass): #144-#146 added, 27-146
+contiguous by the same exhaustive "### N." scan. All three come out of a
+documentation-consolidation pass that ended up reading source, and all
+three share a shape: the knowledge already existed in this repository and
+did not reach the place that needed it.
+
+No existing entry was edited. #144 records a gap #112 left, and #112 is
+left untouched -- it claimed five touchpoints in `dgx-orchestrator.py` and
+removed five touchpoints in `dgx-orchestrator.py`, which was accurate. The
+overclaim was elsewhere. Same reasoning as #110/#111.
+
+Also confirmed this pass, recorded here rather than as an entry because
+neither is a defect: numbering 27-146 has no gaps or duplicates and is
+strictly descending; and three entry formats now coexist -- 96 use
+`**Trap:** / **Fix:**`, 17 use `**Trap:**` without the article,
+#82 uses `**Symptom:** / **Cause:**`, and #107-#109 use neither. Readable,
+but it makes the file harder to grep by field. Worth standardizing on the
+newer `**Trap:**` form for anything added from here, without touching what
+exists.
+-->
+
+<!--
+Reconciliation note (2026-09-09, third pass): #147-#148 added, 27-148
+contiguous. Both are rescued from docs/TROUBLESHOOTING.md's incident log
+during its dissolution -- Incident #9 and Incident #12 respectively. They
+are the only two of its fourteen incidents with no coverage anywhere else
+in the doc set. Neither is a defect in this codebase, which is likely why
+neither was written up here at the time; both are traps in the hardware
+and the supply chain that this cluster sits on, and both cost hours.
+
+Retaining the original Incident numbers in each entry, per the citation
+convention above: the two series stay distinct, and anything still citing
+"Incident #9" can be followed here.
+-->
+
+### 148. A deterministic byte-count mismatch on a HuggingFace download is a corrupted upstream shard, not your network
+
+**Trap:** `RuntimeError: Task error: File size mismatch: expected N bytes
+but downloaded M bytes` from `huggingface_hub`'s Xet client. Every instinct
+says transient -- retry, clear the cache, blame the LAN. All of that is
+wasted here.
+
+**The tell is that the numbers do not move.** The same expected and the
+same downloaded byte count, across repeated attempts. Genuine network
+flakiness produces a different short read each time; a corrupted upstream
+file produces the identical one forever, because every attempt re-fetches
+the same broken remote bytes. Clearing the local cache does not help and
+cannot help.
+
+Confirmed on `saricles/MiniMax-M2.7-NVFP4-GB10`, where three specific
+shards serve short of their own reported `Content-Length` from HF's CDN,
+reproducible with plain `curl` and with `git lfs pull` independently of any
+vLLM or Xet code path. The repo's own HF discussion thread (#3) documents
+it.
+
+**Fix:** there is no local fix. Check the repo's HF discussion tab before
+assuming anything on this side is at fault. **The decision rule: if the
+byte counts repeat exactly, stop retrying** -- that signature is upstream
+corruption and more attempts cannot change it.
+
+Recorded here 2026-09-09 from TROUBLESHOOTING.md Incident #12. The affected
+checkpoint is listed in `docs/reference/community-sources.md`.
+
+### 147. Both ConnectX-7 ports report a link, and only one cable exists
+
+**Trap:** `ethtool <second-port-iface>` reports `Link detected: yes` on the
+second RDMA port of BOTH `spark-3` and `spark-4`, and returns a full module
+EEPROM read for it. There is one physical QSFP cable between the pair.
+
+The driver or firmware is serving stale or cached module data from whichever
+port initialized first. **The proof is the vendor serial number: it is
+identical on both ports.** One transceiver, reported twice.
+
+**Fix:** none needed and none available -- it is a reporting artifact, not a
+misconfiguration. Trust `enp1s0f0np0`, which is the actually-cabled port,
+confirmed by matching the real cable's serial. Everything in the deploy path
+already binds to it explicitly (`NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`,
+`--master-addr`), so nothing is currently misled by this.
+
+Recorded because it is exactly the shape of thing that gets re-investigated
+from scratch: a plausible second fabric path that appears healthy under the
+obvious diagnostic and does not exist. **If it resurfaces, do not chase it.**
+Check the serial numbers and move on.
+
+Recorded here 2026-09-09 from TROUBLESHOOTING.md Incident #9.
+
+### 146. The offline prefetcher only understood the OLD speculative-decode flag, so every working drafter was silently never cached
+
+**Trap:** `cache_cluster_assets.py` collected speculative-decoding draft
+checkpoints by regexing `--speculative-model` out of each topology's
+`vllm_args`. That was correct when it was written. It is now exactly
+backwards.
+
+Every recipe in the catalog that actually works declares its drafter
+*inside* `--speculative-config`'s JSON -- `{"method": "dflash", "model":
+"z-lab/gemma-4-26B-A4B-it-DFlash", ...}`. None of those matched the regex.
+So `z-lab/gemma-4-26B-A4B-it-DFlash`,
+`google/gemma-4-26B-A4B-it-assistant` and
+`meta-models/Muse-Glimmer-30B-assistant` were never pre-fetched, and
+`python3 cache_cluster_assets.py && <go offline>` produced a cluster that
+looked fully staged and then failed at model load on every speculative
+recipe.
+
+The part worth keeping: the only drafters the regex *did* catch belonged
+to `nemotron-3.5-lightning-nvfp4` and its `-tools` variant -- the two
+recipes that carry a standalone `--speculative-model` flag, which these
+builds reject outright (see #145 and errata E023). **The prefetcher
+successfully cached weights for exactly the recipes that cannot launch,
+and missed every recipe that can.** Neither half produced a symptom,
+because a prefetcher that fetches the wrong thing looks identical to one
+that fetches the right thing until you disconnect.
+
+**Fix:** parse the JSON. `--speculative-config`'s blob is unwrapped with
+`shlex.split` (which is what handles the single-quoting E011 requires) and
+read for its `model` key; `--speculative-model` is still parsed too, since
+a recipe carrying it is precisely the one someone is about to fix.
+Critically, the parser now **prints a warning** when it cannot read a
+speculative config rather than skipping it silently -- silent
+under-fetch is what made this invisible for as long as it was.
+
+Two unrelated defects in the same file were fixed in the same pass: it
+hardcoded the SSH user `tetrel` and a literal
+`/home/tetrel/.cache/huggingface:...` mount rather than resolving
+`ssh_user` via `common/ssh.py` (pass `None`, as every `run_ssh` call site
+in `dgx-orchestrator.py` does) and reading each host's `volume_mount` from
+`cluster_config.yaml`. Same class as #73's ten hardcoded literals. Both
+agreed with the current config and would not have on another.
+
+Still open in this file, deliberately not fixed here because it needs a
+decision about where staging paths come from: recipes using
+`extra_mounts` / `model_path_override` to stage weights outside the shared
+HF cache are still invisible to the prefetcher. WORKSTREAMS WS-3.
+
+### 145. Four recipes were violating three `enforce: error` errata rules, and nothing noticed because nothing reads `errata.yaml`
+
+**Trap:** not a code defect. A read of all 35 files in `recipes/local/`
+found four live violations of rules that were written from real incidents,
+graded `error`, and had already been fixed elsewhere at least once each:
+
+- `qwen-3.8-27b::2_node` and `qwen-3.8-27b-nvfp4-sqk2::2_node` paired
+  `qwen3_next_mtp` with `pp_size: 2` -- **E005**, the hard
+  `NotImplementedError` from #104. #107 rebuilt the `qwen-3.5-122b`
+  siblings as TP for exactly this and these two were missed.
+- `qwen-3.8-27b::2_node` additionally had **no `image:` field at all**, so
+  it inherited `default_image`, which ships no Ray -- **E004**, the fourth
+  recurrence of #43/#103, in the face of `nemotron-3_5-lightning-bf16`'s
+  own header saying it set `image:` proactively "rather than let it recur
+  a third time". It also omitted the Ray flag itself (**E003**).
+- `nemotron-3.5-lightning-nvfp4` and `_nemotron-3.5-lightning-nvfp4-tools`
+  passed a standalone `--speculative-model` alongside
+  `--speculative-config`, which these builds reject.
+
+**What makes this an entry rather than four one-line fixes:** the
+`--speculative-model` diagnosis was already written down. It is in
+`_deepseek-v4-flash-vision-exp.yaml`'s header, verbatim -- "This build
+REJECTS a separate `--speculative-model` flag (confirmed: our nemotron-3.5
+recipe crashed on exactly that)." Someone watched that recipe crash,
+understood why, wrote it into **a different recipe**, and left the broken
+one alone. The knowledge never left the file it was typed into.
+
+The E005 pair is the same shape with a worse property: it fails at
+`create_engine_config()`, before any weight load or GPU cost. A failure
+that cheap produces no incident anyone remembers, so two dead topologies
+sat in the catalog indefinitely. **Cheap failures need a linter precisely
+because they never earn a tombstone of their own.**
+
+**Fix:** all four recipes corrected. `qwen-3.8-27b` and
+`qwen-3.8-27b-nvfp4-sqk2` handled differently on purpose -- the former
+rebuilt as TP2 (its 2-node topology is wanted), the latter had its dead
+2_node block deleted, since converting it would have duplicated its
+`-nvfp4` sibling and the file is a coworker's single-node tune. Both
+nemotron recipes moved the drafter into `--speculative-config`'s `model`
+key. `errata.yaml` gained **E023** (standalone `--speculative-model`) and
+**E024** (`--moe-backend marlin` on a mixed FP8/NVFP4 checkpoint, from
+`qwen-3.6-35b-a3b-nvfp4`'s header, which records it as the cause of both
+2026-09-05 load failures), plus a new linter rule: **a rule with live
+violations is evidence about the linter, not only about the rule** --
+record the violations in the rule's own evidence block so the cost of the
+missing linter stays visible instead of being fixed quietly.
+
+Note `qwen-3.8-27b`'s 2_node is rebuilt but **unrun**, and setting
+`image:` also moved its 1_node off `default_image` and reset that
+topology's `config_hash`, since `image` is recipe-level and
+`build_config_payload()` includes it. Tracked in WORKSTREAMS WS-1 rather
+than assumed working.
+
+### 144. The `models.yaml` removal was verified by AST diff and a live argv diff -- against one of the two files that parsed it
+
+**Trap:** #112 retired `models.yaml` and the `USE_LEGACY_CATALOG` fallback,
+verifying the removal two ways: an AST-equivalence check and a live
+`--dry-run` argv diff. Both are stronger checks than this repo usually
+applies, and both passed honestly.
+
+`cache_cluster_assets.py` still contained the entire legacy path:
+`MODELS_YAML_PATH`, `_extract_manifest_legacy()` (a full `models.yaml`
+parser, kept verbatim as a rollback lever), and a live
+`USE_LEGACY_CATALOG == "1"` branch in `extract_manifest()`.
+
+**#112 is not wrong and has not been edited.** It named five touchpoints
+in `dgx-orchestrator.py` and removed five touchpoints in
+`dgx-orchestrator.py`. The claim that the surface was "small and fully
+mapped" lived in `WORKSTREAMS.md` WS-0a, and it was the map that was
+short, not the work.
+
+Worse than dead code, by the time it was found: `_extract_manifest_legacy()`
+opens with `if not MODELS_YAML_PATH.exists(): sys.exit(...)`, and #112's
+step 6 deleted `models.yaml` from the repo. The advertised rollback lever
+had quietly become a guaranteed hard exit -- discoverable only by someone
+reaching for it mid-incident, which is the worst possible moment to find
+out.
+
+**What makes this worth an entry:** the check that would have caught it was
+written down and not run. K10's kickoff prompt in `WORKSTREAMS.md` ends
+with, verbatim, `grep -rn "USE_LEGACY_CATALOG\|models\.yaml" .` should
+come back clean apart from `TOMBSTONES.md` history. That grep returns
+`cache_cluster_assets.py` immediately. The two rigorous verifications were
+performed; the trivial one that *scopes where to run them* was skipped.
+
+A rigorous check applied to an incomplete surface produces a confident
+wrong answer, and it is more dangerous than no check, because the rigour
+is what stops anyone looking again. The surface-defining step is usually
+the cheap one and should run first.
+
+**Fix:** legacy path removed from `cache_cluster_assets.py` along with the
+now-unused `yaml`, `os` and `Path` imports and an unused
+`resolve_user_identity_key` import (`run_ssh()` resolves the identity key
+itself). `grep -rn "USE_LEGACY_CATALOG\|models\.yaml" .` now returns only
+this file's history and two comments in `dgx-orchestrator.py` (3377, 4546)
+that correctly describe the removed path in the past tense.
 
 ### 143. Two numbers were nearly written into recipe headers as findings, and neither survived a repeat
 
@@ -1330,7 +1598,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 126. Closing the deep dive past #125: the actual TP0/TP1 divergence trigger was never confirmed, but a real, durable, model-independent structural fragility in FlashInfer's tuning architecture was -- traced until it hit a JIT-compiled-extension wall. Recorded for its transferable value, not because `llama-4-fp8` needed it
 
-* **The Trap:** #125 closed the EP hypothesis but left the actual cause of
+* **Trap:** #125 closed the EP hypothesis but left the actual cause of
   TP0's instant cache hit vs. TP1's ~48-minute live sweep unknown. Purely
   out of curiosity (explicitly not pursued for `llama-4-fp8` remediation,
   which #122's decision already closed), the investigation continued one
@@ -1341,7 +1609,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   per-architecture `MoERunner` class, defined dynamically inside
   `get_cutlass_fused_moe_module()`.
 
-* **The Fix:** Not a fix -- a deliberate closing note, because the chase
+* **Fix:** Not a fix -- a deliberate closing note, because the chase
   hit a real boundary rather than running out of leads. `get_cutlass_
   fused_moe_module()` calls `gen_cutlass_fused_moe_sm120_module(...)
   .build_and_load()` -- a JIT-compiled CUDA extension, built and loaded at
@@ -1400,14 +1668,14 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 125. CLOSED: #119's rank-divergent-EP mechanism is disconfirmed, by direct source read, not inference -- the boot log's `EP rank` label is unconditional bookkeeping under any variable name. Actual root cause of the observed TP0/TP1 cache-hit asymmetry is unknown
 
-* **The Trap:** #124 found `enable_expert_parallel` absent from
+* **Trap:** #124 found `enable_expert_parallel` absent from
   `parallel_state.py` entirely, but flagged a real remaining gap: the
   codebase is confirmed elsewhere (`multiproc_executor.py`) to rename this
   exact flag to `enable_ep` when passing it downstream, so a grep for the
   literal string `enable_expert_parallel` alone could not rule out
   `parallel_state.py` reading the same value under a different local name.
 
-* **The Fix:** `grep -n "enable_ep\|ep_rank\|EP rank"
+* **Fix:** `grep -n "enable_ep\|ep_rank\|EP rank"
   vllm/distributed/parallel_state.py`, against the same confirmed image,
   closes that gap directly. Three matches, none of them what would be
   needed to support #119's mechanism:
@@ -1459,14 +1727,14 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 124. Further evidence against #119's mechanism: `parallel_state.py` (the file that prints the boot log's `EP rank` label) has zero textual reference to `enable_expert_parallel` -- strengthens #123's reopening toward "EP likely wasn't active," one gap short of full closure
 
-* **The Trap:** #123 reopened #119's confirmed root cause on two pieces of
+* **Trap:** #123 reopened #119's confirmed root cause on two pieces of
   evidence -- `enable_expert_parallel` defaults `False`, and the original
   failing deploy's boot log never overrode it -- but left open whether the
   boot log's `TP rank X, EP rank Y` label is reliable evidence of active
   EP sharding at all, since `vllm/distributed/parallel_state.py`'s actual
   print-construction logic was never read.
 
-* **The Fix:** `grep -rn "enable_expert_parallel" vllm/ --include=*.py`
+* **Fix:** `grep -rn "enable_expert_parallel" vllm/ --include=*.py`
   against the confirmed-matching image (`eugr/spark-vllm-b12x:latest`,
   `vllm.__version__` re-verified as `0.1.dev20482+g83cb22a0e...` in the
   same transcript as this grep, closing the process-hygiene gap #123
@@ -1520,7 +1788,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 123. #119's "confirmed" root cause reopened: `enable_expert_parallel` defaults `False` in this exact build, and the failing deploy's own boot log never overrode it -- the EP-rank labels #119 relied on may just be bookkeeping, not evidence of active expert sharding
 
-* **The Trap:** #119 read `rank 0 ... TP rank 0, EP rank 0` /
+* **Trap:** #119 read `rank 0 ... TP rank 0, EP rank 0` /
   `rank 1 ... TP rank 1, EP rank 1` in the original failing deploy's boot
   log as proof that expert parallelism was active, and built a confirmed
   root cause on it: EP sharding makes `local_expert_offset` genuinely
@@ -1529,7 +1797,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   for nominally the same op. `#120` and `#121` both build on that same
   premise.
 
-* **The Fix:** Not a fix -- a genuine reopening, caught before it went
+* **Fix:** Not a fix -- a genuine reopening, caught before it went
   into the record uncorrected. Checked `EngineArgs`' actual field defaults
   against `eugr/spark-vllm-b12x:latest`, confirmed via `docker run --rm`
   (not a resident container, so it couldn't have been running an
@@ -1587,14 +1855,14 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 122. Decision: `llama-4-fp8-tp`'s upstream/local-rebuild fix paths (#121) deliberately not pursued -- no relationship with the fork maintainer, limited time, working PP fallback already exists
 
-* **The Trap:** #121 named two real fix paths for the FlashInfer
+* **Trap:** #121 named two real fix paths for the FlashInfer
   rank-divergent-cache-key issue (#119/#120) -- upstream to whoever
   maintains `eugr/spark-vllm-b12x`, or a local rebuild. Neither is a code
   change available in this repo, so leaving the item as "two options,
   neither checked" risks reading as an oversight to a future reader,
   rather than the deliberate call it actually is.
 
-* **The Fix:** Not a fix -- a recorded decision, per this repo's own
+* **Fix:** Not a fix -- a recorded decision, per this repo's own
   standing practice of surfacing scope-crossing calls explicitly rather
   than letting them sit ambiguous. Operator's own words: no personal
   relationship with the fork's maintainer, limited time to spend chasing
@@ -1621,7 +1889,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 121. Correction: #119/#120's "unfixable from this codebase" framing was imprecise -- the fix is unavailable within `imrobertson/orchestrator`, but real fix paths exist against the image itself, upstream or local
 
-* **The Trap:** #119 and #120 both stated the FlashInfer/vLLM
+* **Trap:** #119 and #120 both stated the FlashInfer/vLLM
   cache-key-divergence and leader-only-save issues as "confirmed unfixable
   from this codebase," supported by repeated grep evidence that the
   relevant code (`flashinfer/fused_moe/`,
@@ -1631,7 +1899,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   editing this repo's own source" was stated in a way that read as "not
   fixable, period" -- a materially different and untrue claim.
 
-* **The Fix:** Not a technical correction, a scope correction, flagged
+* **Fix:** Not a technical correction, a scope correction, flagged
   explicitly rather than left standing. Two real paths exist against the
   `eugr/spark-vllm-b12x` image itself, neither requiring a change to this
   repo:
@@ -1661,14 +1929,14 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 120. Why the rank-divergent tuning cost from #119 can't self-heal: `save_configs()` is gated to the leader rank only, and the cache path isn't host-persisted anyway. A general pattern for any future TP+EP MoE model on this cluster, not specific to `llama-4-fp8` (V?.?.?)
 
-* **The Trap:** #119 confirmed TP1's FlashInfer autotune cache key is
+* **Trap:** #119 confirmed TP1's FlashInfer autotune cache key is
   genuinely rank-divergent under expert parallelism (`local_expert_offset`
   baked into `MoERunner._cache_key_extras()`), meaning TP1 must live-tune
   every deploy while TP0 hits the baked cache instantly. The natural
   follow-up: TP1 does the work once, live, every time -- why doesn't that
   work get cached for the *next* deploy, the way TP0's apparently is?
 
-* **The Fix:** Two independent reasons, read directly from
+* **Fix:** Two independent reasons, read directly from
   `vllm/model_executor/warmup/kernel_warmup.py`'s `flashinfer_autotune()`
   (already fetched for #118) and `flashinfer/fused_moe/runners.py`'s
   `save_configs()` docstring (fetched for #119).
@@ -1731,7 +1999,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 119. `llama-4-fp8-tp` root cause CONFIRMED, not just hypothesized: the FlashInfer MoE cache key is provably rank-divergent under expert parallelism, and this deploy runs EP -- read directly from `MoERunner._cache_key_extras()` and corroborated by the deploy's own boot log (V?.?.?)
 
-* **The Trap:** #118 identified a strong, code-grounded candidate mechanism
+* **Trap:** #118 identified a strong, code-grounded candidate mechanism
   -- a second, per-tactic `all_reduce()` inside `_profile_single_kernel`,
   which would deadlock/stall if the two TP ranks' cache lookups for
   "the same" nominal op and profile step diverged -- but stopped short of
@@ -1742,7 +2010,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   (in which case the real divergence would have to come from somewhere
   else, e.g. genuinely different shapes reaching `choose_one` per rank).
 
-* **The Fix:** Read `flashinfer/fused_moe/runners.py` directly (pulled
+* **Fix:** Read `flashinfer/fused_moe/runners.py` directly (pulled
   from the resident `vllm-head` container, confirmed still running the
   exact build under investigation via `python3 -c "import vllm;
   print(vllm.__version__)"` before pulling -- `0.1.dev20482+g83cb22a0e...`,
@@ -1821,7 +2089,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 118. `llama-4-fp8-tp` root cause NARROWED again: #117's "not a collective-asymmetry issue" was too broad. The asymmetry very plausibly exists one level deeper than the outer barrier, exactly where the original stack trace pointed. Confirmed against FlashInfer's actual `autotuner.py` source, not inferred (V?.?.?)
 
-* **The Trap:** #117 corrected #116's diagnosis on the strength of a full
+* **Trap:** #117 corrected #116's diagnosis on the strength of a full
   manual deploy's logs, which showed both TP ranks calling
   `world.barrier()` (`vllm/model_executor/warmup/kernel_warmup.py:324`)
   symmetrically. From that, #117 concluded the hang was not an
@@ -1831,7 +2099,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   ("why did the crash take ~48 minutes, across many completed profile
   passes, rather than failing immediately") as an open, unresolved
   question.
-* **The Fix:** Pulled the real FlashInfer source directly -- the running
+* **Fix:** Pulled the real FlashInfer source directly -- the running
   build's version string is a resolvable `setuptools_scm` git hash
   (`v0.1.dev20482+g83cb22a0e...`), and the flashinfer cache path named
   its version (`0.6.18`) explicitly, so the exact matching source was
@@ -1895,14 +2163,14 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 117. `llama-4-fp8-tp` root cause CORRECTED: not an asymmetric collective call, a TP1-side autotune loop running dozens of times until the barrier's TCP transport times out. Confirmed via a full manual deploy's complete logs (V?.?.?)
 
-* **The Trap:** #116 diagnosed the hang from a live `py-spy dump` captured
+* **Trap:** #116 diagnosed the hang from a live `py-spy dump` captured
   mid-stall during `ab_test.py` repeat 2, showing TP1's MainThread blocked
   in `torch.distributed.all_reduce` inside FlashInfer's
   `_profile_single_kernel` (`autotuner.py:2198`). From that single snapshot,
   #116 concluded FlashInfer's autotuner calls a collective only on the
   cache-miss branch, with TP0 skipping it entirely on a cache hit --
   "one rank participates, the other doesn't."
-* **The Fix:** A subsequent manual deploy
+* **Fix:** A subsequent manual deploy
   (`dgx-config deploy --model llama-4-fp8-tp --nodes 2`, left running to
   completion rather than killed by `ab_test.py`'s 900s ceiling) produced
   the complete `docker logs -f` output from both `vllm-head` (spark-4) and
@@ -1965,7 +2233,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 116. `llama-4-fp8-tp` TP=2 deploy deadlocks intermittently -- confirmed via live stack trace as a FlashInfer autotuner cross-rank `all_reduce` bug, not orchestrator code. PP remains the only reliable topology for this model (V?.?.?)
 
-* **The Trap:** WS-1's Qwen A/B (#116's sibling, the coder pair) found TP
+* **Trap:** WS-1's Qwen A/B (#116's sibling, the coder pair) found TP
   beating PP by ~1.9x with zero reliability issues, and flagged that
   `llama-4-fp8`'s existing confirmed-`ready` PP=2 deploy needed its own
   A/B rather than assuming the result transfers -- different model,
@@ -1979,7 +2247,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   harness's 900s ceiling. `42/44 checks passed` -- the harness correctly
   stopped short on each TP failure rather than silently continuing.
 
-* **The Fix:** Diagnosed by direct evidence at every step, not narrative --
+* **Fix:** Diagnosed by direct evidence at every step, not narrative --
   worth recording the discarded hypotheses along with the confirmed one,
   since each was chased with a real check before being ruled out rather
   than assumed.
@@ -2075,7 +2343,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 115. `qwen-3.5-122b` MTP token-depth sweep (n=2/3/4) completed -- no single best depth, a real Pareto trade-off across prompt categories. Corrects a hypothesis in #113 (V?.?.?)
 
-* **The Trap:** WORKSTREAMS.md's D-1 chain had queued this sweep to test a
+* **Trap:** WORKSTREAMS.md's D-1 chain had queued this sweep to test a
   third-party claim ("depth 3 is best, 2 second-best, 4 too aggressive")
   against real hardware, run overnight via two sequential `ab_test.py`
   invocations (`mtp2` vs `-tp`[n=3], then `mtp2` vs `mtp4`). Separately,
@@ -2083,7 +2351,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   deploys was "likely" explained by `eugr/spark-vllm-b12x:latest` having
   drifted builds mid-session -- a guess, explicitly flagged as unquantified
   at the time.
-* **The Fix:** Both runs completed clean: `mtp2` vs `-tp` at 54/54 checks;
+* **Fix:** Both runs completed clean: `mtp2` vs `-tp` at 54/54 checks;
   `mtp2` vs `mtp4` with `deployed=True, boot_log_hit=True` on both sides.
   Ray versions confirmed matching (2.58.0) on both hosts before launch --
   #106's pre-pull fix holding. `n=2` was independently re-measured in both
@@ -2136,14 +2404,14 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 114. #111's ledger cleanup applied to production and committed -- #110 fully closed end to end (V?.?.?)
 
-* **The Trap:** #111 recorded that `clean_ledger.py` had been extended with
+* **Trap:** #111 recorded that `clean_ledger.py` had been extended with
   a `REKEY` operation and verified against a *copy* of the production
   ledger, but the actual production `model_ledger.json` on `maestro` had
   not yet been touched -- the drop/rekey plan existed and was tested, not
   applied. Leaving that gap open across a doc-writing session risked the
   usual failure this file exists to prevent: a written record implying
   something is done when it's still just designed.
-* **The Fix:** Confirmed nothing deployed (`dgx-config status`, both hosts
+* **Fix:** Confirmed nothing deployed (`dgx-config status`, both hosts
   idle) before running `--apply` against the real file. Dry run against
   production matched the tested plan exactly (1 drop, 1 rekey, 0
   conflicts); `--apply` produced 26 keys with a `.bak-1788484650` safety
@@ -2167,7 +2435,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 113. Confirmed: `VLLM_USE_V1` no longer exists in vLLM on the current `:latest` build -- Incident #1's rule scoped, not deleted (V?.?.?)
 
-* **The Trap:** `TROUBLESHOOTING.md`'s own tuning reference contradicted
+* **Trap:** `TROUBLESHOOTING.md`'s own tuning reference contradicted
   itself on whether `VLLM_USE_V1=0` is required for 2-node cross-host
   topologies -- Incident #1 (from V4.8.1, #43) says it's required alongside
   `--distributed-executor-backend ray`; a later "Multi-node executor
@@ -2183,7 +2451,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   (`ModuleNotFoundError`). `vllm.engine.llm_engine` still resolves, but as
   a V1 compatibility shim, not a V0 code path. There is no V0 executor
   left for the variable to switch.
-* **The Fix:** Not a code fix -- a diagnostic result recorded before any
+* **Fix:** Not a code fix -- a diagnostic result recorded before any
   code changes. `errata.yaml` E015 records all four positions (required /
   no-effect / not-needed / removed-entirely) and the resolution: the
   Ray-flag half of Incident #1's rule (`--distributed-executor-backend
@@ -2211,7 +2479,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 112. `models.yaml` and its legacy code path retired -- Phase 2's last remnant, verified by AST equivalence and a live argv diff, not just `py_compile` (V?.?.?)
 
-* **The Trap:** Phase 2 (per-model recipe files replacing the monolithic
+* **Trap:** Phase 2 (per-model recipe files replacing the monolithic
   `models.yaml`) completed weeks ago, but `models.yaml` and a
   `USE_LEGACY_CATALOG=1` fallback survived untouched: the
   `MODELS_YAML_PATH` constant, `_load_model_catalog_legacy()` (24 lines),
@@ -2222,7 +2490,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   `GLOBAL_HF_HUB_OFFLINE`/`GLOBAL_TRANSFORMERS_OFFLINE` got injected into
   each topology's `env_vars` -- deleting the function blind could have
   silently dropped that behavior rather than just removing a fallback.
-* **The Fix:** Confirmed `build_catalog_response()`
+* **Fix:** Confirmed `build_catalog_response()`
   (`common/recipes.py:577-620`) already performs the identical
   strip-then-append injection for both offline switches, sourced from
   `cluster_config.yaml` instead of `models.yaml`'s own top-level keys --
@@ -2249,7 +2517,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 111. #110's root cause identified and resolved: not a key-derivation split, a duplicate recipe with an identical `hf_path` -- ledger cleanup handled separately (V?.?.?)
 
-* **The Trap:** #110 (below) recorded the symptom -- two ledger keys for
+* **Trap:** #110 (below) recorded the symptom -- two ledger keys for
   one model, `lifetime` and `launch_history`/`runs[]` split across a dot
   form and an underscore form -- but declined to guess at a fix without
   the call site identified, on the correct suspicion that guessing risked
@@ -2271,7 +2539,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   lowercasing or sanitizing it) is what rules out the served-name-derivation
   reading: that fallback would have produced the raw HF basename, not a
   recipe-stem-shaped key.
-* **The Fix:** The duplicate recipe file (dot form) was deleted by the
+* **Fix:** The duplicate recipe file (dot form) was deleted by the
   operator, closing the collision at its source -- only one recipe with
   this `hf_path` remains, so `_resolve_catalog_key()` can no longer return
   an ambiguous match for it. `errata.yaml` gained rule E018 (duplicate
@@ -2308,7 +2576,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 110. `nemotron-3.5-lightning-bf16`'s live-telemetry and deploy-tracking code paths derive different ledger keys for the same model -- confirmed live, split real usage data across two entries (V?.?.?)
 
-* **The Trap:** `model_ledger.json` picked up **two** separate `2_node`
+* **Trap:** `model_ledger.json` picked up **two** separate `2_node`
   entries for the same model: `nemotron-3.5-lightning-bf16::2_node`
   (literal dot) and `nemotron-3_5-lightning-bf16::2_node` (underscore,
   matching the actual recipe filename). The underscore key has the real
@@ -2332,7 +2600,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   extended same session with this incident plus the broader
   ledger-reconciliation gap it exposes (recipe renamed vs. changed vs.
   never-committed-only-ever-live-variant, currently indistinguishable).
-* **The Fix:** Not yet fixed -- documented as found. No safe one-line
+* **Fix:** Not yet fixed -- documented as found. No safe one-line
   fix without knowing which specific call site derives the dot-form key;
   guessing at a patch here risks silently merging two ledger entries
   that might not actually be safe to merge without inspecting both first
@@ -2413,7 +2681,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   `pp_size: 2` recipe against `qwen-3.5-122b-tp`'s `tp_size: 2` (the
   n=3 baseline) would have confounded topology with token depth, making
   any throughput delta uninterpretable.
-* **The Fix:** `qwen-3.5-122b.yaml` removed from the catalog rather than
+* **Fix:** `qwen-3.5-122b.yaml` removed from the catalog rather than
   left as a known-bad trap for someone to click later. **Update, same
   session:** `qwen-3.5-122b-tp` confirmed live with real throughput --
   `benchmark.py` 3-pass, warm avg 40.9 tok/s decode (38.4 cold, TTFT
@@ -2428,7 +2696,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 106. `ab_test.py`'s pre-pull only ever targeted the head node -- `spark-3` and `spark-4` silently drifted to different cached builds of the same `:latest` tag (V?.?.?)
 
-* **The Trap:** The pre-pull step ahead of every deploy (`docker pull
+* **Trap:** The pre-pull step ahead of every deploy (`docker pull
   {image}` before `docker run`/`cli deploy`) only ever ran against
   `host` -- the single head/target host passed into `run_stage()`. For a
   2-node deploy this never touched the second physical host at all.
@@ -2448,7 +2716,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   6/6 attempts spanning two unrelated recipes (`qwen-2_5-coder-32b`
   PP and its `-tp` TP sibling), ruling out either recipe as the cause.
   Found live, 2026-09-03.
-* **The Fix:** Pre-pull now loops over every host a 2-node deploy will
+* **Fix:** Pre-pull now loops over every host a 2-node deploy will
   actually use (`[PRIMARY_HOST, SECONDARY_HOST]`, mirroring
   `dgx-orchestrator.py`'s own `target_hosts` resolution for `nodes == 2`
   exactly, rather than redefining that set independently) instead of
@@ -2460,7 +2728,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 105. `ab_test.py`'s `any_override` treated `--{side}-nodes` itself as an override, making it structurally impossible to select a 2-node topology through the catalog-recipe path at all (V?.?.?)
 
-* **The Trap:** `resolve_variant()`'s pure-named-recipe-passthrough branch
+* **Trap:** `resolve_variant()`'s pure-named-recipe-passthrough branch
   (the only branch that can ever set `nodes=2`) requires `not any_override`
   to be reached. `any_override` was computed by checking every `ov` field
   including `nodes` itself -- so passing `--{side}-nodes 2` alone, with
@@ -2478,7 +2746,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   own suggested command was written before this was caught and doesn't
   work as written). Found live, 2026-09-03, while trying to run the
   `qwen-2_5-coder-32b` vs `qwen-2_5-coder-32b-tp` A/B.
-* **The Fix:** Excluded `"nodes"` from the `any_override` field check.
+* **Fix:** Excluded `"nodes"` from the `any_override` field check.
   `--{side}-nodes` alone now correctly reaches the passthrough branch;
   combined with any *real* override (`--{side}-vllm-args`, etc.) it still
   correctly falls through to the ad-hoc branch's existing `nodes > 1`
@@ -2489,7 +2757,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 104. `qwen3_next_mtp` (MTP) speculative decoding is incompatible with `pp_size > 1` -- hard vLLM `NotImplementedError`, not a recipe misconfiguration (V?.?.?)
 
-* **The Trap:** `qwen-3.6-27b-nvfp4.yaml`'s `2_node` topology
+* **Trap:** `qwen-3.6-27b-nvfp4.yaml`'s `2_node` topology
   (`pp_size: 2`, `--speculative-config
   '{"method":"qwen3_next_mtp","num_speculative_tokens":3}'`) crashed at
   engine-config-creation time, before any weight load or GPU work:
@@ -2502,7 +2770,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   checkpoint -- expect the identical crash on any recipe pairing an MTP
   draft head with `pp_size > 1`, e.g. `qwen-3.5-122b.yaml`'s PP-side MTP
   addition this same session, untested as of this writing.
-* **The Fix:** No fix -- this is a real upstream vLLM limitation, not a
+* **Fix:** No fix -- this is a real upstream vLLM limitation, not a
   flag ordering or config mistake to correct. MTP-family speculative
   decoding on this cluster requires `tp_size` (or single-node), never
   `pp_size > 1`. Caught cheaply: fails at config validation, before any
@@ -2511,7 +2779,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 103. Three recipes stuck on the `default_image`-has-no-Ray / TOMBSTONES #43 trap now confirmed fixed by an image swap plus the standard Ray fix -- `llama-3.3-70b`, `llama-4-fp4`, `llama-4-fp8` all now live-verified (V4.8.6+)
 
-* **The Trap:** covered live in `docs/TROUBLESHOOTING.md` Incident #11
+* **Trap:** covered live in `docs/TROUBLESHOOTING.md` Incident #11
   and this file's own #43 -- `llama-3.3-70b::2_node` crashed with
   `collective_rpc should not be called on follower node` (TOMBSTONES #43's
   exact signature) because its `vllm_args` never carried
@@ -2520,7 +2788,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   doesn't ship the `ray` binary at all (`exec: ray: not found`), so the
   flag had nowhere to run. `llama-4-fp4` and `llama-4-fp8` carried the
   identical gap in their own `2_node` topologies.
-* **The Fix:** all three recipes switched `image:` to
+* **Fix:** all three recipes switched `image:` to
   `eugr/spark-vllm-b12x:latest` (confirmed to ship Ray) and added
   `--distributed-executor-backend ray` plus `VLLM_USE_V1=0` to `vllm_args`
   /`env_vars` -- the latter per this file's #43 precedent, not because it
@@ -2543,7 +2811,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 102. `compile_stage_confidence` collapsed "genuinely uncached compile" and "possible cache hit" into one label — two real self-reported compile durations (78.32s, 31.78s) were indistinguishable from a lucky warm-cache 0.17s (V4.8.6, +fd079)
 
-* **The Trap:** `extract_phases()` reported any self-reported
+* **Trap:** `extract_phases()` reported any self-reported
   `torch.compile took Ns` line as `compile_stage_confidence: "reported"`,
   full stop. That's the right shape for "this number is real, not
   fabricated," but it silently answers a second question it was never
@@ -2559,7 +2827,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   cache. One label, two structurally different situations, no way for a
   reader of the ledger to tell which was which without re-deriving it
   from each recipe's `env_vars` by hand.
-* **The Fix:** `extract_phases()` gained an `inductor_cache_disabled:
+* **Fix:** `extract_phases()` gained an `inductor_cache_disabled:
   Optional[bool]` parameter — not derivable from log text (confirmed:
   grepped `TORCHINDUCTOR`/`FX_GRAPH_CACHE` across every real archive on
   hand, zero hits; it only ever appears in the recipe's own `env_vars`,
@@ -2582,7 +2850,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 101. No download-phase marker existed — a genuine 319s cold weight-download on `llama-4-fp4::1_node` was indistinguishable from unexplained slop (V4.8.6)
 
-* **The Trap:** `phase_extract.py` had a documented, known gap (flagged
+* **Trap:** `phase_extract.py` had a documented, known gap (flagged
   in the ETA-rework session's own closeout doc): nothing recognized
   vLLM's own self-reported download-duration line, so a cold
   first-ever-pull of a model's weights had its entire download window
@@ -2592,7 +2860,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   `model_ledger.json` under any topology) reported `unaccounted_sec:
   376.45` against a `total_sec` of `558.47` — the great majority of the
   run's wall clock, unattributed.
-* **The Fix:** New `_DOWNLOAD_DONE` regex on
+* **Fix:** New `_DOWNLOAD_DONE` regex on
   `[weight_utils.py:540] Time spent downloading weights for <model>: N
   seconds` — same source file as the existing `_LOADER_DONE` marker,
   structurally parallel, and confirmed to precede
@@ -2619,7 +2887,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 100. `UnrecognizedLogShape` catches total vocabulary mismatch but not partial mismatch — one marker silently failing while others matched produced a pre-load phase reported as 100% of total run time (V?.?.?)
 
-* **The Trap:** `extract_phases()`'s only safety net was
+* **Trap:** `extract_phases()`'s only safety net was
   `UnrecognizedLogShape`, raised when NO known marker matched anywhere in
   the log. That guard assumes a log either belongs to a recognized
   vocabulary (most markers match) or doesn't (none do) -- it has no
@@ -2639,7 +2907,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   Nothing short of a human computing the percentage and noticing it was
   implausible would have caught this; the field itself carried no
   indication it was degenerate.
-* **The Fix:** Two changes, not one -- adding the missing pattern alone
+* **Fix:** Two changes, not one -- adding the missing pattern alone
   would have fixed this specific log without fixing the failure mode.
   (1) `_LOADER_START` now accepts both confirmed phrasings. (2) New
   field `pre_load_confidence`: `"measured"` when at least one rank's
@@ -2659,7 +2927,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 99. Rank identity keyed on `Worker_TPn`, which isn't present on a worker's earliest log lines — one 2-node worker fragmented into two ledger-visible ranks (V?.?.?)
 
-* **The Trap:** `phase_extract.py`'s rank grouping tried `Worker_TPn`
+* **Trap:** `phase_extract.py`'s rank grouping tried `Worker_TPn`
   first, falling back to the stable `RayWorkerProc pid=N` tag only when
   no `Worker_TPn` was present on a given line. Against the real dspark
   2-node archive this produced `rank_count: 5` for what is actually a
@@ -2672,7 +2940,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   (`pid3575` and `TP0`), each holding a partial view -- `load_started_at`
   attributed to one entry, `weight_load_durations` to the other,
   neither individually correct.
-* **The Fix:** Key rank identity on the `RayWorkerProc` pid unconditionally
+* **Fix:** Key rank identity on the `RayWorkerProc` pid unconditionally
   when present -- it's on every line from that worker for the whole run,
   unlike `Worker_TPn`. `Worker_TPn` is kept only as a display label,
   resolved after parsing by scanning that rank's lines for any occurrence
@@ -2687,7 +2955,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 98. `docker logs`'s stdout and stderr are two separate streams concatenated end-to-end, not one chronological one — reading archive order as time order silently misordered every phase boundary past the seam (V?.?.?)
 
-* **The Trap:** `common/runlog.py`'s original archive write was
+* **Trap:** `common/runlog.py`'s original archive write was
   `raw = (log_res.stdout or "") + (log_res.stderr or "")`. Correct for
   content (a container's own stderr output belongs in the archive, and
   every existing reader in this codebase does the same concatenation),
@@ -2704,7 +2972,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   assume to be simple -- gets every boundary after the seam wrong by
   however far the two streams diverge, silently, since the file looks
   perfectly well-formed.
-* **The Fix:** `_merge_streams_by_timestamp()` -- tags every line with its
+* **Fix:** `_merge_streams_by_timestamp()` -- tags every line with its
   stream and nearest-preceding timestamp, then stable-sorts by
   (timestamp, stream) so untimestamped lines (tqdm `\r`-updated progress
   fragments, ~28% of lines in real archives) stay attached to whichever
@@ -2721,7 +2989,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 97. `"fetching" in logs_lower` matched the middle of "prefetching", so every load on an EXT4 host was filed as `downloaded` — and because that branch is checked first, it masked every compile too (V?.?.?)
 
-* **The Trap:** `_finalize_host_status()`'s READY-time bucket classifier
+* **Trap:** `_finalize_host_status()`'s READY-time bucket classifier
   tested bare substrings against the whole log:
   `if "downloading" in logs_lower or "fetching" in logs_lower`. vLLM's
   `weight_utils.py:881` emits, on every load whose filesystem is not a
@@ -2741,7 +3009,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   in a plausible-looking bucket, and the evidence needed to question it
   (the log) was read once and discarded — see #93 for the archive built
   precisely because nothing retained it.
-* **The Fix:** Word-bounded compiled patterns hoisted to module level:
+* **Fix:** Word-bounded compiled patterns hoisted to module level:
   `_RE_DOWNLOADING = \b(?:re)?(?:downloading|fetching)\b` and
   `_RE_COMPILING = \b(?:re)?(?:tilelang completes|jit compilation|compiling)\b`.
   `\b` kills the prefetching match — the position before `fetching` in
@@ -2769,7 +3037,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 96. `eta_seconds` was computed, latched, shipped in every `/api/status` payload, and never rendered — the dashboard had been showing the raw re-derived string all along (V?.?.?)
 
-* **The Trap:** The reported symptom was an ETA that "violently snaps
+* **Trap:** The reported symptom was an ETA that "violently snaps
   backwards" mid-load, and the obvious reading was that the backend
   estimate was wrong. It is wrong, but that was not why the number
   bounced on screen. `_finalize_host_status()` computes both an
@@ -2791,7 +3059,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   baseline, so a phase flip at elapsed=100s against a 180s baseline
   leaves the displayed remaining dropping from ~1400s to ~80s with the
   latch never triggering.
-* **The Fix:** Client-side monotonic clamp in `index.html`, no backend
+* **Fix:** Client-side monotonic clamp in `index.html`, no backend
   change. Each poll takes `min(server estimate, own projection)` so a
   poll may only ever pull the number down, and a 1s ticker interpolates
   between the 4s polls so it counts rather than stepping. State keys on
@@ -2814,7 +3082,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 95. Averaging a phase bucket that contains exactly one cold-JIT run parked the ETA on a number the load would never approach (V?.?.?)
 
-* **The Trap:** `get_estimated_load_time()` returned
+* **Trap:** `get_estimated_load_time()` returned
   `int(sum(times) / len(times))` over the recorded samples for
   `model::topo`. Every multi-sample series in `model_ledger.json` turns
   out to have the same shape — a tight cluster of warm runs plus exactly
@@ -2835,7 +3103,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   because classification is a substring scan of `docker logs --tail 5000`
   performed once at READY. The buckets are whole-run totals labelled by
   whichever keyword survived the tail window, not phase durations.
-* **The Fix:** `statistics.median(numeric)` instead of the mean, plus a
+* **Fix:** `statistics.median(numeric)` instead of the mean, plus a
   shape guard on the list itself — the ledger is hand-editable via
   `ledger_set_lifetime()`, and a malformed entry must degrade to the
   hardcoded default rather than raise inside a 4s status poll. 8 of 20
@@ -2855,7 +3123,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 94. Redacting `authorization: <value>` with `\S+` absorbed the word "Bearer" and archived the credential (V?.?.?)
 
-* **The Trap:** `common/runlog.py` redacts secrets before anything
+* **Trap:** `common/runlog.py` redacts secrets before anything
   touches disk, since run-log archives are meant to be kept indefinitely
   and shared while investigating a load, and this codebase has already
   leaked a token once (`--dry-run` rendered `HF_TOKEN` in plaintext in an
@@ -2870,7 +3138,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   exactly where the secret is. This is the standard shape of an HTTP
   Authorization header, so it is the likeliest form for a real leak to
   take, not an edge case.
-* **The Fix:** Optional `(?:bearer\s+)?` group between the separator and
+* **Fix:** Optional `(?:bearer\s+)?` group between the separator and
   the captured value, so the scheme is consumed and the credential is
   what gets replaced. Caught by a test asserting the specific secret
   string is absent from the decompressed archive, rather than asserting
@@ -2882,7 +3150,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 93. A failed `docker logs` was archived as though it were the container's log, because stdout and stderr are concatenated unconditionally (V?.?.?)
 
-* **The Trap:** Every existing reader in `dgx-orchestrator.py` does
+* **Trap:** Every existing reader in `dgx-orchestrator.py` does
   `log_res.stdout + log_res.stderr` — correctly, because a container's
   own stderr arrives on the stderr channel and dropping it would lose
   most of vLLM's output. `common/runlog.py`'s archive path copied that
@@ -2897,7 +3165,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   a run whose logs "don't say anything useful" — indistinguishable from a
   quiet load, and only noticed much later when someone tried to
   reconstruct phase boundaries from it.
-* **The Fix:** Check `log_res.returncode != 0` and return `None` before
+* **Fix:** Check `log_res.returncode != 0` and return `None` before
   touching the concatenation — archive nothing rather than something
   false. Surfaced by a test that deliberately failed the `docker logs`
   call and asserted the function returns `None`, rather than asserting it
@@ -2910,7 +3178,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 92. `vllm_args` was hashed as a raw string, so a trailing newline from a YAML block-scalar edit silently reverted a validated recipe to untested (V?.?.?)
 
-* **The Trap:** `compute_config_hash()` sorted `env_vars` before hashing
+* **Trap:** `compute_config_hash()` sorted `env_vars` before hashing
   — explicitly, so that reordering entries would not invalidate tested
   status — but passed `vllm_args` through as the raw string. Its
   docstring acknowledged flag reordering as a known simplification
@@ -2927,7 +3195,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   scalar, so reflowing the block, or an editor appending a newline, is
   enough to orphan the recipe's entire launch history with no change to
   what gets launched.
-* **The Fix:** `_canonicalize_vllm_args()` — `shlex.split()`, group into
+* **Fix:** `_canonicalize_vllm_args()` — `shlex.split()`, group into
   flag→value pairs, sort. Three deliberate bail-outs to the raw string,
   each trading a possible false "untested" for never a false
   "validated": unparseable input (unbalanced quotes must not raise out
@@ -2948,7 +3216,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 91. `mods` was excluded from `config_hash` on an "inert metadata" premise that stopped being true when the bake pipeline landed — two recipes differing only in mods shared each other's "launched successfully" record (V?.?.?)
 
-* **The Trap:** `compute_config_hash()`'s docstring listed `mods` under
+* **Trap:** `compute_config_hash()`'s docstring listed `mods` under
   "Deliberately EXCLUDES capability/mods (inert metadata, Phase 4)", and
   `RecipeConfig.mods` carried a stronger instruction still: mods "must
   stay out of `compute_config_hash()` even once wired up". Both were
@@ -2987,7 +3255,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   asserting a field is inert is a claim about a *point in time*, and it
   does not update itself when the field is wired up. The wiring commit
   is not where anyone thinks to re-read a hash function's exclusion list.
-* **The Fix:** `mods` is now part of the payload, as an ORDERED list —
+* **Fix:** `mods` is now part of the payload, as an ORDERED list —
   deliberately NOT sorted, unlike `env_vars`. Mods bake in sequence and a
   later mod can overwrite an earlier one's changes, so `["a", "b"]` and
   `["b", "a"]` are genuinely different images and sorting would merge
@@ -3015,7 +3283,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 90. Generalizing `tests/metest.py`'s Gemma4 presets into `tests/ab_test.py` silently reordered `dflash`'s docker serve-args — caught only by explicit argv diffing, not review (V?.?.?)
 
-* **The Trap:** Refactoring `run_dflash_stage()`'s hardcoded raw-docker
+* **Trap:** Refactoring `run_dflash_stage()`'s hardcoded raw-docker
   build into a reusable "preset" (a static partial argv list + an
   `.append()` of the host/port/max-model-len/gpu-util flags, tacked on
   once those values were known) produced a `docker run` command with the
@@ -3041,7 +3309,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   `tests/metest.py` (#88); the script has since been generalized from a
   fixed 3-stage Gemma4 smoke test into a general two-sided recipe A/B rig
   and renamed to `tests/ab_test.py`.
-* **The Fix:** Converted the static partial-list-plus-append pattern into
+* **Fix:** Converted the static partial-list-plus-append pattern into
   a closure (`build_serve_args(port, max_model_len, gpu_util)`) that
   places every flag at its exact original argv position, called once the
   final values are resolved, rather than appending anything after the
@@ -3063,7 +3331,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 89. `eugr/spark-vllm-b12x`'s forked `Gemma4Proposer` breaks MTP speculative decoding — mainline vLLM doesn't (V?.?.?)
 
-* **The Trap:** Deploying Gemma 4 26B-A4B NVFP4 with native MTP
+* **Trap:** Deploying Gemma 4 26B-A4B NVFP4 with native MTP
   speculative decoding on this cluster's usual image
   (`eugr/spark-vllm-b12x:latest`) boots cleanly — model loads, MTP draft
   layers map correctly, `/health` passes — then crashes on the very
@@ -3090,7 +3358,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   `envs.py` reports it as an unrecognized variable, and a sibling AEON
   model's own docs suggest the auto-selected `VLLM_CUTLASS` MoE backend
   is the *intended* default anyway, not something to correct.
-* **The Fix:** Use `eugr/spark-vllm:latest` (mainline) for MTP
+* **Fix:** Use `eugr/spark-vllm:latest` (mainline) for MTP
   deployments of this model, not `-b12x`. Confirmed working across 8
   live runs (`num_speculative_tokens` 2 and 4, 4 runs each): clean
   boot, no crash, ~50-53 tok/s single-stream. `-b12x`'s own MoE-kernel
@@ -3104,7 +3372,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 88. YAML double-quoted scalars silently break on `vllm_args` containing embedded JSON — use a block scalar instead (tests/metest.py)
 
-* **The Trap:** `tests/metest.py`'s scratch-recipe generator wrapped
+* **Trap:** `tests/metest.py`'s scratch-recipe generator wrapped
   `vllm_args` in a YAML double-quoted string
   (`vllm_args: "{vllm_args}"`). This works fine for a plain flag string,
   but the moment `vllm_args` contains a `--speculative-config` value —
@@ -3120,7 +3388,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   #42/#28 (YAML scalar handling for `vllm_args` — comment pollution in a
   folded scalar, in those cases), different specific mechanism (embedded
   quote characters, not embedded `#` comments).
-* **The Fix:** Write `vllm_args` as a YAML block scalar (`>-`) instead of
+* **Fix:** Write `vllm_args` as a YAML block scalar (`>-`) instead of
   a quoted flow scalar — block scalars have no quote-delimiter for
   embedded content to collide with, so arbitrary JSON, single quotes, or
   other YAML-special characters inside the value are never a problem
@@ -3135,7 +3403,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 87. `tests/` scripts can't import `common.*` without adding the repo root to `sys.path` themselves (tests/smoke_test_gemma4_nvfp4.py)
 
-* **The Trap:** A script living in `tests/` (or any subdirectory other than
+* **Trap:** A script living in `tests/` (or any subdirectory other than
   the repo root) that does `from common.X import ...` fails immediately
   with `ModuleNotFoundError: No module named 'common'` when invoked
   directly — confirmed live on the first real run of
@@ -3149,7 +3417,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   style. Same root shape as #83 (a `tests/` script quietly diverging from
   an assumption that only holds for code at the repo root), different
   specific mechanism.
-* **The Fix:** Resolve the repo root via the `BASE_DIR` env var
+* **Fix:** Resolve the repo root via the `BASE_DIR` env var
   (`docker-compose.yml` sets `BASE_DIR=/app` in the orchestrator
   container) with a fallback to `Path(__file__).resolve().parent.parent`,
   and `sys.path.insert(0, ...)` it before any `common` import:
@@ -3170,7 +3438,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 86. `--dry-run` output embeds live secrets in plaintext (V?.?.?)
 
-* **The Trap:** `docker_run_commands` in a `--dry-run` response is the
+* **Trap:** `docker_run_commands` in a `--dry-run` response is the
   literal argv `docker run` would receive, including every `-e
   KEY=value` flag — which means it includes `-e HF_TOKEN=<real token>`
   whenever `get_hf_token()` finds one. `--dry-run` reads as "nothing real
@@ -3183,7 +3451,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   during Task MC's own live-hardware verification, when a real dry-run
   response containing a real token was pasted into a conversation as
   part of confirming the output looked correct.
-* **The Fix:** None applied yet. Worth deciding deliberately rather than
+* **Fix:** None applied yet. Worth deciding deliberately rather than
   patched reactively: either mask any `-e (HF_TOKEN|.*_TOKEN|.*_KEY)=...`
   value before it's ever added to a response dict (so `--dry-run`,
   `docker_run_commands`, and any future JSON/log surface stay safe to
@@ -3196,7 +3464,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 85. Two mod-set failure modes look identical but are not: resolution vs. bake (V?.?.?)
 
-* **The Trap:** `common/mods.py` (Task MB) exposes two distinct exception
+* **Trap:** `common/mods.py` (Task MB) exposes two distinct exception
   types for what looks, from the call site, like one kind of failure:
   `ModResolutionError` (a recipe names a `mods/<n>` directory that doesn't
   exist — pure/local, no SSH, deterministic for a given
@@ -3220,7 +3488,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   visible from the exception message alone unless the message names the
   exception type or the caller checks `type(exc)` separately per class.
 
-* **The Fix:** Task MC's integration
+* **Fix:** Task MC's integration
   (`_execute_deployment_impl._resolve_host_image_tag()` /
   `dgx-orchestrator.py`) deliberately keeps the per-host bake-then-run
   ordering (bake immediately before *that host's* `docker run`, not a
@@ -3239,7 +3507,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 84. `common/mods.py`'s own module docstring names a function that doesn't exist (V?.?.?)
 
-* **The Trap:** `common/mods.py`'s module-level docstring (the "Task MB"
+* **Trap:** `common/mods.py`'s module-level docstring (the "Task MB"
   header comment) says: *"given a base image tag and an ordered list of
   mod names, `resolve_and_bake_mods()` below returns the tag of an image
   with those mods applied, baking it on the target host first if that tag
@@ -3254,7 +3522,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   another, and nothing catches the drift" pattern this repo has already
   paid for once (the old recipe `name:`-field-vs-filename split
   `common/recipes.py`'s own docstring documents fixing).
-* **The Fix:** None applied — Task MC's declared scope was
+* **Fix:** None applied — Task MC's declared scope was
   `dgx-orchestrator.py` only; `common/mods.py` (MB's deliverable) was left
   byte-for-byte as uploaded, per this task's scope boundary. Flagging here
   so MB's owner (or whoever next touches `common/mods.py`) can either
@@ -3265,7 +3533,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 
 ### 83. Smoke test's independent-verification SSH calls silently broke on multi-word `--format` strings (tests/smoke_test_mods.py)
 
-* **The Trap:** `tests/smoke_test_mods.py` hand-rolled its own `ssh_run()`
+* **Trap:** `tests/smoke_test_mods.py` hand-rolled its own `ssh_run()`
   helper for "independent verification" -- checking `common/mods.py`'s
   output via plain `docker inspect` calls that don't go through the code
   being tested. Reasonable goal, wrong layer: the helper duplicated
@@ -3292,7 +3560,7 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   transport for "independence" reintroduced the exact bug that
   consolidation was meant to prevent.
 
-* **The Fix:** `ssh_run()` in `tests/smoke_test_mods.py` is now a one-line
+* **Fix:** `ssh_run()` in `tests/smoke_test_mods.py` is now a one-line
   adapter over `common.ssh.run_ssh()` instead of a parallel implementation.
   "Independent verification" means not calling `ensure_mods_baked()` to
   check its own output -- it does not mean re-deriving SSH transport
@@ -3348,44 +3616,44 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
 * **File:** common/ssh.py, get_hf_token()
 
 ### 81. Long-Lived Daemon Slowly Exhausted the Container's Process Table (V4.8.7)
-* **The Trap:** `common/ssh.py`'s `run_ssh()` uses SSH's `ControlMaster=auto` / `ControlPersist=60s` for connection reuse — by design, a `ControlPersist` master detaches from the SSH client that spawned it so it can outlive that client. When its original parent process exits, standard Unix reparenting hands it to PID 1 of its namespace. The Dockerfile's `CMD` runs `python3 dgx-orchestrator.py daemon` directly as PID 1, with no `tini`/`dumb-init`/`--init` — and a bare Python process has no general-purpose logic to reap arbitrary reparented children (it only ever waits on processes it directly spawned itself, which is correct for those, but says nothing about orphans reparented to it from elsewhere). Every `ControlPersist` master that got reparented and later exited became a zombie nothing ever collected. Over enough days of continuous status polling (SSH calls against every host, every 4-10s, forever), this is a slow, steady climb toward the container's PID ceiling. Surfaced as `dgx-config` failing with `OCI runtime exec failed ... nsexec-0[...]: unable to spawn stage-1: Resource temporarily unavailable` — `runc` failing to fork a new process inside the container because there was no room left. Both the dashboard's teardown button and `dgx-config teardown` failed identically (same underlying container, same PID exhaustion) until a full `docker compose down`/recreate cleared the whole PID namespace and gave temporary relief — a strong tell in hindsight that should have pointed straight at container-level resource exhaustion rather than anything in `dgx-orchestrator.py`'s own logic.
-* **The Fix:** Added `init: true` to `orchestrator-api` in `docker-compose.yml`, which runs Docker's built-in `tini`-based init as PID 1 instead of the raw Python process. `tini` correctly reaps any reparented orphan regardless of what spawned it, closing the leak at its actual source with a one-line config change and zero code changes. `run_ssh()`'s own docstring had already correctly identified this exact leak mechanism in the abstract (see its "Process-tree cleanup on timeout" section) without yet being connected to this specific production symptom — worth rereading that docstring in full if this class of issue ever resurfaces elsewhere.
+* **Trap:** `common/ssh.py`'s `run_ssh()` uses SSH's `ControlMaster=auto` / `ControlPersist=60s` for connection reuse — by design, a `ControlPersist` master detaches from the SSH client that spawned it so it can outlive that client. When its original parent process exits, standard Unix reparenting hands it to PID 1 of its namespace. The Dockerfile's `CMD` runs `python3 dgx-orchestrator.py daemon` directly as PID 1, with no `tini`/`dumb-init`/`--init` — and a bare Python process has no general-purpose logic to reap arbitrary reparented children (it only ever waits on processes it directly spawned itself, which is correct for those, but says nothing about orphans reparented to it from elsewhere). Every `ControlPersist` master that got reparented and later exited became a zombie nothing ever collected. Over enough days of continuous status polling (SSH calls against every host, every 4-10s, forever), this is a slow, steady climb toward the container's PID ceiling. Surfaced as `dgx-config` failing with `OCI runtime exec failed ... nsexec-0[...]: unable to spawn stage-1: Resource temporarily unavailable` — `runc` failing to fork a new process inside the container because there was no room left. Both the dashboard's teardown button and `dgx-config teardown` failed identically (same underlying container, same PID exhaustion) until a full `docker compose down`/recreate cleared the whole PID namespace and gave temporary relief — a strong tell in hindsight that should have pointed straight at container-level resource exhaustion rather than anything in `dgx-orchestrator.py`'s own logic.
+* **Fix:** Added `init: true` to `orchestrator-api` in `docker-compose.yml`, which runs Docker's built-in `tini`-based init as PID 1 instead of the raw Python process. `tini` correctly reaps any reparented orphan regardless of what spawned it, closing the leak at its actual source with a one-line config change and zero code changes. `run_ssh()`'s own docstring had already correctly identified this exact leak mechanism in the abstract (see its "Process-tree cleanup on timeout" section) without yet being connected to this specific production symptom — worth rereading that docstring in full if this class of issue ever resurfaces elsewhere.
 
 ### 80. `ACTIVE_DEPLOYMENT_STATE`'s In-Memory Cache Didn't Survive `dgx-config`'s Own Execution Model (V4.8.7)
-* **The Trap:** #77 introduced `ACTIVE_DEPLOYMENT_STATE` as a disk-backed *but also in-memory-cached* dict — loaded once at daemon startup, then mutated in place by `_set_active_deployment()`/`_clear_active_deployment()`, with every read going through that cached global. This assumed every writer was the long-running daemon process itself. It isn't: `dgx-config` is a bash wrapper that `docker exec`s straight into the *same* running `dgx-orchestrator-api` container to run `python3 dgx-orchestrator.py cli ...` — a genuinely separate process from the daemon's own PID 1, every single invocation. A CLI-triggered deploy wrote the correct record to the JSON file on disk and exited; the daemon's in-memory copy never saw that write and kept serving `active_recipe_key: null` via `/api/status` indefinitely, even though `docker exec dgx-orchestrator-api cat active_deployment_state.json` showed the correct data sitting right there the whole time. Confirmed directly: file on disk had the right `catalog_key`, live API response for the same host was `null`, simultaneously.
-* **The Fix:** Removed the in-memory global entirely. `_set_active_deployment()`/`_clear_active_deployment()` now do a read-modify-write straight against disk on every call; the sole read site (inside `_resolve_active_recipe()`) now calls `_load_active_deployment_state()` fresh each time instead of touching a cached dict. This is the same pattern `model_ledger.json` and `hf_path_ledger.json` already used via `_read_json_state()` — `ACTIVE_DEPLOYMENT_STATE` was the one file given different (and, it turned out, wrong) treatment for no real reason. Verified with a standalone test simulating two fully independent processes (one writing, one reading with zero shared memory) confirming the always-fresh-read approach sees the write correctly. **General lesson for this codebase specifically:** any in-memory cache of state that `dgx-config` can also write is unsafe by construction, because `dgx-config` invocations are never the same process as the daemon, even though they run inside the same container.
+* **Trap:** #77 introduced `ACTIVE_DEPLOYMENT_STATE` as a disk-backed *but also in-memory-cached* dict — loaded once at daemon startup, then mutated in place by `_set_active_deployment()`/`_clear_active_deployment()`, with every read going through that cached global. This assumed every writer was the long-running daemon process itself. It isn't: `dgx-config` is a bash wrapper that `docker exec`s straight into the *same* running `dgx-orchestrator-api` container to run `python3 dgx-orchestrator.py cli ...` — a genuinely separate process from the daemon's own PID 1, every single invocation. A CLI-triggered deploy wrote the correct record to the JSON file on disk and exited; the daemon's in-memory copy never saw that write and kept serving `active_recipe_key: null` via `/api/status` indefinitely, even though `docker exec dgx-orchestrator-api cat active_deployment_state.json` showed the correct data sitting right there the whole time. Confirmed directly: file on disk had the right `catalog_key`, live API response for the same host was `null`, simultaneously.
+* **Fix:** Removed the in-memory global entirely. `_set_active_deployment()`/`_clear_active_deployment()` now do a read-modify-write straight against disk on every call; the sole read site (inside `_resolve_active_recipe()`) now calls `_load_active_deployment_state()` fresh each time instead of touching a cached dict. This is the same pattern `model_ledger.json` and `hf_path_ledger.json` already used via `_read_json_state()` — `ACTIVE_DEPLOYMENT_STATE` was the one file given different (and, it turned out, wrong) treatment for no real reason. Verified with a standalone test simulating two fully independent processes (one writing, one reading with zero shared memory) confirming the always-fresh-read approach sees the write correctly. **General lesson for this codebase specifically:** any in-memory cache of state that `dgx-config` can also write is unsafe by construction, because `dgx-config` invocations are never the same process as the daemon, even though they run inside the same container.
 
 ### 79. `ORCHESTRATOR_VERSION`'s Hash Suffix Was Broken Two Different Ways Before It Actually Worked (V4.8.6)
-* **The Trap:** First attempt appended a short `git rev-parse --short HEAD` commit hash (+ `-dirty` flag) to `ORCHESTRATOR_VERSION`, computed at daemon startup via `subprocess`. This assumed a live git checkout with `.git` history was reachable at runtime — not true for this daemon: the Docker image is built via `COPY . .`, and while `.git` wasn't deliberately excluded, the more fundamental problem is portability — this makes the code awkward to hand to anyone without access to this specific git history, and confirmed in production it degraded to a permanently-silent `"+unknown"` on every real startup regardless, since the bare `except Exception: return "unknown"` swallowed whatever the actual failure was with zero diagnostic trail. Second attempt replaced the git dependency with a hash of the running file's own bytes (`hashlib.sha256(Path(__file__).read_bytes())`) — no git needed, portable to anyone regardless of repo access — but *also* silently returned `"+unknown"` in production, for a different and still-undiagnosed reason at the time, because the same silent-except pattern was carried over into the replacement code.
-* **The Fix:** `Path(__file__).resolve()` instead of a bare `Path(__file__)` — `__file__` isn't guaranteed to already be an absolute path, and a relative path resolved against a working directory that doesn't match where the file actually lives (a real risk in a containerized daemon's launch command) fails a bare `read_bytes()` silently. Also added `print()` logging to the `except` block itself, so a third failure (if one ever happens) is diagnosable instead of another silent `"unknown"`. Broader lesson, already called out elsewhere in this log but worth restating: a version-identity mechanism that can silently fail closed into looking fine (`"+unknown"` doesn't error, it just quietly stops being useful) needs its own failure path logged from the moment it's written, not added later once it's already shipped broken twice.
+* **Trap:** First attempt appended a short `git rev-parse --short HEAD` commit hash (+ `-dirty` flag) to `ORCHESTRATOR_VERSION`, computed at daemon startup via `subprocess`. This assumed a live git checkout with `.git` history was reachable at runtime — not true for this daemon: the Docker image is built via `COPY . .`, and while `.git` wasn't deliberately excluded, the more fundamental problem is portability — this makes the code awkward to hand to anyone without access to this specific git history, and confirmed in production it degraded to a permanently-silent `"+unknown"` on every real startup regardless, since the bare `except Exception: return "unknown"` swallowed whatever the actual failure was with zero diagnostic trail. Second attempt replaced the git dependency with a hash of the running file's own bytes (`hashlib.sha256(Path(__file__).read_bytes())`) — no git needed, portable to anyone regardless of repo access — but *also* silently returned `"+unknown"` in production, for a different and still-undiagnosed reason at the time, because the same silent-except pattern was carried over into the replacement code.
+* **Fix:** `Path(__file__).resolve()` instead of a bare `Path(__file__)` — `__file__` isn't guaranteed to already be an absolute path, and a relative path resolved against a working directory that doesn't match where the file actually lives (a real risk in a containerized daemon's launch command) fails a bare `read_bytes()` silently. Also added `print()` logging to the `except` block itself, so a third failure (if one ever happens) is diagnosable instead of another silent `"unknown"`. Broader lesson, already called out elsewhere in this log but worth restating: a version-identity mechanism that can silently fail closed into looking fine (`"+unknown"` doesn't error, it just quietly stops being useful) needs its own failure path logged from the moment it's written, not added later once it's already shipped broken twice.
 * 
 ### 78. Dashboard Teardown Silently Reported Success on Real Per-Host Failures (V4.8.6)
-* **The Trap:** `_execute_teardown_impl`'s `finally` block unconditionally set the completion message to `"Teardown complete for {hosts}"`, regardless of what the per-host `results` dict actually recorded — a `docker rm` timeout or non-zero exit was captured correctly in `results[h]` (e.g. `"Error: docker rm timed out..."`) but never reflected in `TEARDOWN_STATE`'s final message. `/api/teardown` then returned that `results` dict as a bare 200 OK with no inspection at all, so the dashboard's own `!response.ok` error-toast branch in `index.html` — which already existed and already worked correctly — never had a reason to fire. The CLI's `teardown` subcommand hit the exact same possible per-host failures (same `execute_teardown()` call) but `print(json.dumps(...))`s the raw results dict, so failures were visible there and only there. This is what made dashboard teardown look markedly less reliable than CLI teardown despite both going through identical backend logic: a host where `docker rm` genuinely failed kept its container running, ACTIVE_DEPLOYMENT_STATE still got cleared unconditionally (see #77), and the dashboard reported "done" — leaving the Model Deployer panel showing nothing active while the host's own panel still showed a loaded model, with no indication anything needed manual attention until someone noticed the mismatch and killed the container by hand.
-* **The Fix:** Added `_teardown_results_are_clean()` — a missing or empty `results` entry for any target host counts as failure, not success, since an exception raised before the "removing" phase populated `results` was previously indistinguishable from a clean run. The `finally` block now composes an accurate completion message listing exactly which hosts failed and why, and sets `TEARDOWN_STATE["phase"] = "error"` when that happens (new value alongside the existing idle/signaling/stopping/removing/sweeping/done). `/api/teardown` now raises `HTTPException` on real failure — a per-host error, or `CLUSTER_OP_LOCK` busy — bringing it in line with `api_deploy()`/`api_benchmark()`, which already both checked their result's status; this endpoint was the one overlooked outlier. No frontend changes were needed: `index.html`'s error-toast handling already existed and simply needed a non-2xx response to react to. Not yet verified against a live per-host failure on production (no failing teardown to test against at the time of the fix) — worth confirming the error toast and message actually render correctly next time a host genuinely fails to tear down.
+* **Trap:** `_execute_teardown_impl`'s `finally` block unconditionally set the completion message to `"Teardown complete for {hosts}"`, regardless of what the per-host `results` dict actually recorded — a `docker rm` timeout or non-zero exit was captured correctly in `results[h]` (e.g. `"Error: docker rm timed out..."`) but never reflected in `TEARDOWN_STATE`'s final message. `/api/teardown` then returned that `results` dict as a bare 200 OK with no inspection at all, so the dashboard's own `!response.ok` error-toast branch in `index.html` — which already existed and already worked correctly — never had a reason to fire. The CLI's `teardown` subcommand hit the exact same possible per-host failures (same `execute_teardown()` call) but `print(json.dumps(...))`s the raw results dict, so failures were visible there and only there. This is what made dashboard teardown look markedly less reliable than CLI teardown despite both going through identical backend logic: a host where `docker rm` genuinely failed kept its container running, ACTIVE_DEPLOYMENT_STATE still got cleared unconditionally (see #77), and the dashboard reported "done" — leaving the Model Deployer panel showing nothing active while the host's own panel still showed a loaded model, with no indication anything needed manual attention until someone noticed the mismatch and killed the container by hand.
+* **Fix:** Added `_teardown_results_are_clean()` — a missing or empty `results` entry for any target host counts as failure, not success, since an exception raised before the "removing" phase populated `results` was previously indistinguishable from a clean run. The `finally` block now composes an accurate completion message listing exactly which hosts failed and why, and sets `TEARDOWN_STATE["phase"] = "error"` when that happens (new value alongside the existing idle/signaling/stopping/removing/sweeping/done). `/api/teardown` now raises `HTTPException` on real failure — a per-host error, or `CLUSTER_OP_LOCK` busy — bringing it in line with `api_deploy()`/`api_benchmark()`, which already both checked their result's status; this endpoint was the one overlooked outlier. No frontend changes were needed: `index.html`'s error-toast handling already existed and simply needed a non-2xx response to react to. Not yet verified against a live per-host failure on production (no failing teardown to test against at the time of the fix) — worth confirming the error toast and message actually render correctly next time a host genuinely fails to tear down.
 
 ### 77. Dashboard Model-Select Dropdown Silently Showed the Wrong Deployed Recipe (V4.8.6)
-* **The Trap:** The dashboard (and `SESSION_TRACKER`'s lifetime-token attribution, and the ledger auto-detect CLI's `_detect_live_model_topo_metrics()`) all resolved "which recipe is currently running" the same way: fuzzy-matching the served checkpoint's display name (`active_model`, e.g. `"DeepSeek-V4-Flash-0731"`) against catalog keys and `hf_path`s via `_resolve_catalog_key()`. Two recipes serving the identical checkpoint under materially different configs — `deepseek-v4-flash-0731-1M` and `deepseek-v4-flash-0731-dspark-sm120` both report the same served name — collide under that match by construction, so the code silently took whichever catalog entry it happened to iterate to first, independent of which recipe was actually deployed. Reported symptom: the model-select dropdown kept snapping back to `-1M` regardless of what was actually launched. Same ambiguity also risked misattributing lifetime prompt/generation token counts to the wrong recipe's `model_ledger.json` entry, silently — a data-correctness bug, not just a UI one.
-* **The Fix:** Added `ACTIVE_DEPLOYMENT_STATE`, a disk-backed (`active_deployment_state.json`) per-host record of `{catalog_key, topo_key, config_hash}`, written by `execute_deployment()` at the exact moment it knows what it launched — reusing the same `config_hash` already computed for `PENDING_LAUNCH_STATE` (see #76's launch-success tracking), not a new hashing mechanism. Cleared per-host on teardown (unconditionally, same "always resets" reasoning as `TEARDOWN_STATE`). Only trusted when live container discovery confirms something is actually running on that host (`active_container != "None"`), so a stale record can't survive an out-of-band `docker rm` done outside the orchestrator. The three independent copies of "prefer the exact record, fall back to fuzzy match" this fix initially produced (one each in `_finalize_host_status`, `_compute_cluster_status_impl`, `_detect_live_model_topo_metrics`, each with subtly different gating) were consolidated into a single `_resolve_active_recipe()` helper in the same pass, once the duplication was noticed. `/api/status` now exposes `active_recipe_key`/`active_config_hash` per host; `index.html`'s `fetchStatus()` reads that directly instead of re-deriving it via string matching. Note: this entry's original in-memory-caching approach to `ACTIVE_DEPLOYMENT_STATE` was itself found broken and fixed separately — see #80.
+* **Trap:** The dashboard (and `SESSION_TRACKER`'s lifetime-token attribution, and the ledger auto-detect CLI's `_detect_live_model_topo_metrics()`) all resolved "which recipe is currently running" the same way: fuzzy-matching the served checkpoint's display name (`active_model`, e.g. `"DeepSeek-V4-Flash-0731"`) against catalog keys and `hf_path`s via `_resolve_catalog_key()`. Two recipes serving the identical checkpoint under materially different configs — `deepseek-v4-flash-0731-1M` and `deepseek-v4-flash-0731-dspark-sm120` both report the same served name — collide under that match by construction, so the code silently took whichever catalog entry it happened to iterate to first, independent of which recipe was actually deployed. Reported symptom: the model-select dropdown kept snapping back to `-1M` regardless of what was actually launched. Same ambiguity also risked misattributing lifetime prompt/generation token counts to the wrong recipe's `model_ledger.json` entry, silently — a data-correctness bug, not just a UI one.
+* **Fix:** Added `ACTIVE_DEPLOYMENT_STATE`, a disk-backed (`active_deployment_state.json`) per-host record of `{catalog_key, topo_key, config_hash}`, written by `execute_deployment()` at the exact moment it knows what it launched — reusing the same `config_hash` already computed for `PENDING_LAUNCH_STATE` (see #76's launch-success tracking), not a new hashing mechanism. Cleared per-host on teardown (unconditionally, same "always resets" reasoning as `TEARDOWN_STATE`). Only trusted when live container discovery confirms something is actually running on that host (`active_container != "None"`), so a stale record can't survive an out-of-band `docker rm` done outside the orchestrator. The three independent copies of "prefer the exact record, fall back to fuzzy match" this fix initially produced (one each in `_finalize_host_status`, `_compute_cluster_status_impl`, `_detect_live_model_topo_metrics`, each with subtly different gating) were consolidated into a single `_resolve_active_recipe()` helper in the same pass, once the duplication was noticed. `/api/status` now exposes `active_recipe_key`/`active_config_hash` per host; `index.html`'s `fetchStatus()` reads that directly instead of re-deriving it via string matching. Note: this entry's original in-memory-caching approach to `ACTIVE_DEPLOYMENT_STATE` was itself found broken and fixed separately — see #80.
 
 ### 76. `SessionTracker` Self-Deadlock — The Real Cause of the Multi-Hour Dashboard Freezes (V4.8.5)
-* **The Trap:** `SessionTracker.lock` was a plain `threading.Lock()`. `update()` holds this lock for its entire body, and when its periodic "flush while still active" condition fires (>1hr of sustained activity — true of essentially any real serving session), it calls `self._commit_session()`, which *also* acquires the same lock. A plain `Lock` cannot be re-acquired by the thread already holding it: permanent, deterministic, self-inflicted deadlock, with no recovery short of restarting the process. Since `get_cluster_status()` only ever keeps one `_STATUS_INFLIGHT` future in flight at a time (see #40), this single wedged thread froze *all* status polling indefinitely — the actual root cause of the dashboard-frozen-for-hours incidents on 2026-08-25, 08-27, and 08-28, pre-existing before any of this session's other fixes and misdiagnosed each time as something else (see #74, and the ruled-out SSH/thread-pool theories below). This is also why restarting the daemon only ever gave temporary relief: a fresh `SessionTracker` starts unlocked, then reliably deadlocks again roughly an hour into the next real session.
-* **The Fix:** `threading.Lock()` → `threading.RLock()` — reentrant-safe for the same-thread re-acquire case, no change to cross-thread contention semantics. Found via a live `py-spy dump` against the actually-wedged production process, not inferred — the stack trace showed the exact `_commit_session` → `update` → `_compute_cluster_status_impl` chain, blocked. Proven with a reproduction of the real production call sequence: confirmed the original `Lock()` deadlocks within 5s every time, and `RLock()` completes and flushes correctly every time. Two theories investigated and ruled out along the way, kept here so they aren't re-walked: SSH subprocess-level hangs in `run_ssh()` (its `subprocess.run(..., timeout=...)` reliably kills its child and returns within its own timeout, even against a detached grandchild holding stdout/stderr open); and naive `WORKER_POOL` backlog growth from serial polling (tested over 150s against a deliberately slow host — the pool self-limits, backlog stabilizes). A third, `WORKER_POOL` starvation from a stuck teardown, is real (see #70) but bounded to roughly 5 minutes worst-case, not hours — a genuine but secondary bug, not this one.
+* **Trap:** `SessionTracker.lock` was a plain `threading.Lock()`. `update()` holds this lock for its entire body, and when its periodic "flush while still active" condition fires (>1hr of sustained activity — true of essentially any real serving session), it calls `self._commit_session()`, which *also* acquires the same lock. A plain `Lock` cannot be re-acquired by the thread already holding it: permanent, deterministic, self-inflicted deadlock, with no recovery short of restarting the process. Since `get_cluster_status()` only ever keeps one `_STATUS_INFLIGHT` future in flight at a time (see #40), this single wedged thread froze *all* status polling indefinitely — the actual root cause of the dashboard-frozen-for-hours incidents on 2026-08-25, 08-27, and 08-28, pre-existing before any of this session's other fixes and misdiagnosed each time as something else (see #74, and the ruled-out SSH/thread-pool theories below). This is also why restarting the daemon only ever gave temporary relief: a fresh `SessionTracker` starts unlocked, then reliably deadlocks again roughly an hour into the next real session.
+* **Fix:** `threading.Lock()` → `threading.RLock()` — reentrant-safe for the same-thread re-acquire case, no change to cross-thread contention semantics. Found via a live `py-spy dump` against the actually-wedged production process, not inferred — the stack trace showed the exact `_commit_session` → `update` → `_compute_cluster_status_impl` chain, blocked. Proven with a reproduction of the real production call sequence: confirmed the original `Lock()` deadlocks within 5s every time, and `RLock()` completes and flushes correctly every time. Two theories investigated and ruled out along the way, kept here so they aren't re-walked: SSH subprocess-level hangs in `run_ssh()` (its `subprocess.run(..., timeout=...)` reliably kills its child and returns within its own timeout, even against a detached grandchild holding stdout/stderr open); and naive `WORKER_POOL` backlog growth from serial polling (tested over 150s against a deliberately slow host — the pool self-limits, backlog stabilizes). A third, `WORKER_POOL` starvation from a stuck teardown, is real (see #70) but bounded to roughly 5 minutes worst-case, not hours — a genuine but secondary bug, not this one.
 
 ### 75. `get_cluster_status()` Silently Served a Frozen Snapshot Forever (V4.8.5)
-* **The Trap:** When the in-flight status computation failed or timed out, `get_cluster_status()` fell back to serving the last successful cached snapshot — reasonable for a transient blip, but with no way to tell "slightly slow poll" apart from "this has been dead for hours." Combined with #76, this is exactly what let the deadlock run for hours across three separate incidents without the dashboard visibly indicating anything was wrong — it just kept looking like a live, if boring, snapshot.
-* **The Fix:** Every response from `get_cluster_status()` now carries `stale` / `stale_for_seconds`, computed against how long the currently-served cache has actually been in use. Nothing consumes this to change behavior yet — it's just present in the JSON — but it's what let the #76 investigation catch the deadlock live and prove it was real and ongoing (`stale_for_seconds: 14884.6` against an actual wedged process) instead of a one-off screenshot. Surfacing it as a dashboard banner is open — see `ROADMAP.md`.
+* **Trap:** When the in-flight status computation failed or timed out, `get_cluster_status()` fell back to serving the last successful cached snapshot — reasonable for a transient blip, but with no way to tell "slightly slow poll" apart from "this has been dead for hours." Combined with #76, this is exactly what let the deadlock run for hours across three separate incidents without the dashboard visibly indicating anything was wrong — it just kept looking like a live, if boring, snapshot.
+* **Fix:** Every response from `get_cluster_status()` now carries `stale` / `stale_for_seconds`, computed against how long the currently-served cache has actually been in use. Nothing consumes this to change behavior yet — it's just present in the JSON — but it's what let the #76 investigation catch the deadlock live and prove it was real and ongoing (`stale_for_seconds: 14884.6` against an actual wedged process) instead of a one-off screenshot. Surfacing it as a dashboard banner is open — see `ROADMAP.md`.
 
 ### 74. `server_time` Mislabeled `EST` While Actually Emitting Naive UTC (V4.8.5)
-* **The Trap:** `server_time` was built from `datetime.datetime.now()` — naive, but correct in value since the container's system clock is genuinely UTC — with a hardcoded literal `" EST"` suffix appended. The value was never actually Eastern time, just mislabeled. Almost certainly the cause of the dashboard clock appearing roughly 5 hours in the future: something downstream saw the `"EST"` label and applied its own (also DST-unaware) conversion to a value that didn't need one. This bug and #76's frozen-status bug were stacked and only became distinguishable once #76 was fixed — a frozen wrong value and a live-but-mislabeled wrong value both just look "wrong," for completely different reasons.
-* **The Fix:** `server_time` now emits real, explicit, tz-aware UTC (`datetime.now(datetime.timezone.utc)`) with an unambiguous `"UTC"` suffix, removing any excuse for a consumer to "correct" it further. Reminder: the dashboard clock's purpose is a UTC reference for log comparison, not a wall clock.
+* **Trap:** `server_time` was built from `datetime.datetime.now()` — naive, but correct in value since the container's system clock is genuinely UTC — with a hardcoded literal `" EST"` suffix appended. The value was never actually Eastern time, just mislabeled. Almost certainly the cause of the dashboard clock appearing roughly 5 hours in the future: something downstream saw the `"EST"` label and applied its own (also DST-unaware) conversion to a value that didn't need one. This bug and #76's frozen-status bug were stacked and only became distinguishable once #76 was fixed — a frozen wrong value and a live-but-mislabeled wrong value both just look "wrong," for completely different reasons.
+* **Fix:** `server_time` now emits real, explicit, tz-aware UTC (`datetime.now(datetime.timezone.utc)`) with an unambiguous `"UTC"` suffix, removing any excuse for a consumer to "correct" it further. Reminder: the dashboard clock's purpose is a UTC reference for log comparison, not a wall clock.
 
 ### 73. Ten Hardcoded `spark-3`/`spark-4` Literals — Primary/Secondary Host Refactor (V4.8.5)
-* **The Trap:** Ten separate places in `dgx-orchestrator.py` hardcoded the literal strings `"spark-4"` / `"spark-3"` (one single-quoted and missed on the first grep pass — neither quote style alone is a complete search) or the literal management IP `10.0.14.43`, instead of deriving host identity from `HOSTS` / `cluster_config.yaml`. One of these was a genuine landmine, not just a code-smell: the 2-node deploy path's `target_hosts` was hardcoded regardless of the `head` argument actually passed, meaning a 2-node deploy aimed at any host pair other than spark-3/4 would have silently targeted — and torn down — spark-3/4 instead. This mattered now specifically because the cluster is no longer guaranteed to be exactly two nodes on one interconnected segment; a future host pair may live on a different network segment with no ConnectX-7 fabric between it and spark-3/4, so hardcoding the pair anywhere in the deploy or teardown path is unsafe by construction, not just inflexible.
-* **The Fix:** Added `PRIMARY_HOST`, `SECONDARY_HOST`, and `PRIMARY_HOST_IP` constants, derived once from `HOSTS` (first/second listed host in `cluster_config.yaml`), and replaced every hardcoded literal with them. Proven both directions: loaded the same code against two synthetic `cluster_config.yaml`s (spark-3/4, and a hypothetical spark-5/6) and confirmed byte-identical behavior to the original hardcoded values for the existing config (zero regression), and fully correct independent derivation for the other. This is what makes it safe to eventually run a second, independent orchestrator instance against a different host pair with zero further code changes — see the `maestro2` discussion in `ROADMAP.md`. Note this refactor is naming/derivation only: it does not yet express the network-segment-pairing constraint (a host pair must share a fabric) anywhere in code — see `ARCHITECTURE-MIGRATION-PLAN.md`'s Phase 3 section, which still needs this written in before any N-node allocator code gets built against it.
+* **Trap:** Ten separate places in `dgx-orchestrator.py` hardcoded the literal strings `"spark-4"` / `"spark-3"` (one single-quoted and missed on the first grep pass — neither quote style alone is a complete search) or the literal management IP `10.0.14.43`, instead of deriving host identity from `HOSTS` / `cluster_config.yaml`. One of these was a genuine landmine, not just a code-smell: the 2-node deploy path's `target_hosts` was hardcoded regardless of the `head` argument actually passed, meaning a 2-node deploy aimed at any host pair other than spark-3/4 would have silently targeted — and torn down — spark-3/4 instead. This mattered now specifically because the cluster is no longer guaranteed to be exactly two nodes on one interconnected segment; a future host pair may live on a different network segment with no ConnectX-7 fabric between it and spark-3/4, so hardcoding the pair anywhere in the deploy or teardown path is unsafe by construction, not just inflexible.
+* **Fix:** Added `PRIMARY_HOST`, `SECONDARY_HOST`, and `PRIMARY_HOST_IP` constants, derived once from `HOSTS` (first/second listed host in `cluster_config.yaml`), and replaced every hardcoded literal with them. Proven both directions: loaded the same code against two synthetic `cluster_config.yaml`s (spark-3/4, and a hypothetical spark-5/6) and confirmed byte-identical behavior to the original hardcoded values for the existing config (zero regression), and fully correct independent derivation for the other. This is what makes it safe to eventually run a second, independent orchestrator instance against a different host pair with zero further code changes — see the `maestro2` discussion in `ROADMAP.md`. Note this refactor is naming/derivation only: it does not yet express the network-segment-pairing constraint (a host pair must share a fabric) anywhere in code — see `ARCHITECTURE-MIGRATION-PLAN.md`'s Phase 3 section, which still needs this written in before any N-node allocator code gets built against it.
 
 ### 72. `SessionTracker` Re-Baselined to Zero on Every Restart, Discarding History (V4.8.5)
-* **The Trap:** A freshly-instantiated `SessionTracker` (e.g. after any daemon restart) unconditionally re-baselined its running counters to "whatever vLLM's live cumulative counter reads right now" — silently discarding the tracker's entire prior view of reality. Confirmed in production: one orchestrator restart reduced a session's real lifetime totals of ~29,000,000 prompt tokens and ~730,000 generation tokens to 190/763 in the ledger — a roughly 152,000x undercount, not a rounding error.
-* **The Fix:** Added `_load_last_seen_raw()`, which reads the ledger's persisted `last_seen_raw` checkpoint (now written on every `_commit_session()` call) on the active-transition and resumes from there if vLLM's live counters are still ≥ the checkpoint — i.e. a restart correctly resumes instead of re-baselining to zero. Falls back to the original fresh-start behavior only when counters are genuinely lower than the checkpoint (a real engine redeploy, not just an orchestrator restart). Proven with a reproduction covering all three cases: resume-after-restart, genuine-redeploy, and fully-explicit args. Added `dgx-config correct-ledger` (also `dgx-config cli correct-ledger` and `POST /api/correct-ledger`, plus a standalone `correct_ledger.py` break-glass script) as a one-off repair tool for an already-corrupted ledger entry — auto-detects the currently-serving host/key/topology/live metrics when run with no arguments, refuses to overwrite with smaller values unless `--force`, and backs up the whole ledger file (timestamped) before any write. The specific 190/763 entry from this incident was corrected with it in production (dry-run previewed, then applied for real).
+* **Trap:** A freshly-instantiated `SessionTracker` (e.g. after any daemon restart) unconditionally re-baselined its running counters to "whatever vLLM's live cumulative counter reads right now" — silently discarding the tracker's entire prior view of reality. Confirmed in production: one orchestrator restart reduced a session's real lifetime totals of ~29,000,000 prompt tokens and ~730,000 generation tokens to 190/763 in the ledger — a roughly 152,000x undercount, not a rounding error.
+* **Fix:** Added `_load_last_seen_raw()`, which reads the ledger's persisted `last_seen_raw` checkpoint (now written on every `_commit_session()` call) on the active-transition and resumes from there if vLLM's live counters are still ≥ the checkpoint — i.e. a restart correctly resumes instead of re-baselining to zero. Falls back to the original fresh-start behavior only when counters are genuinely lower than the checkpoint (a real engine redeploy, not just an orchestrator restart). Proven with a reproduction covering all three cases: resume-after-restart, genuine-redeploy, and fully-explicit args. Added `dgx-config correct-ledger` (also `dgx-config cli correct-ledger` and `POST /api/correct-ledger`, plus a standalone `correct_ledger.py` break-glass script) as a one-off repair tool for an already-corrupted ledger entry — auto-detects the currently-serving host/key/topology/live metrics when run with no arguments, refuses to overwrite with smaller values unless `--force`, and backs up the whole ledger file (timestamped) before any write. The specific 190/763 entry from this incident was corrected with it in production (dry-run previewed, then applied for real).
 * * **Repair semantics (documented 2026-08-30):** `correct-ledger` *sets*
   `lifetime` and `last_seen_raw` rather than adding to them. For a key with
   a single continuous engine lifetime this is correct — the surviving
@@ -3400,183 +3668,183 @@ and its counterpart `::1_node` entry is missing the corresponding tokens.
   than one.
 
 ### 71. Crashed-Worker Logs Didn't Survive Teardown, Making Diagnosis Impossible After the Fact (V4.8.5)
-* **The Trap:** Ray's session directory, including a crashed worker's stdout/stderr, lived only inside the container's own `/tmp/ray` with no persistent mount. A container that crashed and was subsequently torn down took its own crash evidence with it — this is precisely why the first of the two 08-25 OOM crashes (06:15 UTC) could never be conclusively diagnosed: its logs were already gone by the time anyone went looking, and it's now believed to be the same OOM mechanism as the second, confirmed crash, but this remains unconfirmed and probably always will be.
-* **The Fix:** Every deploy now binds a per-run, per-host directory (`~/.cache/ray-logs/<deploy_run_id>/<host>`) to each container's `/tmp/ray`, so the session directory survives container teardown. This is what made the second 08-25 crash (16:24 UTC) diagnosable at all, and root-caused it for real: Ray's own node-memory monitor OOM-killed a worker at 95% host memory usage (`threshold_memory_monitor.cc`), not a driver or kernel fault — `gpu_util: 0.82` on the 1M-context 2-node recipe left only ~22GB of headroom on the 121.69GB unified memory pool for JIT caches, page cache, and Ray/Python overhead over a multi-hour session (see the related `gpu_util` correction already in `USER MEMORY`/recipe history). Also added: `tuning.debug_launch_blocking` (default `false`), which sets `CUDA_LAUNCH_BLOCKING=1` for forcing synchronous CUDA kernel launches when actively chasing a repro (costs real decode throughput — not meant to be left on), and `dgx-config prune-ray-logs [--retention-days N] [--dry-run]`, age-based cleanup defaulting to `tuning.crash_log_retention_days` (7 days), since these logs are small enough that waiting for disk pressure would let them accumulate indefinitely. New `cluster_config.yaml` / `TuningConfig` fields (`debug_launch_blocking`, `crash_log_retention_days`) both default to today's implicit behavior, so an older config file without them keeps working unchanged.
+* **Trap:** Ray's session directory, including a crashed worker's stdout/stderr, lived only inside the container's own `/tmp/ray` with no persistent mount. A container that crashed and was subsequently torn down took its own crash evidence with it — this is precisely why the first of the two 08-25 OOM crashes (06:15 UTC) could never be conclusively diagnosed: its logs were already gone by the time anyone went looking, and it's now believed to be the same OOM mechanism as the second, confirmed crash, but this remains unconfirmed and probably always will be.
+* **Fix:** Every deploy now binds a per-run, per-host directory (`~/.cache/ray-logs/<deploy_run_id>/<host>`) to each container's `/tmp/ray`, so the session directory survives container teardown. This is what made the second 08-25 crash (16:24 UTC) diagnosable at all, and root-caused it for real: Ray's own node-memory monitor OOM-killed a worker at 95% host memory usage (`threshold_memory_monitor.cc`), not a driver or kernel fault — `gpu_util: 0.82` on the 1M-context 2-node recipe left only ~22GB of headroom on the 121.69GB unified memory pool for JIT caches, page cache, and Ray/Python overhead over a multi-hour session (see the related `gpu_util` correction already in `USER MEMORY`/recipe history). Also added: `tuning.debug_launch_blocking` (default `false`), which sets `CUDA_LAUNCH_BLOCKING=1` for forcing synchronous CUDA kernel launches when actively chasing a repro (costs real decode throughput — not meant to be left on), and `dgx-config prune-ray-logs [--retention-days N] [--dry-run]`, age-based cleanup defaulting to `tuning.crash_log_retention_days` (7 days), since these logs are small enough that waiting for disk pressure would let them accumulate indefinitely. New `cluster_config.yaml` / `TuningConfig` fields (`debug_launch_blocking`, `crash_log_retention_days`) both default to today's implicit behavior, so an older config file without them keeps working unchanged.
 
 ### 70. `_execute_teardown_impl`'s Futures Had No Timeout At All (V4.8.5)
-* **The Trap:** Unlike the rest of the file's `_collect_bounded()` pattern (see #40), `_execute_teardown_impl`'s `.result()` calls across its four phases had no `timeout=` whatsoever. A genuinely stuck sub-operation could wedge teardown indefinitely — and since teardown shares `WORKER_POOL` with status polling, a wedged teardown could starve `get_cluster_status()` too. Investigated as a candidate root cause for the #76 multi-hour freezes; demonstrated real with an artificially infinite stuck sub-operation, but with realistically bounded slow operations (matching what the leaf `run_ssh()` calls' own timeouts already allow), the resulting staleness is a single episode that self-heals once the stuck operation completes — bounded to roughly 5 minutes worst case, not hours. A real, fixed bug, but not the #76 root cause.
-* **The Fix:** Added explicit timeouts to each phase's `.result()` calls, matching each phase's own already-established worst case (sum of its sequential `run_ssh` timeouts): roughly 35s / 180s / 90s / 15s across the four phases, ~320s worst case total.
+* **Trap:** Unlike the rest of the file's `_collect_bounded()` pattern (see #40), `_execute_teardown_impl`'s `.result()` calls across its four phases had no `timeout=` whatsoever. A genuinely stuck sub-operation could wedge teardown indefinitely — and since teardown shares `WORKER_POOL` with status polling, a wedged teardown could starve `get_cluster_status()` too. Investigated as a candidate root cause for the #76 multi-hour freezes; demonstrated real with an artificially infinite stuck sub-operation, but with realistically bounded slow operations (matching what the leaf `run_ssh()` calls' own timeouts already allow), the resulting staleness is a single episode that self-heals once the stuck operation completes — bounded to roughly 5 minutes worst case, not hours. A real, fixed bug, but not the #76 root cause.
+* **Fix:** Added explicit timeouts to each phase's `.result()` calls, matching each phase's own already-established worst case (sum of its sequential `run_ssh` timeouts): roughly 35s / 180s / 90s / 15s across the four phases, ~320s worst case total.
 
 ### 69. `sweep_ipc_orphans` Required a Terminal & Over-Broad Sudo Scope (V4.8.5)
-* **The Trap:** The IPC sweep introduced in #64 ran as `sudo python3 -c <whole script>`. In production this failed outright with "a terminal is required," since `run_ssh(capture=True)` never allocates a TTY. Even with a TTY, a sudoers rule matching `python3 -c *` would grant passwordless root execution of arbitrary Python — far broader than the sweep itself needed.
-* **The Fix:** `sudo` now wraps only the actual `ipcrm -m <shmid>` call inside the script; the outer invocation (reading `/proc/sysvipc/shm`) needs no privilege at all and runs unprivileged. This lets the sudoers entry be scoped to exactly `NOPASSWD: /usr/bin/ipcrm -m *`. Verified in production: the corresponding sudoers entry was added on both hosts, and `dgx-config sweep-ipc-orphans --dry-run` ran clean on both.
+* **Trap:** The IPC sweep introduced in #64 ran as `sudo python3 -c <whole script>`. In production this failed outright with "a terminal is required," since `run_ssh(capture=True)` never allocates a TTY. Even with a TTY, a sudoers rule matching `python3 -c *` would grant passwordless root execution of arbitrary Python — far broader than the sweep itself needed.
+* **Fix:** `sudo` now wraps only the actual `ipcrm -m <shmid>` call inside the script; the outer invocation (reading `/proc/sysvipc/shm`) needs no privilege at all and runs unprivileged. This lets the sudoers entry be scoped to exactly `NOPASSWD: /usr/bin/ipcrm -m *`. Verified in production: the corresponding sudoers entry was added on both hosts, and `dgx-config sweep-ipc-orphans --dry-run` ran clean on both.
 
 ### 68. `common/ssh.py` Hardening — Real, But Narrower Than First Suspected (V4.8.5)
-* **The Trap:** Investigated as a candidate cause of the #76 freezes before the real root cause was found. `subprocess.run()`'s single-process kill on timeout doesn't clean up an orphaned child that has forked further, and a stale-but-still-"established" TCP connection can sit for a long time before either side notices.
-* **The Fix:** Added `ServerAliveInterval=5` / `ServerAliveCountMax=2`, letting SSH itself detect and tear down a genuinely-dead-but-still-established connection within ~10-15s. Added process-group kill (`os.setsid` on launch, `os.killpg` on timeout) instead of relying on `subprocess.run`'s single-process kill — this correctly reaps an ordinary orphaned child with zero downside, but **cannot** reach a child that deliberately detaches into its own session (a real SSH `ControlPersist` master almost certainly does this — no process-group trick from the calling side can reach it, by design). `ControlPersist=60s` is self-bounding regardless (the master exits on its own after 60s idle), so this was never actually an unbounded leak in production, just modeled that way in an overly pessimistic synthetic test. Neither fix turned out to be the #76 root cause, but both are solid hardening on their own merits.
+* **Trap:** Investigated as a candidate cause of the #76 freezes before the real root cause was found. `subprocess.run()`'s single-process kill on timeout doesn't clean up an orphaned child that has forked further, and a stale-but-still-"established" TCP connection can sit for a long time before either side notices.
+* **Fix:** Added `ServerAliveInterval=5` / `ServerAliveCountMax=2`, letting SSH itself detect and tear down a genuinely-dead-but-still-established connection within ~10-15s. Added process-group kill (`os.setsid` on launch, `os.killpg` on timeout) instead of relying on `subprocess.run`'s single-process kill — this correctly reaps an ordinary orphaned child with zero downside, but **cannot** reach a child that deliberately detaches into its own session (a real SSH `ControlPersist` master almost certainly does this — no process-group trick from the calling side can reach it, by design). `ControlPersist=60s` is self-bounding regardless (the master exits on its own after 60s idle), so this was never actually an unbounded leak in production, just modeled that way in an overly pessimistic synthetic test. Neither fix turned out to be the #76 root cause, but both are solid hardening on their own merits.
 
 ### 67. Daemon Never Cleaned Up Its Own Stale SSH Multiplex Sockets (V4.8.5)
-* **The Trap:** `dgx-config`'s CLI wrapper already flushes stale SSH multiplex sockets (`/root/.ssh/cm-*`, `/tmp/cm-*`) before every invocation, but the long-running daemon process itself never did this for its own multi-day uptime — an accumulation risk noted but not root-caused as part of the #76 investigation (four simultaneous SSH mux/master processes against the same `ControlPath`, spawned within about a minute of each other, were observed in `py-spy`/`docker top` output during that investigation and flagged as unusual, but not conclusively tied to any specific incident).
-* **The Fix:** The daemon now flushes its own stale multiplex sockets every ~5 minutes, piggybacked on the existing 10s telemetry loop, matching the hygiene the CLI wrapper already performed.
+* **Trap:** `dgx-config`'s CLI wrapper already flushes stale SSH multiplex sockets (`/root/.ssh/cm-*`, `/tmp/cm-*`) before every invocation, but the long-running daemon process itself never did this for its own multi-day uptime — an accumulation risk noted but not root-caused as part of the #76 investigation (four simultaneous SSH mux/master processes against the same `ControlPath`, spawned within about a minute of each other, were observed in `py-spy`/`docker top` output during that investigation and flagged as unusual, but not conclusively tied to any specific incident).
+* **Fix:** The daemon now flushes its own stale multiplex sockets every ~5 minutes, piggybacked on the existing 10s telemetry loop, matching the hygiene the CLI wrapper already performed.
 
 ### 66. Benchmark Always Targeted `spark-4` Regardless of What Was Actually Deployed (V4.8.5)
-* **The Trap:** `index.html`'s `headSelect` dropdown value was only ever set once, from its hardcoded HTML default — and its containing row is fully removed (`display: none`) for any model whose recipe defines only a single topology, which every model exercised this session turned out to be. `triggerBenchmarkNow()` read that stale, often-unreachable value unconditionally, so a dashboard-triggered benchmark could silently target the wrong host regardless of where the model was actually serving. The CLI path (`dgx-config deploy --benchmark`) was checked separately and confirmed **not** independently affected — it threads its own explicit `--head` value straight through correctly.
-* **The Fix:** Every status poll now syncs `headSelect`'s value to the backend's real, live-discovered `serving_host` — a field already used elsewhere on the dashboard, just never read by the frontend before. Since benchmarking's entire purpose is testing what's already deployed, this makes the target correct by construction instead of depending on a control the user often couldn't even see. Not yet manually verified in a real browser (only `node --check`'d for syntax) — worth a click-through pass, especially for a single-topology model where the row itself stays hidden.
+* **Trap:** `index.html`'s `headSelect` dropdown value was only ever set once, from its hardcoded HTML default — and its containing row is fully removed (`display: none`) for any model whose recipe defines only a single topology, which every model exercised this session turned out to be. `triggerBenchmarkNow()` read that stale, often-unreachable value unconditionally, so a dashboard-triggered benchmark could silently target the wrong host regardless of where the model was actually serving. The CLI path (`dgx-config deploy --benchmark`) was checked separately and confirmed **not** independently affected — it threads its own explicit `--head` value straight through correctly.
+* **Fix:** Every status poll now syncs `headSelect`'s value to the backend's real, live-discovered `serving_host` — a field already used elsewhere on the dashboard, just never read by the frontend before. Since benchmarking's entire purpose is testing what's already deployed, this makes the target correct by construction instead of depending on a control the user often couldn't even see. Not yet manually verified in a real browser (only `node --check`'d for syntax) — worth a click-through pass, especially for a single-topology model where the row itself stays hidden.
 
 ### 65. No Reliable Way to Confirm Which Code Was Actually Running (V4.8.5)
-* **The Trap:** A fix could be built, tested, and handed over, edited into the repo, and still not actually be running — the deploy workflow (`git push` locally → `git pull` on `maestro` → copy into the container → restart) has a step for a forgotten `git push` to silently no-op at. This happened for real during the #76 investigation: a fix landed in the repo but the daemon kept running the old, still-broken code for a while before anyone noticed, because there was no way to check "is my latest fix actually running" short of `grep`-ing the live container for a known string.
-* **The Fix:** Added `ORCHESTRATOR_VERSION`, a string constant meant to be bumped by hand on every meaningful change, surfaced in four places: daemon startup logs, every `/api/status` response, the CLI `status` command's summary line, and a new badge in the dashboard header next to Server Time. "Is my latest fix actually running" is now a one-glance check instead of a remembered `grep` incantation.
+* **Trap:** A fix could be built, tested, and handed over, edited into the repo, and still not actually be running — the deploy workflow (`git push` locally → `git pull` on `maestro` → copy into the container → restart) has a step for a forgotten `git push` to silently no-op at. This happened for real during the #76 investigation: a fix landed in the repo but the daemon kept running the old, still-broken code for a while before anyone noticed, because there was no way to check "is my latest fix actually running" short of `grep`-ing the live container for a known string.
+* **Fix:** Added `ORCHESTRATOR_VERSION`, a string constant meant to be bumped by hand on every meaningful change, surfaced in four places: daemon startup logs, every `/api/status` response, the CLI `status` command's summary line, and a new badge in the dashboard header next to Server Time. "Is my latest fix actually running" is now a one-glance check instead of a remembered `grep` incantation.
 
 ### 64. Suspected IPC/Shared-Memory Leak From `--ipc=host` Under Abrupt Process Kills (V4.8.4)
-* **The Trap:** Every container runs with `--ipc=host`, so Ray's shared-memory-backed plasma object store and vLLM/PyTorch's own multiprocessing shared memory live in the *host's* own SysV IPC table and `/dev/shm`, not an isolated per-container one. Combined with #62 above — the vLLM engine was never gracefully signaled — any shared memory segment not cleanly unlinked before an abrupt kill simply persisted on the host indefinitely, since SysV/POSIX shared memory isn't reclaimed automatically on process death the way ordinary process memory is. Suspected as the actual cause of at least one real deploy failure, not just a theoretical risk.
-* **The Fix:** Added a final "sweeping" phase to every teardown (`sweep_ipc_orphans()`) that removes SysV shared memory segments with `nattch == 0` — a hard kernel-tracked attach count, not a heuristic, so this can never touch a segment still genuinely in use by anything on the shared host. Runs automatically inside `_execute_teardown_impl`, which every deploy's own pre-deploy teardown already calls — so this is now a guarantee on every deploy, not a manual step. Added `dgx-config ipc-inventory` (read-only) and `dgx-config sweep-ipc-orphans --dry-run` for ad-hoc inspection. Deliberately does NOT touch POSIX `/dev/shm` files yet — verifying those are truly orphaned needs a costlier cross-reference against every process's open file descriptors and memory maps, which wasn't safe to rush without testing against the real hosts.
+* **Trap:** Every container runs with `--ipc=host`, so Ray's shared-memory-backed plasma object store and vLLM/PyTorch's own multiprocessing shared memory live in the *host's* own SysV IPC table and `/dev/shm`, not an isolated per-container one. Combined with #62 above — the vLLM engine was never gracefully signaled — any shared memory segment not cleanly unlinked before an abrupt kill simply persisted on the host indefinitely, since SysV/POSIX shared memory isn't reclaimed automatically on process death the way ordinary process memory is. Suspected as the actual cause of at least one real deploy failure, not just a theoretical risk.
+* **Fix:** Added a final "sweeping" phase to every teardown (`sweep_ipc_orphans()`) that removes SysV shared memory segments with `nattch == 0` — a hard kernel-tracked attach count, not a heuristic, so this can never touch a segment still genuinely in use by anything on the shared host. Runs automatically inside `_execute_teardown_impl`, which every deploy's own pre-deploy teardown already calls — so this is now a guarantee on every deploy, not a manual step. Added `dgx-config ipc-inventory` (read-only) and `dgx-config sweep-ipc-orphans --dry-run` for ad-hoc inspection. Deliberately does NOT touch POSIX `/dev/shm` files yet — verifying those are truly orphaned needs a costlier cross-reference against every process's open file descriptors and memory maps, which wasn't safe to rush without testing against the real hosts.
 
 ### 63. Teardown Never Actually Reached Ray or the vLLM Engine Inside a Container (V4.8.4)
-* **The Trap:** Teardown's host-level process cleanup (`ps aux | grep -E 'vllm|ray'` run directly over SSH against the bare host) had zero visibility into anything running inside a container — none of our `docker run` invocations set `--pid=host`, so every container has its own isolated PID namespace, invisible to the host's own process table. This had been true for the entire lifetime of the graceful-teardown rewrite without anyone tracing the actual namespace implications — it ran without error on every teardown, which made it look like it was doing something. Worse: even `docker stop`'s SIGTERM, which correctly reaches a container's real PID 1, only reaches `ray start --block` in a 2-node deploy — the vLLM engine itself runs as a *separate*, detached `docker exec -d` process, never a child of PID 1, so it was never signaled by anything at all. It was only ever killed via the abrupt kernel-level namespace teardown at `docker rm -f` time.
-* **The Fix:** Added `_teardown_host_container_internals()`, which reaches inside each container via `docker exec` — the only mechanism that can see and signal container-internal processes without changing PID namespace sharing — to gracefully stop the vLLM engine (targeted `pkill` by process pattern, TERM then KILL) and Ray (`ray stop`, then `ray stop --force`) before the container is ever stopped or removed. The old host-level step is kept as a harmless safety net for genuinely bare-metal stray processes, not the primary mechanism it had been mistaken for.
+* **Trap:** Teardown's host-level process cleanup (`ps aux | grep -E 'vllm|ray'` run directly over SSH against the bare host) had zero visibility into anything running inside a container — none of our `docker run` invocations set `--pid=host`, so every container has its own isolated PID namespace, invisible to the host's own process table. This had been true for the entire lifetime of the graceful-teardown rewrite without anyone tracing the actual namespace implications — it ran without error on every teardown, which made it look like it was doing something. Worse: even `docker stop`'s SIGTERM, which correctly reaches a container's real PID 1, only reaches `ray start --block` in a 2-node deploy — the vLLM engine itself runs as a *separate*, detached `docker exec -d` process, never a child of PID 1, so it was never signaled by anything at all. It was only ever killed via the abrupt kernel-level namespace teardown at `docker rm -f` time.
+* **Fix:** Added `_teardown_host_container_internals()`, which reaches inside each container via `docker exec` — the only mechanism that can see and signal container-internal processes without changing PID namespace sharing — to gracefully stop the vLLM engine (targeted `pkill` by process pattern, TERM then KILL) and Ray (`ray stop`, then `ray stop --force`) before the container is ever stopped or removed. The old host-level step is kept as a harmless safety net for genuinely bare-metal stray processes, not the primary mechanism it had been mistaken for.
 
 
 ### 62. FlashInfer SM120 Autotuner Failure on Speculative Shapes (V4.8.4)
-* **The Trap:** Combining `--attention-backend B12X_ATTN` with DSpark speculative tokens caused FlashInfer's JIT autotuner (`sparse_mla_sm120_decode_dsv4`) to encounter input shapes (`(7, 32, 512)`) outside its pre-compiled tuning buckets during `_dummy_run`, causing startup timeouts and process cancellation.
-* **The Fix:** Swapped to `--attention-backend FLASH_ATTN` for speculative builds, bypassing the JIT autotuning pass while maintaining reliable engine initialization.
+* **Trap:** Combining `--attention-backend B12X_ATTN` with DSpark speculative tokens caused FlashInfer's JIT autotuner (`sparse_mla_sm120_decode_dsv4`) to encounter input shapes (`(7, 32, 512)`) outside its pre-compiled tuning buckets during `_dummy_run`, causing startup timeouts and process cancellation.
+* **Fix:** Swapped to `--attention-backend FLASH_ATTN` for speculative builds, bypassing the JIT autotuning pass while maintaining reliable engine initialization.
 
 ### 61. DSpark Speculative Minimum Token Validation Failure (V4.8.4)
-* **The Trap:** Attempting to lower memory consumption by reducing DSpark speculative draft tokens to 2 or 3 triggered a hard Pydantic validation failure during `SpeculativeConfig` instantiation: `Value error, DSpark requires num_speculative_tokens >= dspark_block_size (5)`.
-* **The Fix:** Enforced a strict minimum of `num_speculative_tokens: 5` in recipes using DSpark. To fit within VRAM budgets under this token floor, sequence concurrency must be capped at `--max-num-seqs 1` or context length reduced.
+* **Trap:** Attempting to lower memory consumption by reducing DSpark speculative draft tokens to 2 or 3 triggered a hard Pydantic validation failure during `SpeculativeConfig` instantiation: `Value error, DSpark requires num_speculative_tokens >= dspark_block_size (5)`.
+* **Fix:** Enforced a strict minimum of `num_speculative_tokens: 5` in recipes using DSpark. To fit within VRAM budgets under this token floor, sequence concurrency must be capped at `--max-num-seqs 1` or context length reduced.
 
 ### 60. Crashed Engine Misreported as Indefinite Warmup — Keyword Collision in Log Scanner (V4.8.4)
-* **The Trap:** `detect_model_stage()` scanned container logs in reverse for progress keywords, including `"kv cache"` as a WARMUP signal. A vLLM startup crash (`ValueError: nvfp4 KV cache is not supported with MLA backends...`) contains that exact phrase inside its own error message, so the scanner matched the crash report itself as legitimate progress and reported `NOT READY - WARMUP` forever, with an ETA that counted up for over an hour with no historic data. Compounded by 2-node Ray deploys: the container's PID 1 is `ray start --block`, not the vLLM engine — the engine runs via a separate detached `docker exec -d`, so Docker correctly reports the container `RUNNING` long after the actual engine process has died. Container-level health alone can't be trusted for this launch path.
-* **The Fix:** Added `_detect_crash_signature()`, which checks the log tail for an actual Python traceback *before* the keyword scan runs, and short-circuits to `CRASHED (ENGINE EXITED: <exception>)` if found — regardless of what substrings a future crash's error text happens to contain. `_finalize_host_status()` now skips ETA computation entirely for a crashed status instead of computing a countdown against a dead process.
+* **Trap:** `detect_model_stage()` scanned container logs in reverse for progress keywords, including `"kv cache"` as a WARMUP signal. A vLLM startup crash (`ValueError: nvfp4 KV cache is not supported with MLA backends...`) contains that exact phrase inside its own error message, so the scanner matched the crash report itself as legitimate progress and reported `NOT READY - WARMUP` forever, with an ETA that counted up for over an hour with no historic data. Compounded by 2-node Ray deploys: the container's PID 1 is `ray start --block`, not the vLLM engine — the engine runs via a separate detached `docker exec -d`, so Docker correctly reports the container `RUNNING` long after the actual engine process has died. Container-level health alone can't be trusted for this launch path.
+* **Fix:** Added `_detect_crash_signature()`, which checks the log tail for an actual Python traceback *before* the keyword scan runs, and short-circuits to `CRASHED (ENGINE EXITED: <exception>)` if found — regardless of what substrings a future crash's error text happens to contain. `_finalize_host_status()` now skips ETA computation entirely for a crashed status instead of computing a countdown against a dead process.
 
 ### 59. No Mutual Exclusion Between Deploy, Teardown, and Benchmark Controls (V4.8.4)
-* **The Trap:** Nothing on the dashboard stopped clicking Deploy while a teardown was mid-flight killing containers, or clicking Teardown while a deploy was mid-launch — both race against the same containers and can leave the cluster in a state neither operation intended. `CLUSTER_OP_LOCK` protected this server-side (a second call gets a "cluster busy" error), but the UI gave no indication a click would fail until the confusing error came back.
-* **The Fix:** Added `applyOperationLocks()` in `index.html`, which cross-locks Deploy, Teardown, the entire deploy form (model/topology/head/user-id), and both benchmark controls whenever either deploy or teardown is in flight, driven by a local `isDeploying` flag and the polled `is_tearing_down` status field.
+* **Trap:** Nothing on the dashboard stopped clicking Deploy while a teardown was mid-flight killing containers, or clicking Teardown while a deploy was mid-launch — both race against the same containers and can leave the cluster in a state neither operation intended. `CLUSTER_OP_LOCK` protected this server-side (a second call gets a "cluster busy" error), but the UI gave no indication a click would fail until the confusing error came back.
+* **Fix:** Added `applyOperationLocks()` in `index.html`, which cross-locks Deploy, Teardown, the entire deploy form (model/topology/head/user-id), and both benchmark controls whenever either deploy or teardown is in flight, driven by a local `isDeploying` flag and the polled `is_tearing_down` status field.
 
 ### 58. Teardown Became a Multi-Phase ~60s Operation With Zero Progress Visibility (V4.8.4)
-* **The Trap:** After the grace-period rewrite (see #54), teardown could legitimately take up to ~60s across three phases, but the dashboard button just showed a static "Tearing down..." label with no indication of which phase it was in or whether it was progressing.
-* **The Fix:** Added `TEARDOWN_STATE` (mirroring the existing `BENCHMARK_STATE` pattern), written by `_execute_teardown_impl` at each phase transition (`signaling` → `stopping` → `removing` → `done`) and surfaced via `/api/status` as `is_tearing_down`/`teardown_message`. Teardown itself stays synchronous (deploy depends on that ordering) — the dashboard's existing 4s status poll picks up live phase text concurrently with the blocking POST.
+* **Trap:** After the grace-period rewrite (see #54), teardown could legitimately take up to ~60s across three phases, but the dashboard button just showed a static "Tearing down..." label with no indication of which phase it was in or whether it was progressing.
+* **Fix:** Added `TEARDOWN_STATE` (mirroring the existing `BENCHMARK_STATE` pattern), written by `_execute_teardown_impl` at each phase transition (`signaling` → `stopping` → `removing` → `done`) and surfaced via `/api/status` as `is_tearing_down`/`teardown_message`. Teardown itself stays synchronous (deploy depends on that ordering) — the dashboard's existing 4s status poll picks up live phase text concurrently with the blocking POST.
 
 ### 57. Near-Duplicate Recipe Catalog Keys — Silent Model Repoint (V4.8.4)
-* **The Trap:** `recipes/local/deepseek-v4-flash-nvfp4.yaml` (an older, distinct NVIDIA build) and `recipes/local/deepseek-v4-flash-0731-nvfp4.yaml` (the correct, working auroter 0731 build) coexisted with catalog keys one keystroke apart. A prior session silently repointed the former's `hf_path` to the *same* model as the latter while also swapping in an unvalidated `--kv-cache-dtype nvfp4_ds_mla` (see #56) — with no filename change to signal any of it happened. Deploying the wrong key crashed on a config that had never actually been tested end-to-end.
-* **The Fix:** Deleted `deepseek-v4-flash-nvfp4.yaml` outright rather than reverting it to its original config — the older NVIDIA build it used to serve wasn't in active use, so removing it closes both the collision risk and the invalid kv-cache-dtype landmine in one move. No structural fix for the underlying class of error yet — near-duplicate catalog keys with no loader-level collision warning remains an open gap, tracked in `ROADMAP.md`.
+* **Trap:** `recipes/local/deepseek-v4-flash-nvfp4.yaml` (an older, distinct NVIDIA build) and `recipes/local/deepseek-v4-flash-0731-nvfp4.yaml` (the correct, working auroter 0731 build) coexisted with catalog keys one keystroke apart. A prior session silently repointed the former's `hf_path` to the *same* model as the latter while also swapping in an unvalidated `--kv-cache-dtype nvfp4_ds_mla` (see #56) — with no filename change to signal any of it happened. Deploying the wrong key crashed on a config that had never actually been tested end-to-end.
+* **Fix:** Deleted `deepseek-v4-flash-nvfp4.yaml` outright rather than reverting it to its original config — the older NVIDIA build it used to serve wasn't in active use, so removing it closes both the collision risk and the invalid kv-cache-dtype landmine in one move. No structural fix for the underlying class of error yet — near-duplicate catalog keys with no loader-level collision warning remains an open gap, tracked in `ROADMAP.md`.
 
 
 ### 56. vLLM Rejects `nvfp4`-Family KV Cache Dtype for MLA Models (V4.8.4)
-* **The Trap:** `--kv-cache-dtype nvfp4_ds_mla` — a custom identifier intended as a GB10/`flashinfer_b12x` MLA cache bypass — crashes at engine-config-creation time with `pydantic_core.ValidationError: nvfp4 KV cache is not supported with MLA (Multi-head Latent Attention) backends`. This is a vLLM core validation guard (landed alongside upstream PR #40177, "Add nvfp4 kv cache support"), not an orchestrator or image issue — confirmed the pulled `eugr/spark-vllm-b12x:latest` image digest was unchanged across the working and broken deploys.
-* **The Fix:** No code fix — this is a hard vLLM constraint. DeepSeek V4 Flash (and any other MLA-architecture model) must use `--kv-cache-dtype fp8` or `auto`. Any recipe attempting an `nvfp4`-family dtype on an MLA model needs to be caught before deploy, not after — a candidate for future recipe-schema validation.
+* **Trap:** `--kv-cache-dtype nvfp4_ds_mla` — a custom identifier intended as a GB10/`flashinfer_b12x` MLA cache bypass — crashes at engine-config-creation time with `pydantic_core.ValidationError: nvfp4 KV cache is not supported with MLA (Multi-head Latent Attention) backends`. This is a vLLM core validation guard (landed alongside upstream PR #40177, "Add nvfp4 kv cache support"), not an orchestrator or image issue — confirmed the pulled `eugr/spark-vllm-b12x:latest` image digest was unchanged across the working and broken deploys.
+* **Fix:** No code fix — this is a hard vLLM constraint. DeepSeek V4 Flash (and any other MLA-architecture model) must use `--kv-cache-dtype fp8` or `auto`. Any recipe attempting an `nvfp4`-family dtype on an MLA model needs to be caught before deploy, not after — a candidate for future recipe-schema validation.
 
 ### 55. Sequential Per-Host Teardown Left Worker NCCL-Connected to a Vanished Head (V4.8.4)
-* **The Trap:** The grace-period rewrite (#54) processed hosts one at a time in a `for` loop. Head could complete its entire ~20-40s graceful shutdown and be fully gone before worker's teardown cycle even began — worker spent that whole window still alive and still NCCL/Ray-connected to a rank-0 head that had already vanished mid-collective-op, observed on the dashboard as the worker going "confused" and crashing on its own well before teardown ever touched it directly.
-* **The Fix:** `_execute_teardown_impl` now runs each phase (signal, stop, remove) across all target hosts *concurrently* via `WORKER_POOL`, not one host fully torn down before the next starts, so head and worker are signaled and come down together.
+* **Trap:** The grace-period rewrite (#54) processed hosts one at a time in a `for` loop. Head could complete its entire ~20-40s graceful shutdown and be fully gone before worker's teardown cycle even began — worker spent that whole window still alive and still NCCL/Ray-connected to a rank-0 head that had already vanished mid-collective-op, observed on the dashboard as the worker going "confused" and crashing on its own well before teardown ever touched it directly.
+* **Fix:** `_execute_teardown_impl` now runs each phase (signal, stop, remove) across all target hosts *concurrently* via `WORKER_POOL`, not one host fully torn down before the next starts, so head and worker are signaled and come down together.
 
 ### 54. Teardown Hard-Kill Risked Corrupting In-Flight JIT Compiles (V4.8.4)
-* **The Trap:** Teardown SIGKILL'd host processes and ran `docker rm -f` with zero grace period. JIT compilation shells out to `nvcc`/`ptxas`/`cicc` as child subprocesses that write cache artifacts non-atomically; SIGKILL on the parent doesn't propagate to those children, so a hard-kill mid-compile could leave an orphaned compiler process writing into the persistent, shared cache directory unsupervised, or leave a half-written artifact at the path the loader treats as a cache hit on the next load — silent, one-time, unpredictable recompiles with no error surfaced anywhere. Compounded by the absence of `--init` on `docker run`, meaning the container's PID 1 had no proper zombie-reaping or signal-forwarding for exactly this kind of subprocess tree.
-* **The Fix:** Added `TEARDOWN_GRACE_SEC` (20s): host processes now get SIGTERM and a real grace period before escalating to `-9`, and `docker stop --time N` runs before `docker rm -f` rather than skipping straight to it. Added `--init` to both the 1-node and 2-node `docker run` construction paths.
+* **Trap:** Teardown SIGKILL'd host processes and ran `docker rm -f` with zero grace period. JIT compilation shells out to `nvcc`/`ptxas`/`cicc` as child subprocesses that write cache artifacts non-atomically; SIGKILL on the parent doesn't propagate to those children, so a hard-kill mid-compile could leave an orphaned compiler process writing into the persistent, shared cache directory unsupervised, or leave a half-written artifact at the path the loader treats as a cache hit on the next load — silent, one-time, unpredictable recompiles with no error surfaced anywhere. Compounded by the absence of `--init` on `docker run`, meaning the container's PID 1 had no proper zombie-reaping or signal-forwarding for exactly this kind of subprocess tree.
+* **Fix:** Added `TEARDOWN_GRACE_SEC` (20s): host processes now get SIGTERM and a real grace period before escalating to `-9`, and `docker stop --time N` runs before `docker rm -f` rather than skipping straight to it. Added `--init` to both the 1-node and 2-node `docker run` construction paths.
 
 ### 53. `historical_tps` Never Resolved — Ledger Key Mismatch (V4.8.4)
-* **The Trap:** `enrich_catalog()` looked up `ledger_tps.get(m_key, "N/A")` where `m_key` is the catalog/recipe key, but `benchmark.py` logged the raw served HF model basename into the ledger's `Model` column — two different string spaces that never matched. `historical_tps` was silently `N/A` for every model, always.
-* **The Fix:** Added `--model-key` to `benchmark.py`, threaded through from both the deploy-triggered and dashboard-triggered benchmark paths, so the ledger logs the catalog key directly. Old ledger rows predate this and won't retroactively match; `benchmark_ledger.csv` was rotated rather than backfilled.
+* **Trap:** `enrich_catalog()` looked up `ledger_tps.get(m_key, "N/A")` where `m_key` is the catalog/recipe key, but `benchmark.py` logged the raw served HF model basename into the ledger's `Model` column — two different string spaces that never matched. `historical_tps` was silently `N/A` for every model, always.
+* **Fix:** Added `--model-key` to `benchmark.py`, threaded through from both the deploy-triggered and dashboard-triggered benchmark paths, so the ledger logs the catalog key directly. Old ledger rows predate this and won't retroactively match; `benchmark_ledger.csv` was rotated rather than backfilled.
 
 ### 52. Benchmark TTFT/Decode Speed Reported Zero for Reasoning Models (V4.8.4)
-* **The Trap:** `run_benchmark_pass()` only started the TTFT clock and counted tokens when a stream chunk's `delta.content` was truthy. DeepSeek V4 (run with `--reasoning-parser deepseek_v4`) streams its initial tokens into `delta.reasoning_content` instead — for a reasoning-heavy response, `first_token_time` never fired and `decode_tps` reported `0.0`.
-* **The Fix:** `run_benchmark_pass()` now starts the clock on either `content` or `reasoning_content`.
+* **Trap:** `run_benchmark_pass()` only started the TTFT clock and counted tokens when a stream chunk's `delta.content` was truthy. DeepSeek V4 (run with `--reasoning-parser deepseek_v4`) streams its initial tokens into `delta.reasoning_content` instead — for a reasoning-heavy response, `first_token_time` never fired and `decode_tps` reported `0.0`.
+* **Fix:** `run_benchmark_pass()` now starts the clock on either `content` or `reasoning_content`.
 
 ### 51. JIT Cache Pruning Deleted Individual Files, Risking Half-Written Cache Entries (V4.8.4)
-* **The Trap:** `prune_cluster_cache()` ran `find ~/.cache/{tilelang,deepgemm,triton} -type f -atime +N -delete`. A Triton/TileLang cache entry is a *directory* of co-dependent artifacts (metadata JSON + compiled binary); deleting files piecemeal can leave a half-entry that the loader treats as a hit and then fails to load — corruption, not a clean miss. Also relied on `atime`, which some filesystem mount options don't reliably update.
-* **The Fix:** Replaced with a remote Python script that evicts whole entry *directories*, strictly oldest-first (`max(atime, mtime)` per entry, degrading gracefully to mtime-only), only when a host is below `--min-free-gb`. Added a fully read-only `cache-inventory` command (entry counts, sizes, LRU order, mount options) safe to run against production at any time, and `--dry-run` on the prune path itself.
+* **Trap:** `prune_cluster_cache()` ran `find ~/.cache/{tilelang,deepgemm,triton} -type f -atime +N -delete`. A Triton/TileLang cache entry is a *directory* of co-dependent artifacts (metadata JSON + compiled binary); deleting files piecemeal can leave a half-entry that the loader treats as a hit and then fails to load — corruption, not a clean miss. Also relied on `atime`, which some filesystem mount options don't reliably update.
+* **Fix:** Replaced with a remote Python script that evicts whole entry *directories*, strictly oldest-first (`max(atime, mtime)` per entry, degrading gracefully to mtime-only), only when a host is below `--min-free-gb`. Added a fully read-only `cache-inventory` command (entry counts, sizes, LRU order, mount options) safe to run against production at any time, and `--dry-run` on the prune path itself.
 
 ### 50. Orchestrator Daemon Self-Destruction via Broad Teardown `pkill` & Missing Lock Wrapper (V4.8.3)
-* **The Trap:** Triggering a deployment executed `_execute_teardown_impl()`, which ran `sudo pkill -9 -f 'vllm|ray|python3'`. Because `dgx-orchestrator` runs as a `python3` process on `spark-4`, it killed its own HTTP server mid-request, causing browser deployment calls to fail with `Failed to fetch`. Additionally, `execute_deployment()` was missing its `CLUSTER_OP_LOCK` wrapper definition during refactoring, raising a backend `NameError`.
-* **The Fix:** Re-implemented `execute_deployment()` with `CLUSTER_OP_LOCK` enforcement, and updated host teardown commands to explicitly filter out `dgx-orchestrator` PIDs (`grep -v 'dgx-orchestrator'`) before issuing process kill signals.
+* **Trap:** Triggering a deployment executed `_execute_teardown_impl()`, which ran `sudo pkill -9 -f 'vllm|ray|python3'`. Because `dgx-orchestrator` runs as a `python3` process on `spark-4`, it killed its own HTTP server mid-request, causing browser deployment calls to fail with `Failed to fetch`. Additionally, `execute_deployment()` was missing its `CLUSTER_OP_LOCK` wrapper definition during refactoring, raising a backend `NameError`.
+* **Fix:** Re-implemented `execute_deployment()` with `CLUSTER_OP_LOCK` enforcement, and updated host teardown commands to explicitly filter out `dgx-orchestrator` PIDs (`grep -v 'dgx-orchestrator'`) before issuing process kill signals.
 
 ### 49. Speculative Metric Key Mismatch & Strict Recipe MTP Checks (V4.8.3)
-* **The Trap:** vLLM and DeepSeek-V4 speculative models expose draft/accepted token counters under `vllm:spec_decode_num_draft_tokens_total` and `vllm:spec_decode_num_accepted_tokens_total`. The scraper was listening for legacy `vllm:num_spec_tokens_*` keys, resulting in zeroed draft stats. Furthermore, `enrich_catalog()` strictly checked CLI flags for `mtp_enabled`, hiding speculative UI metrics for models using integrated draft heads or alternative flags like `--speculative-config`.
-* **The Fix:** Updated `get_vllm_metrics()` to parse `vllm:spec_decode_num_*` Prometheus metrics, and expanded `enrich_catalog()` to check case-insensitively for speculative keywords (`speculative`, `mtp`, `draft`, `nextn`, `proposal`) or historical ledger activity.
+* **Trap:** vLLM and DeepSeek-V4 speculative models expose draft/accepted token counters under `vllm:spec_decode_num_draft_tokens_total` and `vllm:spec_decode_num_accepted_tokens_total`. The scraper was listening for legacy `vllm:num_spec_tokens_*` keys, resulting in zeroed draft stats. Furthermore, `enrich_catalog()` strictly checked CLI flags for `mtp_enabled`, hiding speculative UI metrics for models using integrated draft heads or alternative flags like `--speculative-config`.
+* **Fix:** Updated `get_vllm_metrics()` to parse `vllm:spec_decode_num_*` Prometheus metrics, and expanded `enrich_catalog()` to check case-insensitively for speculative keywords (`speculative`, `mtp`, `draft`, `nextn`, `proposal`) or historical ledger activity.
 
 ### 48. In-RAM Telemetry Loss on Daemon Shutdown (V4.8.3)
-* **The Trap:** Real-time token counts, session durations, and MTP (Multi-Token Prediction) hit rates were accumulated in memory to protect host NVMe drives from continuous disk writes. Unplanned daemon restarts, container updates, or host reboots wiped uncommitted session analytics.
-* **The Fix:** Implemented a 1-hour periodic delta-checkpoint flush in `SessionTracker` and attached OS signal traps (`SIGTERM` / `SIGINT`) to `dgx-orchestrator.py` to force stateful commits to `model_ledger.json` before process termination.
+* **Trap:** Real-time token counts, session durations, and MTP (Multi-Token Prediction) hit rates were accumulated in memory to protect host NVMe drives from continuous disk writes. Unplanned daemon restarts, container updates, or host reboots wiped uncommitted session analytics.
+* **Fix:** Implemented a 1-hour periodic delta-checkpoint flush in `SessionTracker` and attached OS signal traps (`SIGTERM` / `SIGINT`) to `dgx-orchestrator.py` to force stateful commits to `model_ledger.json` before process termination.
 
 ### 47. Idle-Time Metric Pollution in Long-Running Sessions (V4.8.3)
-* **The Trap:** Calculating Tokens Per Second (TPS) across a continuous session by subtracting session start time from session end time caused long idle periods (e.g., a 600-second quiet wait before closing a session) to dilute high-speed token generation bursts into artificially low averages.
-* **The Fix:** Decoupled the 10-minute idle tripwire from the active compute timer. Active TPS is calculated strictly as `Total_Generated_Tokens / (Last_Active_TS - First_Active_TS)`. The 600-second idle period triggers session commits to `model_ledger.json` but is completely excluded from the time divisor.
+* **Trap:** Calculating Tokens Per Second (TPS) across a continuous session by subtracting session start time from session end time caused long idle periods (e.g., a 600-second quiet wait before closing a session) to dilute high-speed token generation bursts into artificially low averages.
+* **Fix:** Decoupled the 10-minute idle tripwire from the active compute timer. Active TPS is calculated strictly as `Total_Generated_Tokens / (Last_Active_TS - First_Active_TS)`. The 600-second idle period triggers session commits to `model_ledger.json` but is completely excluded from the time divisor.
 
 ### 46. Wrapped `bash -c` Shell Command Inspection Failure (V4.8.3)
-* **The Trap:** Docker container inspection on Ray head nodes returned array-wrapped shell strings (e.g., `["bash", "-c", "ray start ... && python3 -m vllm ... --model <path>"]`). The inspection parser attempted to find `--model` as a discrete array element, threw an exception, and defaulted to labeling the active container as `"Active Container"`, preventing catalog matching.
-* **The Fix:** Upgraded `_discover_host_container()` to execute a regex pattern (`--model\s+([^\s]+)`) across string-wrapped entrypoint commands to extract the model path regardless of shell layering.
+* **Trap:** Docker container inspection on Ray head nodes returned array-wrapped shell strings (e.g., `["bash", "-c", "ray start ... && python3 -m vllm ... --model <path>"]`). The inspection parser attempted to find `--model` as a discrete array element, threw an exception, and defaulted to labeling the active container as `"Active Container"`, preventing catalog matching.
+* **Fix:** Upgraded `_discover_host_container()` to execute a regex pattern (`--model\s+([^\s]+)`) across string-wrapped entrypoint commands to extract the model path regardless of shell layering.
 
 ### 45. Multi-Node Asymmetric Logging & Worker UI State Desync (V4.8.3)
-* **The Trap:** In multi-node Ray deployments, the Head node (`spark-4`) acts as driver and logs shard-loading progress to Docker `stdout`. The Worker node (`spark-3`) only runs a passive `ray start` process and receives weights into VRAM over NCCL without outputting log progress. The orchestrator's log stage detector left `spark-3` permanently stuck on `Active Container` / `INITIALIZING` with a generic fallback ETA.
-* **The Fix:** Updated `_compute_cluster_status_impl()` to treat active worker nodes as UI slaves to the head node during boot sequences—broadcasting the head node's detected model name, stage (`LOADING SHARDS`, `COMPILING KERNELS`), and active ETA across all worker UI cards simultaneously.
+* **Trap:** In multi-node Ray deployments, the Head node (`spark-4`) acts as driver and logs shard-loading progress to Docker `stdout`. The Worker node (`spark-3`) only runs a passive `ray start` process and receives weights into VRAM over NCCL without outputting log progress. The orchestrator's log stage detector left `spark-3` permanently stuck on `Active Container` / `INITIALIZING` with a generic fallback ETA.
+* **Fix:** Updated `_compute_cluster_status_impl()` to treat active worker nodes as UI slaves to the head node during boot sequences—broadcasting the head node's detected model name, stage (`LOADING SHARDS`, `COMPILING KERNELS`), and active ETA across all worker UI cards simultaneously.
 
 ### 44. Grace Blackwell (GB10) Power Limit String Parsing (`PWR: 6/N/AW`) (V4.8.3)
-* **The Trap:** On Grace Blackwell (GB10) unified superchips, power is dynamically managed across the package. `nvidia-smi` returns `N/A` or `[Not Supported]` for GPU-isolated power limits. The UI blindly concatenated the draw, limit, and unit strings, rendering `PWR: 6/N/AW`.
-* **The Fix:** Sanitized telemetry parsing in `dgx-orchestrator.py` and string construction in `index.html`. If the hardware driver returns `N/A` for the limit, the dashboard gracefully falls back to displaying active draw only (`PWR: 6W`).
+* **Trap:** On Grace Blackwell (GB10) unified superchips, power is dynamically managed across the package. `nvidia-smi` returns `N/A` or `[Not Supported]` for GPU-isolated power limits. The UI blindly concatenated the draw, limit, and unit strings, rendering `PWR: 6/N/AW`.
+* **Fix:** Sanitized telemetry parsing in `dgx-orchestrator.py` and string construction in `index.html`. If the hardware driver returns `N/A` for the limit, the dashboard gracefully falls back to displaying active draw only (`PWR: 6W`).
 
 ### 43. Multi-Node V1 Shared Memory (`/dev/shm`) Followers Crash (V4.8.1)
-* **The Trap:** Attempting to deploy multi-node models using `--distributed-executor-backend mp` on the vLLM V1 engine triggered `AssertionError: collective_rpc should not be called on follower node` on `spark-3`. The `mp` backend relies on host IPC shared memory (`/dev/shm`), which cannot cross physical nodes.
-* **The Fix:** Multi-node topologies across physical hosts must use `--distributed-executor-backend ray` and set `VLLM_USE_V1=0` in `env_vars` to force the V0 cross-host Ray executor.
+* **Trap:** Attempting to deploy multi-node models using `--distributed-executor-backend mp` on the vLLM V1 engine triggered `AssertionError: collective_rpc should not be called on follower node` on `spark-3`. The `mp` backend relies on host IPC shared memory (`/dev/shm`), which cannot cross physical nodes.
+* **Fix:** Multi-node topologies across physical hosts must use `--distributed-executor-backend ray` and set `VLLM_USE_V1=0` in `env_vars` to force the V0 cross-host Ray executor.
 
 ### 42. YAML Folded Scalar Comment Pollution in `vllm_args` (V4.8.1)
-* **The Trap:** Inlining bash comments (`#`) inside a YAML folded block scalar (`vllm_args: >-`) resulted in all newlines being flattened into a single space. `shlex.split()` parsed the comments as literal CLI arguments, causing `api_server.py: error: unrecognized arguments: # ...`.
-* **The Fix:** Shifted all operational notes and comments strictly outside of the `vllm_args: >-` string scalar.
+* **Trap:** Inlining bash comments (`#`) inside a YAML folded block scalar (`vllm_args: >-`) resulted in all newlines being flattened into a single space. `shlex.split()` parsed the comments as literal CLI arguments, causing `api_server.py: error: unrecognized arguments: # ...`.
+* **Fix:** Shifted all operational notes and comments strictly outside of the `vllm_args: >-` string scalar.
 
 ### 41. Recipe Catalog Empty Due to Filename/`name:` Field Drift (V4.8.0)
-* **The Trap:** The original recipe schema carried both a filename and an internal `name:` field, required to match. During a merge, two recipes' `name:` fields drifted out of sync with their filenames. Because `build_catalog_response()` fails closed on any single bad recipe, the entire model catalog silently went empty — not just the two broken files — with no error surfaced anywhere the dashboard user could see.
-* **The Fix:** Removed `name:` from the schema entirely. The filename is now the only identifier a recipe has, so there's structurally nothing left for it to disagree with. The whole-catalog-fails-on-one-bad-recipe behavior itself is unchanged and is tracked separately.
+* **Trap:** The original recipe schema carried both a filename and an internal `name:` field, required to match. During a merge, two recipes' `name:` fields drifted out of sync with their filenames. Because `build_catalog_response()` fails closed on any single bad recipe, the entire model catalog silently went empty — not just the two broken files — with no error surfaced anywhere the dashboard user could see.
+* **Fix:** Removed `name:` from the schema entirely. The filename is now the only identifier a recipe has, so there's structurally nothing left for it to disagree with. The whole-catalog-fails-on-one-bad-recipe behavior itself is unchanged and is tracked separately.
 
 ### 40. Dashboard Polling Hang & Duplicate Load-Time Recording (V4.8.0)
-* **The Trap:** Two separate bugs, both invisible under light use. (1) `get_cluster_status()` made several sequential SSH round trips per host with no overall deadline; under frequent dashboard polling, a single unreachable host could cause requests to back up faster than they drained, presenting as a fully hung dashboard. (2) `record_load_time()` was called on every single status poll while a container sat idle-but-ready, not just once at actual readiness — `load_times.json` entries grew without bound instead of capturing one real cold-start duration, silently corrupting the ETA estimator's historical data.
-* **The Fix:** `get_cluster_status()` now single-flights concurrent callers and enforces a hard wall-clock ceiling (`STATUS_CALL_TIMEOUT_SEC`) via bounded per-host futures instead of unbounded `as_completed()`. `record_load_time()` now tracks which container instance has already been recorded and fires at most once per instance.
+* **Trap:** Two separate bugs, both invisible under light use. (1) `get_cluster_status()` made several sequential SSH round trips per host with no overall deadline; under frequent dashboard polling, a single unreachable host could cause requests to back up faster than they drained, presenting as a fully hung dashboard. (2) `record_load_time()` was called on every single status poll while a container sat idle-but-ready, not just once at actual readiness — `load_times.json` entries grew without bound instead of capturing one real cold-start duration, silently corrupting the ETA estimator's historical data.
+* **Fix:** `get_cluster_status()` now single-flights concurrent callers and enforces a hard wall-clock ceiling (`STATUS_CALL_TIMEOUT_SEC`) via bounded per-host futures instead of unbounded `as_completed()`. `record_load_time()` now tracks which container instance has already been recorded and fires at most once per instance.
 
 ### 39. Docker Control Plane & Delegate Wrapper (V4.7.0)
-* **The Trap:** Host-level PEP 668 constraints and local `venv` drift on `codepolice` made cross-environment management fragile and difficult to upgrade.
-* **The Fix:** Containerized the full control plane stack inside a `python:3.12-slim` Docker image on `maestro`. Re-engineered the `dgx-config` CLI wrapper into a context-aware Docker delegate that transparently forwards TTY flags, injects host identity, auto-stages external key files, and handles socket cleanup directly inside the container namespace.
+* **Trap:** Host-level PEP 668 constraints and local `venv` drift on `codepolice` made cross-environment management fragile and difficult to upgrade.
+* **Fix:** Containerized the full control plane stack inside a `python:3.12-slim` Docker image on `maestro`. Re-engineered the `dgx-config` CLI wrapper into a context-aware Docker delegate that transparently forwards TTY flags, injects host identity, auto-stages external key files, and handles socket cleanup directly inside the container namespace.
 
 ### 38. Grace Blackwell (GB10) MXFP4 MoE Engine & Activation Patch (V4.6.3)
-* **The Trap:** On Grace Blackwell (GB10) GPUs under vLLM `0.21.0`, TRTLLM, DeepGEMM, and Triton MXFP4 MoE kernels fail device compatibility checks. Marlin fails with a `KeyError: 'layers.0.ffn.experts.w13_input_scale'` on raw HuggingFace safetensors. `FlashInferExperts` (`--moe-backend flashinfer_cutlass`) is the only valid GB10 kernel, but defaults to `FLASHINFER_CUTLASS_MXFP4_BF16` (BF16 activations) while DeepSeek-V4 requires FP8 activations (`FLASHINFER_CUTLASS_MXFP4_MXFP8`). Passing `flashinfer_cutlass_afp8` is rejected by vLLM's CLI parser.
-* **The Fix:** Configured the recipe to use `--moe-backend flashinfer_cutlass` and injected a container entrypoint `sed` patch (`sed -i "s/FLASHINFER_CUTLASS_MXFP4_BF16/FLASHINFER_CUTLASS_MXFP4_MXFP8/g" ...`) to force the FP8 activation Cutlass engine at runtime.
+* **Trap:** On Grace Blackwell (GB10) GPUs under vLLM `0.21.0`, TRTLLM, DeepGEMM, and Triton MXFP4 MoE kernels fail device compatibility checks. Marlin fails with a `KeyError: 'layers.0.ffn.experts.w13_input_scale'` on raw HuggingFace safetensors. `FlashInferExperts` (`--moe-backend flashinfer_cutlass`) is the only valid GB10 kernel, but defaults to `FLASHINFER_CUTLASS_MXFP4_BF16` (BF16 activations) while DeepSeek-V4 requires FP8 activations (`FLASHINFER_CUTLASS_MXFP4_MXFP8`). Passing `flashinfer_cutlass_afp8` is rejected by vLLM's CLI parser.
+* **Fix:** Configured the recipe to use `--moe-backend flashinfer_cutlass` and injected a container entrypoint `sed` patch (`sed -i "s/FLASHINFER_CUTLASS_MXFP4_BF16/FLASHINFER_CUTLASS_MXFP4_MXFP8/g" ...`) to force the FP8 activation Cutlass engine at runtime.
 
 ### 37. Multi-Node vLLM V1 Engine `--nnodes` & `--node-rank` Flags (V4.6.3)
-* **The Trap:** Multi-node container launches using vLLM V1 (`nvcr.io/nvidia/vllm:26.05.post1-py3`) omitted `--nnodes` and `--node-rank`. V1's `multiproc_executor` defaulted to single-host execution and attempted to allocate all pipeline-parallel ranks onto `spark-4`'s single physical GPU, triggering a `local_world_size <= visible_device_count` crash.
-* **The Fix:** Updated `execute_deployment()` in `dgx-orchestrator.py` to inject `--nnodes <nodes>` and `--node-rank 0/1` explicitly into `docker run` commands.
+* **Trap:** Multi-node container launches using vLLM V1 (`nvcr.io/nvidia/vllm:26.05.post1-py3`) omitted `--nnodes` and `--node-rank`. V1's `multiproc_executor` defaulted to single-host execution and attempted to allocate all pipeline-parallel ranks onto `spark-4`'s single physical GPU, triggering a `local_world_size <= visible_device_count` crash.
+* **Fix:** Updated `execute_deployment()` in `dgx-orchestrator.py` to inject `--nnodes <nodes>` and `--node-rank 0/1` explicitly into `docker run` commands.
 
 ### 36. HuggingFace Auth Token Discovery (`get_hf_token`) (V4.6.3)
-* **The Trap:** Unauthenticated HuggingFace Hub requests triggered rate-limiting warnings or failed private checkpoint downloads.
-* **The Fix:** Implemented `get_hf_token()` in `common/ssh.py` to search environment variables, the project's `.secrets` file, or `~/.cache/huggingface/token`, injecting `-e HF_TOKEN=<token>` directly into vLLM containers.
+* **Trap:** Unauthenticated HuggingFace Hub requests triggered rate-limiting warnings or failed private checkpoint downloads.
+* **Fix:** Implemented `get_hf_token()` in `common/ssh.py` to search environment variables, the project's `.secrets` file, or `~/.cache/huggingface/token`, injecting `-e HF_TOKEN=<token>` directly into vLLM containers.
 
 ### 35. SSH Multi-Token Argument Quoting via `shlex.quote` (V4.6.3)
-* **The Trap:** Passing complex CLI arguments or JSON configuration strings (`--attention-config '{"use_fp4_indexer_cache": true}'`) through `run_ssh()` allowed remote shell layers to strip inner quotes or mangle JSON formatting.
-* **The Fix:** Updated `run_ssh()` to process command lists using `shlex.quote` on each token, ensuring preserved remote evaluation across OpenSSH shell boundaries.
+* **Trap:** Passing complex CLI arguments or JSON configuration strings (`--attention-config '{"use_fp4_indexer_cache": true}'`) through `run_ssh()` allowed remote shell layers to strip inner quotes or mangle JSON formatting.
+* **Fix:** Updated `run_ssh()` to process command lists using `shlex.quote` on each token, ensuring preserved remote evaluation across OpenSSH shell boundaries.
 
 ### 34. Web Dashboard Dynamic Hostname Routing (V4.6.2)
-* **The Trap:** Hardcoding `10.0.14.43` or `localhost` as `API_BASE` in `index.html` caused cross-origin requests or connection failures when opening the dashboard from external workstations.
-* **The Fix:** Updated `index.html` to evaluate `window.location.hostname` dynamically.
+* **Trap:** Hardcoding `10.0.14.43` or `localhost` as `API_BASE` in `index.html` caused cross-origin requests or connection failures when opening the dashboard from external workstations.
+* **Fix:** Updated `index.html` to evaluate `window.location.hostname` dynamically.
 
 ### 33. Grace Blackwell (GB10) Unified Memory Telemetry Parser (V4.6.2)
-* **The Trap:** Grace Blackwell LPDDR5x Unified Memory returns `[N/A]` for standard `nvidia-smi` memory queries, causing strict integer parsing checks to reject telemetry lines and return empty metrics.
-* **The Fix:** Updated `get_lightweight_telemetry()` in `dgx-orchestrator.py` to parse temperature and GPU utilization independently while assigning `Unified / 131072 MB` for VRAM fields.
+* **Trap:** Grace Blackwell LPDDR5x Unified Memory returns `[N/A]` for standard `nvidia-smi` memory queries, causing strict integer parsing checks to reject telemetry lines and return empty metrics.
+* **Fix:** Updated `get_lightweight_telemetry()` in `dgx-orchestrator.py` to parse temperature and GPU utilization independently while assigning `Unified / 131072 MB` for VRAM fields.
 
 ### 32. SSH Remote Shell Pipeline Syntax Expansion Bug (V4.6.2)
-* **The Trap:** Executing `docker ps --format '{{.Names}}|{{.Image}}'` over SSH caused the remote Bash shell to interpret `|` as a shell pipe, throwing `Exit 2` or `Exit 127` errors.
-* **The Fix:** Replaced `|` delimiters with double colons (`::`) across remote Docker format strings.
+* **Trap:** Executing `docker ps --format '{{.Names}}|{{.Image}}'` over SSH caused the remote Bash shell to interpret `|` as a shell pipe, throwing `Exit 2` or `Exit 127` errors.
+* **Fix:** Replaced `|` delimiters with double colons (`::`) across remote Docker format strings.
 
 ### 31. Wrapper Subcommand Passthrough for Daemon Execution (V4.6.1)
-* **The Trap:** Running `dgx-config daemon` caused the wrapper to pass `cli daemon` to `dgx-orchestrator.py`, triggering `argparse` choice validation errors.
-* **The Fix:** Updated `dgx-orchestrator.py` to map `args.subcommand == "cli"` and `args.cli_action == "daemon"` directly into daemon execution mode.
+* **Trap:** Running `dgx-config daemon` caused the wrapper to pass `cli daemon` to `dgx-orchestrator.py`, triggering `argparse` choice validation errors.
+* **Fix:** Updated `dgx-orchestrator.py` to map `args.subcommand == "cli"` and `args.cli_action == "daemon"` directly into daemon execution mode.
 
 ### 30. Virtual Environment Bootstrap & Ownership (V4.6.1)
-* **The Trap:** Running `pip install` as a non-service user on the host failed with permission errors.
-* **The Fix:** Standardized on the containerized stack (see Tombstone #39) rather than a host-level `venv`, sidestepping this class of problem entirely.
+* **Trap:** Running `pip install` as a non-service user on the host failed with permission errors.
+* **Fix:** Standardized on the containerized stack (see Tombstone #39) rather than a host-level `venv`, sidestepping this class of problem entirely.
 
 ### 29. Web Dashboard Full-Width Logs & Dynamic Topology Selector (V4.6.0)
-* **The Trap:** Squeezed log panels obscured long trace outputs, and invalid topology options allowed users to attempt single-node deployments of 70B+ models.
-* **The Fix:** Moved live logs to a full-width bottom panel and added dynamic catalog parsing in JavaScript to filter valid topology choices.
+* **Trap:** Squeezed log panels obscured long trace outputs, and invalid topology options allowed users to attempt single-node deployments of 70B+ models.
+* **Fix:** Moved live logs to a full-width bottom panel and added dynamic catalog parsing in JavaScript to filter valid topology choices.
 
 ### 28. YAML Argument Comment Pollution & Syntax Sanitization (V4.6.0)
-* **The Trap:** Inline bash comments inside folded YAML multiline strings (`>-`) were parsed as literal command-line flags, causing vLLM initialization to fail.
-* **The Fix:** Stripped all inline comments and trailing formatting artifacts from the catalog source.
+* **Trap:** Inline bash comments inside folded YAML multiline strings (`>-`) were parsed as literal command-line flags, causing vLLM initialization to fail.
+* **Fix:** Stripped all inline comments and trailing formatting artifacts from the catalog source.
 
 ### 27. Multi-User Shared Key Auto-Staging & OpenSSH 0600 Strictness (V4.5.0)
-* **The Trap:** Group-readable permissions (`0640`) on shared SSH keys triggered OpenSSH `bad permissions` rejections.
-* **The Fix:** Implemented `resolve_user_identity_key()` to auto-stage key copies into `~/.ssh/id_dgx_orchestrator` with `0600` permissions.
+* **Trap:** Group-readable permissions (`0640`) on shared SSH keys triggered OpenSSH `bad permissions` rejections.
+* **Fix:** Implemented `resolve_user_identity_key()` to auto-stage key copies into `~/.ssh/id_dgx_orchestrator` with `0600` permissions.

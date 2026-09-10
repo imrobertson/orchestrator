@@ -3,7 +3,14 @@ recipe_version: '1'
 # The stock recipe has no --enable-auto-tool-choice/--tool-call-parser, so it 400s on
 # any tools+tool_choice:auto request (verified 2026-09-05 sweep). qwen3_coder emits
 # qwen3-style XML tool calls which vLLM parses regardless of base model family.
-# dspark MTP n=5 kept from stock recipe (draft model ships with this checkpoint).
+# dspark n=5 kept from stock recipe (draft model ships with this checkpoint).
+#
+# 2026-09-09: inherited the stock recipe's standalone --speculative-model
+# flag, which these builds reject (errata E023), and inherited it by being
+# copied from a recipe that was already broken. Drafter moved into
+# --speculative-config's `model` key. See the stock recipe's header.
+#
+# UNMEASURED. Never launched successfully.
 hf_path: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
 image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.70
@@ -23,5 +30,4 @@ topologies:
     vllm_args: >-
       --trust-remote-code --kv-cache-dtype fp8 --max-num-seqs 4
       --compilation-config '{"mode": 0}' --enable-auto-tool-choice --tool-call-parser qwen3_coder
-      --speculative-model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark
-      --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
+      --speculative-config '{"method":"dspark","model":"nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark","num_speculative_tokens":5}'

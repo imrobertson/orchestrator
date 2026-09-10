@@ -22,7 +22,10 @@ import types
 SELF = pathlib.Path(__file__).resolve()
 print(f"[harness] self-hash: {hashlib.sha256(SELF.read_bytes()).hexdigest()[:16]}  {SELF}")
 
-TARGET = SELF.parent / "dgx-orchestrator.py"
+sys.path.insert(0, str(SELF.parent))
+from _repo import ORCHESTRATOR          # noqa: E402
+
+TARGET = ORCHESTRATOR
 print(f"[harness] target-hash: {hashlib.sha256(TARGET.read_bytes()).hexdigest()[:16]}  {TARGET}")
 
 # Host inventory the stub will report. The orchestrator derives

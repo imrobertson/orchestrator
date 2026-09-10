@@ -1,5 +1,5 @@
 """
-Typed access to per-model recipes/local/*.yaml and recipes/eugr/*.yaml.
+Typed access to per-model recipes/local/*.yaml.
 
 Phase 2 replaces the monolithic models.yaml with one recipe file per model.
 This module owns:
@@ -53,7 +53,15 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from common.config import BASE_DIR, load_cluster_config
 
 RECIPES_DIR = BASE_DIR / "recipes"
-RECIPE_SUBDIRS = ("local", "eugr")
+# recipes/eugr/ retired 2026-09-09. It held only .gitkeep and nothing ever
+# wrote to it -- tools/translate_eugr_recipes.py stages to
+# recipes/_translated_from_eugr/, which is deliberately NOT globbed so an
+# unreviewed translation cannot land in the live catalog. Ingesting from
+# eugr remains supported via that tool; see docs/reference/community-sources.md.
+# Kept as a tuple rather than collapsed to a single path: the loop below
+# and _recipe_dir_fingerprint() both iterate it, and a future second
+# source (a per-pool catalog under Phase 3) would go here.
+RECIPE_SUBDIRS = ("local",)
 
 # Repo-root directory mod payloads live under. A recipe's mods: entries are
 # bare directory names resolved against this at bake time (Task MB) -- never
@@ -136,8 +144,14 @@ class CapabilityConfig(BaseModel):
 
 class TopologyConfig(BaseModel):
     # Recipe-authoring metadata: intended to flag a topology as valid only
-    # as part of the full multi-node cluster (useful for EUGR-synced
-    # recipes that assume a cluster deploy target). Currently INERT --
+    # as part of the full multi-node cluster. Originally added for
+    # EUGR-synced recipes that assume a cluster deploy target; with
+    # recipes/eugr/ retired (2026-09-09) its only writer is
+    # tools/translate_eugr_recipes.py, whose output stages outside the
+    # globbed catalog -- so nothing in recipes/local/ sets it today.
+    # Removing it is safe but is a schema touch, and F-j records three
+    # config_hash orphaning bumps in three days; not worth a fourth for a
+    # field that is already excluded from the hash. Currently INERT --
     # not read by build_catalog_response() or by dgx-orchestrator.py's
     # deploy path. Same bucket as RecipeConfig.capability/mods: exists so
     # recipes can carry the field without a second schema migration later,
@@ -621,10 +635,6 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
         WORKSTREAMS K4 Q2; that one is still an open question, not a
         settled exclusion.
 
-    Deliberately EXCLUDED:
-      - capability -- authoring metadata, still never reaches the container.
-        Verify that remains true before trusting it; the same assumption
-        about mods went stale without this docstring noticing.
       - notes -- documentation, never reaches the container.
       - The HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE env_vars injection
         build_catalog_response() performs based on cluster_config.yaml's
@@ -635,12 +645,21 @@ def compute_config_hash(recipe: RecipeConfig, topo_key: str) -> str:
         against the raw, as-loaded RecipeConfig/TopologyConfig (i.e. via
         load_recipes()), never against the enriched catalog dict.
 
-    NOTE ON MIGRATION: this is schema 4. Every config_hash recorded under
-    schema 1, 2, or 3 is now unreachable, so all existing launch_history
-    entries orphan and their recipes revert to showing as never-launched.
-    Tolerable rather than correcting, same as the 2->3 bump: nothing in the
-    current catalog sets model_path_override or extra_mounts, so no
-    schema-3 record was WRONG, they are simply no longer computable.
+    NOTE ON MIGRATION: this is schema 5 -- keep this number in step with
+    _CONFIG_HASH_SCHEMA above; it was left saying 4 through the 4->5 bump
+    and had to be corrected on 2026-09-09. Every config_hash recorded under
+    an earlier schema is unreachable, so all existing launch_history entries
+    orphan and their recipes revert to showing as never-launched. Tolerable
+    rather than correcting, same as the 2->3 and 3->4 bumps: no earlier
+    record was WRONG, they are simply no longer computable.
+
+    That said, this has now happened three times in three days, and
+    WORKSTREAMS.md F-j tracks the cost. Before the next bump, check whether
+    the new field is actually reachable by `docker run` -- the
+    gpu_util_ceiling_exempt trace on 2026-09-08 is the pattern -- rather
+    than including it because including things is safer. A field that
+    cannot change what launches costs the entire catalog's launch history
+    for nothing.
     """
     canonical = json.dumps(
         build_config_payload(recipe, topo_key), sort_keys=True, separators=(",", ":")
@@ -704,9 +723,9 @@ def _load_recipes_impl() -> dict[str, RecipeConfig]:
 
 def _recipe_dir_fingerprint() -> tuple:
     """
-    Cheap signal for "has anything under recipes/{local,eugr}/ changed since
-    we last loaded it". (path, mtime_ns) per *.yaml file across both
-    subdirs, sorted for a stable, hashable/comparable tuple. Covers edits
+    Cheap signal for "has anything under recipes/local/ changed since we
+    last loaded it". (path, mtime_ns) per *.yaml file across every subdir
+    in RECIPE_SUBDIRS, sorted for a stable, hashable/comparable tuple. Covers edits
     (mtime changes), adds and removes (the file list itself changes), and
     renames (same, since it's a different set of paths). Deliberately does
     NOT stat file contents/hash them -- mtime is enough to detect "worth
@@ -733,7 +752,7 @@ def _recipe_dir_fingerprint() -> tuple:
 def _load_recipes_cached(_fingerprint: tuple) -> dict[str, RecipeConfig]:
     # _fingerprint is unused inside the function -- it exists purely as the
     # lru_cache key. Any change to it (an edit, add, remove, or rename
-    # under recipes/{local,eugr}/) is a different key, so lru_cache treats
+    # under recipes/local/) is a different key, so lru_cache treats
     # it as a fresh call instead of returning the stale cached result.
     # maxsize=1 means each new fingerprint evicts the previous entry, so
     # this never grows unbounded across repeated edits.
@@ -742,14 +761,16 @@ def _load_recipes_cached(_fingerprint: tuple) -> dict[str, RecipeConfig]:
 
 def load_recipes(bypass_cache: bool = False) -> dict[str, RecipeConfig]:
     """
-    Load and validate every recipe under recipes/local/ and recipes/eugr/.
+    Load and validate every recipe under recipes/local/.
 
     Returns a dict keyed by filename stem (e.g. "recipes/local/foo.yaml" ->
-    key "foo"). A name collision between local/ and eugr/ (same stem in
-    both) still raises -- see _load_recipes_impl().
+    key "foo"). The stem-collision check in _load_recipes_impl() is
+    unreachable while RECIPE_SUBDIRS holds a single directory -- the
+    filesystem prevents two files sharing a stem -- and is kept for the
+    case where it grows again.
 
     Cached across calls, but the cache auto-invalidates whenever any
-    recipe file under recipes/{local,eugr}/ is added, removed, renamed, or
+    recipe file under recipes/local/ is added, removed, renamed, or
     edited (see _recipe_dir_fingerprint()) -- so editing a recipe on disk
     is picked up on the next call with no process restart required. The
     common case (nothing changed since the last call) costs one glob +

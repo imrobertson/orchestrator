@@ -1,4 +1,23 @@
 recipe_version: '1'
+# A coworker's personal 1-node tune. The 1_node block below is unmodified.
+#
+# 2026-09-09: removed a dead 2_node block. It had never been run and could
+# not have been -- it paired qwen3_next_mtp with pp_size 2 (errata E005:
+# NotImplementedError at create_engine_config(), the MTP draft class does
+# not implement SupportsPP, TOMBSTONES #104) and also omitted
+# --distributed-executor-backend ray (E003). It failed before any weight
+# load, which is why a dead topology sat here unnoticed.
+#
+# Deleted rather than rebuilt as TP2: converting would have produced a
+# block flag-equivalent to qwen-3.8-27b-nvfp4's 2_node, which already
+# exists and is the recipe to use for a 2-node run of this checkpoint.
+# This file stays what it is -- a single-node variant.
+#
+# 1_node's config_hash is UNCHANGED by this edit. build_config_payload()
+# hashes per (recipe, topo_key), and none of the recipe-level fields it
+# includes (hf_path, image, entrypoint, model_path_override, extra_mounts,
+# launch_argv_prefix, gpu_util, mods) were touched. Launch history and
+# benchmark ledger entries for sqk2::1_node survive intact.
 hf_path: unsloth/Qwen3.8-27B-NVFP4
 image: eugr/spark-vllm-b12x:latest
 gpu_util: 0.7
@@ -19,20 +38,3 @@ topologies:
       --trust-remote-code --kv-cache-dtype fp8 --language-model-only --reasoning-parser qwen3
       --enable-auto-tool-choice --tool-call-parser qwen3_coder --compilation-config '{"mode":
       0}' --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":5}'
-  2_node:
-    max_model_len: 262144
-    tp_size: 1
-    pp_size: 2
-    env_vars:
-    - OMP_NUM_THREADS=16
-    - VLLM_CPU_OMP_THREADS=16
-    - TORCHINDUCTOR_AUTOGRAD_CACHE=0
-    - TORCHINDUCTOR_FX_GRAPH_CACHE=0
-    - NCCL_CUMEM_ENABLE=0
-    - NCCL_IB_GID_INDEX=3
-    - NCCL_SOCKET_IFNAME=enp1s0f0np0
-    - GLOO_SOCKET_IFNAME=enp1s0f0np0
-    vllm_args: >-
-      --disable-custom-all-reduce --trust-remote-code --kv-cache-dtype fp8 --language-model-only
-      --reasoning-parser qwen3 --enable-auto-tool-choice  --tool-call-parser qwen3_coder --compilation-config
-      '{"mode": 0}' --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":5}'

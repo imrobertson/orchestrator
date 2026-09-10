@@ -65,3 +65,6 @@ benchmark_results.txt
 *-experimental.yaml
 *-imr.yaml
 *-sqk.yaml
+run_logs/
+verification-report.txt
+out

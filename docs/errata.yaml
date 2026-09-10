@@ -30,7 +30,14 @@
 # ADDING A RULE: only from a real incident. Do not anticipate.
 
 version: 1
-generated_from: "TOMBSTONES.md #27-#114, TROUBLESHOOTING.md #1-14, 2026-09-03 synthesis + 2026-09-07 session (E019-E022; images: tonyd2wild_glm53, aeon_ultimate)"
+generated_from: >-
+  TOMBSTONES.md #27-#143, TROUBLESHOOTING.md #1-14, 2026-09-03 synthesis
+  + 2026-09-07 session (E019-E022; images: tonyd2wild_glm53, aeon_ultimate)
+  + 2026-09-09 source-read audit and TROUBLESHOOTING.md dissolution (E023-E025; images: vllm_openai_nightly;
+  E018 known_intentional extended). The 2026-09-09 pass read every file in
+  recipes/local/ directly; E023 and E024 are both derived from diagnoses
+  that already existed in recipe headers but had never reached this file,
+  and both have live violations in the catalog today.
 
 builds:
   # Named so a rule can be scoped to the build it was actually proven on.
@@ -84,6 +91,22 @@ images:
   ngc_default:
     tag: "nvcr.io/nvidia/vllm:26.07-py3"
     ships_ray: false          # confirmed: `exec: ray: not found`
+  vllm_openai_nightly:
+    tag: "vllm/vllm-openai:nightly"
+    ships_ray: unknown        # never exercised 2-node on this cluster
+    entrypoint: ["vllm", "serve"]
+    lineage: "official upstream vLLM image"
+    note: >-
+      Added 2026-09-09. The official vllm/vllm-openai base sets
+      ENTRYPOINT ["vllm","serve"] -- the same mechanism as
+      tonyd2wild_glm53 below, which is built on this base. Recorded here so
+      E020 resolves STATICALLY for recipes using it, without a docker
+      inspect: muse-glimmer-30b.yaml runs this image with no
+      `entrypoint: ""`, which is a live E020 candidate found by reading the
+      catalog rather than by a failed deploy. Not reproduced on hardware --
+      the mechanism is confirmed (#133), the trigger is not.
+      ships_ray is deliberately `unknown`, not false; see aeon_ultimate's
+      note for why that distinction matters to E004.
   hazyumps_gb10:
     tag: "hazyumps/deepseek-v4-flash-gb10:sm121-cu130-20260727d"
     ships_ray: true
@@ -170,7 +193,19 @@ rules:
     evidence:
       tombstones: [43]
       incidents: [1]
-      notes: "Reproduced independently 2026-08-31 (Task MD) on a from-scratch Qwen3-0.6B TP=2 recipe with vllm_args: '' -- an ABSENT flag is enough, it does not require a deliberately wrong one."
+      notes: >-
+        Reproduced independently 2026-08-31 (Task MD) on a from-scratch
+        Qwen3-0.6B TP=2 recipe with vllm_args: '' -- an ABSENT flag is
+        enough, it does not require a deliberately wrong one.
+        LIVE VIOLATIONS as of 2026-09-09: qwen-3.8-27b::2_node and
+        qwen-3.8-27b-nvfp4-sqk2::2_node both omitted this flag. Fixed in
+        the same pass; recorded here because an error-grade rule with live
+        violations and no linter is the case for building the linter
+        (WORKSTREAMS.md WS-3).
+        NOTE the distinct second failure this string also names: TOMBSTONES
+        #140 produces the identical `collective_rpc` error from a different
+        cause (module entrypoint parsing and ignoring --headless), fixed by
+        launch_argv_prefix, NOT by this flag. Same message, two rules.
 
   - id: E004
     summary: "A 2-node recipe must use an image that actually ships the ray binary."
@@ -186,7 +221,17 @@ rules:
     evidence:
       tombstones: [103]
       incidents: [11]
-      notes: "Distinct failure from E003, not a rediscovery of it. Having the flag right is not enough if the image cannot run it. Confirmed fixed live on llama-3.3-70b, llama-4-fp4, llama-4-fp8."
+      notes: >-
+        Distinct failure from E003, not a rediscovery of it. Having the flag
+        right is not enough if the image cannot run it. Confirmed fixed live
+        on llama-3.3-70b, llama-4-fp4, llama-4-fp8.
+        A recipe with NO `image:` field at all inherits default_image
+        (ngc_default, ships_ray: false) and therefore trips this rule --
+        the omission is the violation. LIVE VIOLATION as of 2026-09-09:
+        qwen-3.8-27b had no image: field and a 2_node topology, the FOURTH
+        recurrence of this trap after #103 fixed three recipes and
+        nemotron-3_5-lightning-bf16's header describes adding image:
+        proactively "rather than let it recur a third time."
 
   - id: E005
     summary: "MTP-family speculative decoding cannot be combined with pp_size > 1."
@@ -203,7 +248,18 @@ rules:
     evidence:
       tombstones: [104, 107]
       incidents: [13]
-      notes: "Confirmed live on qwen-3.6-27b-nvfp4::2_node 2026-09-03. Applied to qwen-3.5-122b by mechanism (model-agnostic), not independently reproduced."
+      notes: >-
+        Confirmed live on qwen-3.6-27b-nvfp4::2_node 2026-09-03. Applied to
+        qwen-3.5-122b by mechanism (model-agnostic), not independently
+        reproduced.
+        LIVE VIOLATIONS as of 2026-09-09: qwen-3.8-27b::2_node and
+        qwen-3.8-27b-nvfp4-sqk2::2_node, both pp_size 2 with
+        qwen3_next_mtp. Missed by #107's sweep, which rebuilt the
+        qwen-3.5-122b siblings as TP. Both fixed in the same pass. Note the
+        failure is CHEAP -- config_creation, before any weight load -- which
+        is why two dead recipes sat in the catalog unnoticed. Cheap failures
+        need a linter precisely because they never produce an incident
+        anyone remembers.
 
   - id: E006
     summary: "DSpark requires num_speculative_tokens >= 5."
@@ -242,7 +298,16 @@ rules:
         - {field: vllm_args, flag_not_value: {flag: "--attention-backend", value: "TRITON_ATTN"}}
     remedy: "Gemma 4 has heterogeneous head dimensions (256 local / 512 global) the default FlashInfer path does not handle correctly."
     evidence:
-      notes: "Validated 2026-08-29 TP=2, 12.0 tok/s decode, matching independent community TP=2 figures (~11.2). Confirmed via 'Using AttentionBackendEnum.TRITON_ATTN backend.' 3x across the cluster -- resolved, not merely requested."
+      notes: >-
+        Validated 2026-08-29 TP=2, 12.0 tok/s decode, matching independent
+        community TP=2 figures (~11.2). Confirmed via 'Using
+        AttentionBackendEnum.TRITON_ATTN backend.' 3x across the cluster --
+        resolved, not merely requested.
+        SCOPE NOTE added 2026-09-09: this rule is scoped image_family: eugr
+        and must stay there. gemma4-26b-a4b-aeon-dflash runs
+        ghcr.io/aeon-7/aeon-vllm-ultimate without this flag and is validated
+        at 49-103 tok/s across prompt categories, so widening the scope
+        would make the rule fire on a known-good recipe -- rule 3.
 
   - id: E009
     summary: "Gemma 4 uses the BF16 base checkpoint with --quantization fp8, never a pre-quantized -FP8 repo."
@@ -270,7 +335,13 @@ rules:
     remedy: "Use eugr/spark-vllm:latest (mainline). Confirmed working across 8 live runs, ~50-53 tok/s single-stream."
     evidence:
       tombstones: [89]
-      notes: "Specific to the MTP proposer path. -b12x's MoE-kernel speedup remains worth keeping for workloads that do not need MTP."
+      notes: >-
+        Specific to the MTP proposer path. -b12x's MoE-kernel speedup remains
+        worth keeping for workloads that do not need MTP. A SECOND
+        independent reason to fall back from b12x to mainline exists and is
+        NOT this rule: qwen-3.6-35b-a3b-nvfp4-nothink pins mainline to avoid
+        a B12x plugin NVML crash, which is not MTP-specific and not Gemma-4-
+        specific. Do not merge the two; they have different conditions.
 
   - id: E011
     summary: "vllm_args must be written as a YAML block scalar (>-), never a quoted flow scalar."
@@ -389,6 +460,11 @@ rules:
       Strip VLLM_USE_V1=0 opportunistically as each recipe is re-validated,
       never as a catalog-wide sweep: every env_vars change alters
       compute_config_hash() and resets that recipe's launch-success history.
+      As of 2026-09-09 five recipes still carry it -- llama-4-fp4,
+      llama-4-fp8, llama-4-fp8-tp, qwen-2_5-coder-32b,
+      _llama-4-fp8-tp-noep. That count is recorded so it is known, NOT as a
+      task: WORKSTREAMS.md F-j records two config_hash orphaning bumps
+      already, and a sweep would be a third.
     evidence: {tombstones: [43, 103, 113], incidents: [1]}
 
   - id: E016
@@ -413,9 +489,51 @@ rules:
       Only ever present in a recipe that also carried E001's known-bad
       kv-cache-dtype, and that deploy crashed during config validation before
       MoE execution was reached. Nothing confirms it works or that it is
-      broken. --moe-backend flashinfer_cutlass is the validated choice
-      (required for GB10's SwiGLU clamping, see incident #2).
-    evidence: {incidents: [2]}
+      broken. --moe-backend flashinfer_cutlass is the validated choice on the
+      eugr images -- see E025, which now carries the SwiGLU mechanism this
+      rule used to reach for by citation.
+    evidence:
+      errata: [E025]
+      notes: >-
+        Evidence pointer rewritten 2026-09-09. This rule previously cited
+        `incidents: [2]`, meaning TROUBLESHOOTING.md's incident log, which
+        was archived that day. The mechanism it was reaching for is now in
+        E025 rather than in a retired file.
+
+  - id: E025
+    summary: "DeepSeek-V4 on a eugr image needs --moe-backend flashinfer_cutlass for GB10's SwiGLU clamping."
+    confidence: validated
+    enforce: warn
+    scope: {model_family: deepseek-v4, hardware: gb10, image_family: eugr}
+    condition:
+      all:
+        - {field: hf_path, matches: "(?i)deepseek-v4"}
+        - {field: image, family: eugr}
+        - {field: vllm_args, flag_not_value: {flag: "--moe-backend", value: "flashinfer_cutlass"}}
+    failure: >-
+      ValueError during initialization naming swiglu_limit=10.0, or a
+      complaint about missing MoE backends. DeepSeek-V4 enforces SwiGLU
+      clamping at 10.0; the flashinfer_b12x kernels do not apply that clamp
+      on GB10 silicon.
+    remedy: >-
+      Pass --moe-backend flashinfer_cutlass explicitly. When speculative
+      decoding is also in use, set "moe_backend":"flashinfer_cutlass" INSIDE
+      the --speculative-config JSON as well -- the outer flag does not reach
+      the draft path.
+    scope_caution: >-
+      IMAGE-SCOPED, and the scope is doing real work. The hazyumps GB10-native
+      image (hazyumps/deepseek-v4-flash-gb10) needs NO --moe-backend flag at
+      all: it auto-selects FlashInfer SM120 sparse-MLA decode plus MARLIN MoE
+      correctly, which is why the validated DSpark recipes deliberately omit
+      the flag. Widening this rule past image_family: eugr would fire on the
+      cluster's best-performing recipe -- linter rule 3.
+    evidence:
+      notes: >-
+        Rescued 2026-09-09 from TROUBLESHOOTING.md Incident #2 during that
+        file's dissolution. Validated on real hardware; it is the pattern
+        every working eugr-image DeepSeek recipe used. Written as a rule here
+        rather than left as prose because E017 already depended on it by
+        citation and would have been left pointing at an archived file.
 
   - id: E018
     summary: "Two catalog keys sharing an identical hf_path must be flagged, not silently resolved."
@@ -447,10 +565,20 @@ rules:
       Separately, make _resolve_catalog_key() detect multiple matches rather
       than returning the first.
     known_intentional:
+      # Verified against every file in recipes/local/ on 2026-09-09. The
+      # first four were recorded earlier; the last five were live and
+      # undeclared, so this rule would have fired on all of them as
+      # unexplained. Keeping this list complete is what stops rule 3's
+      # "a warning that always fires is a warning nobody reads".
       - "qwen-2_5-coder-32b / -tp (PP vs TP comparison pair)"
       - "qwen-3.5-122b-tp / -mtp2 / -mtp4 (speculative depth sweep)"
       - "deepseek-v4-flash-0731-dspark / -512k / -1M (context-size variants)"
       - "llama-4-fp8 / -tp (PP vs TP comparison pair, WORKSTREAMS.md WS-1)"
+      - "llama-4-fp8 / -tp / _llama-4-fp8-tp-noep (the _-prefixed third is the expert-parallel-disabled experiment)"
+      - "qwen-3.8-27b-nvfp4 / -sqk2 (unsloth/Qwen3.8-27B-NVFP4; see the note on -sqk2's 2_node below)"
+      - "qwen-3.6-35b-a3b-nvfp4 / -nothink (thinking-mode-disabled variant, kept because thinking scored 0/5 on the coding suite)"
+      - "gemma4-26b-a4b-nvfp4 / -tools (tool-calling variant on mainline rather than -b12x, per E010)"
+      - "muse-glimmer-30b-nvfp4 / -dflash-tools (DFlash drafter + tool-calling variant)"
     evidence: {tombstones: [57, 77, 110, 111]}   # 111 = the resolution entry
 
   - id: E019
@@ -474,8 +602,9 @@ rules:
       fabricated ::2_node keys in TOMBSTONES #127, reached by a different
       door.
     confirmed_instance: >-
-      _glm-5.3-flash-nvfp4-tp2 as first written, 2026-09-07:
-      model_path_override /models/glm-5.3-flash-nvfp4 against hf_path
+      glm-5_3-flash-nvfp4-mtp as first written (then named
+      _glm-5.3-flash-nvfp4-tp2), 2026-09-07: model_path_override
+      /models/glm-5.3-flash-nvfp4 against hf_path
       RedHatAI/GLM-5.3-Flash-NVFP4. Simulated against the real matcher --
       match False before case-matching, True after. Caught in code review
       before the recipe deployed, so no ledger data was corrupted; the
@@ -523,11 +652,19 @@ rules:
       --block-size: expected one argument". Reading it cold points straight
       at the wrong line.
     confirmed_instance: >-
-      _glm-5.3-flash-nvfp4-tp2 on ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8
-      (ENTRYPOINT ["vllm","serve"]), 2026-09-07. Earlier and unrecorded at
-      the time: ghcr.io/aeon-7/aeon-vllm-ultimate (ENTRYPOINT bash), which is
-      why deploy_gemma4_dflash.py existed as a repo-root standalone rather
-      than a recipe.
+      glm-5_3-flash-nvfp4-mtp (then _glm-5.3-flash-nvfp4-tp2) on
+      ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v8 (ENTRYPOINT
+      ["vllm","serve"]), 2026-09-07. Earlier and unrecorded at the time:
+      ghcr.io/aeon-7/aeon-vllm-ultimate (ENTRYPOINT bash), which is why
+      deploy_gemma4_dflash.py existed as a repo-root standalone rather than
+      a recipe.
+    candidate_instance: >-
+      muse-glimmer-30b.yaml on vllm/vllm-openai:nightly, found 2026-09-09 by
+      reading the catalog rather than by a failed deploy. That image is now
+      in the images: block with entrypoint: ["vllm","serve"], so an audit
+      script can resolve this statically. NOT reproduced on hardware --
+      suspected, not confirmed. Promote to a confirmed_instance only after a
+      real deploy fails, per rule 4.
     remedy: >-
       Set entrypoint: "" in the recipe. The quotes are load-bearing -- a bare
       `entrypoint:` parses as null, which is identical to omitting the field.
@@ -542,9 +679,10 @@ rules:
         path empties the whole catalog (TOMBSTONES #41, linter rule 1). This
         rule is written for an on-demand tools/audit_recipe_images.py pass
         (WORKSTREAMS.md WS-3), not for load_recipes(). The images: block now
-        records `entrypoint:` for both known-affected images, so an audit
-        script can resolve this statically for images it already knows.
-        Promote to `warn` only once that path exists and is what consumes it.
+        records `entrypoint:` for all THREE known-affected images, so an
+        audit script can resolve this statically for images it already
+        knows. Promote to `warn` only once that path exists and is what
+        consumes it.
 
   - id: E021
     summary: "model_path_override must resolve inside a path some extra_mounts entry provides."
@@ -608,6 +746,83 @@ rules:
         parsed RecipeConfig -- pydantic erases the distinction, which is the
         whole reason this rule can exist at all.
 
+  - id: E023
+    summary: "Never pass --speculative-model as a separate flag; the drafter belongs in --speculative-config's model key."
+    confidence: known_bad
+    enforce: error
+    scope: {engine: vllm}
+    condition:
+      all:
+        - {field: vllm_args, flag_present: "--speculative-model"}
+    failure: >-
+      These builds reject a standalone --speculative-model flag. The
+      speculative drafter is a member of the --speculative-config JSON
+      object, not a sibling argument, and passing both is not additive --
+      the recipe crashes at startup.
+    fails_at: config_creation
+    remedy: >-
+      Move the repo id into --speculative-config's `model` key and delete the
+      separate flag:
+      --speculative-config '{"method":"dspark","model":"<repo>","num_speculative_tokens":5}'
+    evidence:
+      tombstones: [143]
+      notes: >-
+        Added 2026-09-09. The diagnosis already existed in the repo and had
+        never reached this file: _deepseek-v4-flash-vision-exp.yaml's header
+        states "This build REJECTS a separate `--speculative-model` flag
+        (confirmed: our nemotron-3.5 recipe crashed on exactly that)." The
+        crash was observed, understood, written down in a DIFFERENT recipe,
+        and the broken recipe was never fixed.
+        LIVE VIOLATIONS as of 2026-09-09: nemotron-3.5-lightning-nvfp4 and
+        _nemotron-3.5-lightning-nvfp4-tools, both fixed in the same pass.
+        This rule is the clearest single argument for the linter in
+        WORKSTREAMS.md WS-3 -- the knowledge existed, in this repository,
+        and did not reach the file that needed it. Distinct from E006/E007,
+        which constrain DSpark's parameters rather than how a drafter is
+        declared at all.
+
+  - id: E024
+    summary: "--moe-backend marlin is NVFP4-only and is rejected on a mixed FP8/NVFP4 checkpoint."
+    confidence: known_bad
+    enforce: warn              # see notes -- not decidable from the recipe alone
+    scope: {engine: vllm, hardware: gb10}
+    condition:
+      all:
+        - {field: vllm_args, flag: "--moe-backend", value: "marlin"}
+        - {field: hf_path, in: checkpoints_known_mixed_precision}
+    failure: >-
+      ValueError: moe_backend='marlin' is not supported for unquantized MoE.
+      The marlin MoE kernel path requires uniformly NVFP4-quantized expert
+      weights; a checkpoint that quantizes only some expert groups presents
+      the rest as unquantized and the resolver refuses the whole config.
+    fails_at: config_creation
+    remedy: >-
+      Omit --moe-backend entirely and let vLLM auto-select. The mixed layout
+      is a property of the checkpoint, not something a flag can reconcile.
+    checkpoints_known_mixed_precision:
+      - repo: "unsloth/Qwen3.6-35B-A3B-NVFP4"
+        layout: >-
+          group_0 FP8 for attention, linear_attn and lm_head plus the MoE
+          experts on layers 32-39; group_1 NVFP4 for MoE gate/up/down on all
+          layers. Read from the checkpoint's own quantization config.
+    evidence:
+      tombstones: [143]
+      notes: >-
+        Added 2026-09-09 from qwen-3.6-35b-a3b-nvfp4.yaml's header, which
+        records this as the cause of BOTH 2026-09-05 load failures.
+        enforce is `warn`, not `error`, for one reason: whether a checkpoint
+        is mixed-precision is NOT decidable from the recipe YAML. It
+        requires reading the checkpoint's quantization config, which needs
+        network or a local snapshot -- the same constraint that keeps E020
+        at `none`. The condition above therefore leans on a curated
+        checkpoints_known_mixed_precision list, which is honest about being
+        incomplete rather than pretending to a general predicate. A recipe
+        setting marlin against a checkpoint NOT on that list is not cleared
+        by this rule; it is simply unchecked. Widen the list when a new
+        mixed checkpoint is found, and consider folding the real check into
+        tools/audit_recipe_images.py, which already needs registry access
+        for E020.
+
 
 # 1. NEVER hard-fail the catalog. build_catalog_response() fails closed on any
 #    single bad recipe, so one linter exception would empty the entire model
@@ -617,7 +832,9 @@ rules:
 #    can query them; it must not emit a finding for them.
 # 3. A rule scoped to a build or image must not fire outside that scope. The
 #    VLLM_BASE_DIR case is the cautionary example: a warning that always fires
-#    is a warning nobody reads, and it hides the ones that matter.
+#    is a warning nobody reads, and it hides the ones that matter. E018's
+#    known_intentional list is the same principle applied to a cross-recipe
+#    rule -- an incomplete list makes the rule noise.
 # 4. New rules come from real incidents only, with ONE bounded exception --
 #    the `mechanism_confirmed` tier, see rule 6. Every rule needs an
 #    `evidence` block; a rule nobody can trace back to either a failure or a
@@ -651,3 +868,10 @@ rules:
 #    a rule's scope to "assume it still holds" without re-checking -- see
 #    E014's needs_reverification field for the pattern to follow: leave the
 #    old scope in place, name the gap explicitly, don't guess.
+# 7. A rule with LIVE VIOLATIONS in the catalog is evidence about the
+#    LINTER, not only about the rule. Added 2026-09-09, when a source-read
+#    pass found four recipes violating E003, E004 and E005 -- all three
+#    `enforce: error`, all three written from real incidents, all silently
+#    unenforced because nothing reads this file yet. Record violations in
+#    the rule's evidence block when they are found, so the cost of the
+#    missing linter stays visible rather than being fixed quietly.

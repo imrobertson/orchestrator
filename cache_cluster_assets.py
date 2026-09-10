@@ -2,83 +2,124 @@
 """
 TETREL SECURITY - CLUSTER ASSET PRE-FETCH & CACHE UTILITY (VERBOSE)
 --------------------------------------------------------------------------------
-Pre-pulls all required Docker images and HuggingFace checkpoints down to 
-spark-3 and spark-4 local storage with human-readable file manifests, 
-real-time progress bars, and accurate ETA tracking. Handles token fallbacks safely.
+Pre-pulls every Docker image and HuggingFace checkpoint the live recipe
+catalog references onto each configured host, with human-readable file
+manifests and real-time progress. Handles token fallbacks safely.
+
+Work is SERIAL by design -- one image or repo on one host at a time -- so a
+cold cache takes hours, not minutes. Timeouts are 1800s per image pull and
+3600s per checkpoint.
+
+KNOWN GAP: recipes using `model_path_override` / `extra_mounts` to stage
+weights outside the shared HF cache are not covered here. Stage those by
+hand per the recipe's own instructions. See WORKSTREAMS.md WS-3.
 """
 
-import os
+import json
 import re
+import shlex
 import sys
-from pathlib import Path
-import yaml
 
-from common.config import legacy_hosts_dict
+from common.config import legacy_hosts_dict, load_cluster_config
 from common.recipes import build_catalog_response
-from common.ssh import get_hf_token, resolve_user_identity_key, run_ssh
-
-BASE_DIR = Path(os.getenv("BASE_DIR", Path(__file__).resolve().parent))
-MODELS_YAML_PATH = BASE_DIR / "models.yaml"
+from common.ssh import get_hf_token, run_ssh
 
 HOSTS = legacy_hosts_dict()
 
-def _extract_manifest_legacy() -> tuple[set, dict]:
+DEFAULT_IMAGE_FALLBACK = "nvcr.io/nvidia/vllm:26.07-py3"
+
+
+def _speculative_config_blobs(vllm_args: str) -> list[str]:
     """
-    Original models.yaml-parsing implementation. Kept intact, unmodified,
-    as the USE_LEGACY_CATALOG=1 rollback path -- see extract_manifest()
-    below.
+    Return the raw JSON string(s) passed to --speculative-config.
 
-    Returns (all_images, repo_to_image).
-
-    repo_to_image maps each HF repo to the SPECIFIC model image it should be
-    downloaded through, rather than one globally-guessed "base image" for
-    every repo. This matters because models.yaml already lets individual
-    models override `image:` (e.g. deepseek-v4-flash uses
-    eugr/spark-vllm-b12x, muse-glimmer uses vllm/vllm-openai:muse-glimmer) -
-    a single shared image for every download risks missing huggingface_hub
-    or using a mismatched Python/CUDA env for that repo.
+    shlex.split is what unwraps the single-quoting these blobs always carry
+    (E011 requires vllm_args be a YAML block scalar precisely so the inner
+    double quotes survive). If the args are malformed enough that shlex
+    refuses, the caller falls back to a regex rather than dropping the
+    recipe silently.
     """
-    if not MODELS_YAML_PATH.exists():
-        sys.exit("[-] Error: models.yaml not found.")
+    try:
+        tokens = shlex.split(vllm_args)
+    except ValueError:
+        return []
 
-    with open(MODELS_YAML_PATH, "r") as f:
-        config = yaml.safe_load(f) or {}
+    blobs = []
+    for i, tok in enumerate(tokens):
+        if tok == "--speculative-config" and i + 1 < len(tokens):
+            blobs.append(tokens[i + 1])
+        elif tok.startswith("--speculative-config="):
+            blobs.append(tok.split("=", 1)[1])
+    return blobs
 
-    default_img = config.get("default_image", "nvcr.io/nvidia/vllm:26.07-py3")
-    images = {default_img}
-    repo_to_image = {}
 
-    models = config.get("models", {})
-    for m_name, m_data in models.items():
-        if not isinstance(m_data, dict):
+def _draft_model_repos(vllm_args: str, model_key: str) -> list[str]:
+    """
+    Extract every speculative-decoding draft checkpoint a topology needs.
+
+    TWO forms, and only handling the first is why offline deploys of every
+    working spec-decode recipe used to fail at load:
+
+      1. `--speculative-model <repo>` -- a separate flag. Rejected by the
+         current builds (see errata E023); present only in recipes that
+         cannot launch. Still parsed, because a recipe carrying it is
+         exactly the one someone is about to fix.
+      2. `--speculative-config '{"method": ..., "model": <repo>, ...}'` --
+         the drafter inside the JSON. This is what every working recipe in
+         the catalog uses: DFlash, DSpark and MTP drafters all arrive here.
+
+    Returns [] for recipes with no drafter, which is most of them.
+    """
+    repos = []
+
+    m = re.search(r"--speculative-model\s+(\S+)", vllm_args)
+    if m:
+        repos.append(m.group(1))
+
+    blobs = _speculative_config_blobs(vllm_args)
+
+    if not blobs and "--speculative-config" in vllm_args:
+        # shlex could not tokenize the args. Do not fail closed and do not
+        # fail silently -- scan for the model key directly and say so.
+        print(
+            f"[!] {model_key}: could not tokenize vllm_args to read "
+            f"--speculative-config; falling back to a raw scan for its "
+            f"draft model. Verify the drafter cached before going offline."
+        )
+        for m in re.finditer(r'"model"\s*:\s*"([^"]+)"', vllm_args):
+            repos.append(m.group(1))
+        return repos
+
+    for blob in blobs:
+        try:
+            cfg = json.loads(blob)
+        except (ValueError, TypeError):
+            print(
+                f"[!] {model_key}: --speculative-config is not valid JSON; "
+                f"its draft model will NOT be pre-fetched. Stage it by hand."
+            )
             continue
+        if not isinstance(cfg, dict):
+            continue
+        draft = cfg.get("model")
+        if isinstance(draft, str) and draft:
+            repos.append(draft)
 
-        model_image = m_data.get("image", default_img)
-        images.add(model_image)
+    return repos
 
-        if "hf_path" in m_data:
-            repo_to_image.setdefault(m_data["hf_path"], model_image)
 
-        topologies = m_data.get("topologies", {})
-        for _, topo_data in topologies.items():
-            vllm_args = topo_data.get("vllm_args", "")
-            match = re.search(r'--speculative-model\s+([^\s]+)', vllm_args)
-            if match:
-                # Speculative-decoding draft models ride along with their
-                # parent model's image, since they're loaded by the same process.
-                repo_to_image.setdefault(match.group(1), model_image)
-
-    return images, repo_to_image
-
-def _extract_manifest_from_recipes() -> tuple[set, dict]:
+def extract_manifest() -> tuple[set, dict]:
     """
-    recipes/-backed implementation. Reads the same catalog shape
-    dgx-orchestrator.py's load_model_catalog() has always returned (via
-    build_catalog_response()) instead of parsing models.yaml directly, but
-    preserves _extract_manifest_legacy()'s per-model image-override logic
-    and speculative-decoding draft-model handling exactly -- same field
-    names (hf_path, image, topologies, vllm_args), same traversal, same
-    --speculative-model regex, same repo_to_image.setdefault() semantics.
+    Read the live recipe catalog and return (all_images, repo_to_image).
+
+    repo_to_image maps each HF repo to the SPECIFIC image it should be
+    downloaded through, rather than one globally-guessed base image for
+    every repo. Recipes override `image:` individually, and a shared image
+    risks missing huggingface_hub or using a mismatched Python/CUDA env for
+    that repo.
+
+    Draft checkpoints ride along with their parent model's image, since the
+    same process loads both.
     """
     resp = build_catalog_response()
     if "error" in resp:
@@ -86,7 +127,7 @@ def _extract_manifest_from_recipes() -> tuple[set, dict]:
 
     config = resp["catalog"]
 
-    default_img = config.get("default_image", "nvcr.io/nvidia/vllm:26.07-py3")
+    default_img = config.get("default_image", DEFAULT_IMAGE_FALLBACK)
     images = {default_img}
     repo_to_image = {}
 
@@ -103,54 +144,43 @@ def _extract_manifest_from_recipes() -> tuple[set, dict]:
 
         topologies = m_data.get("topologies", {})
         for _, topo_data in topologies.items():
-            vllm_args = topo_data.get("vllm_args", "")
-            match = re.search(r'--speculative-model\s+([^\s]+)', vllm_args)
-            if match:
-                # Speculative-decoding draft models ride along with their
-                # parent model's image, since they're loaded by the same process.
-                repo_to_image.setdefault(match.group(1), model_image)
+            vllm_args = topo_data.get("vllm_args", "") or ""
+            for draft_repo in _draft_model_repos(vllm_args, m_name):
+                repo_to_image.setdefault(draft_repo, model_image)
 
     return images, repo_to_image
 
-def extract_manifest() -> tuple[set, dict]:
-    """
-    Public entry point. Name and return shape are unchanged -- main()'s
-    call site keeps calling this exact function.
-
-    Defaults to the recipes/ path. Set USE_LEGACY_CATALOG=1 to fall back
-    to _extract_manifest_legacy() (the original models.yaml parsing,
-    preserved above) without any code change or redeploy -- same rollback
-    lever as dgx-orchestrator.py's load_model_catalog().
-    """
-    if os.environ.get("USE_LEGACY_CATALOG") == "1":
-        return _extract_manifest_legacy()
-    return _extract_manifest_from_recipes()
 
 def prefetch_docker_images(images: set):
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("STAGE 1: PRE-PULLING DOCKER CONTAINER IMAGES")
-    print("="*80)
-    
+    print("=" * 80)
+
     for img in sorted(images):
         for host, meta in HOSTS.items():
             print(f"\n[+] Pulling container image '{img}' on {host} ({meta['ip']})...")
-            res = run_ssh(meta["ip"], "tetrel", ["docker", "pull", img], timeout=1800, tty=True, capture=False, connect_timeout=10)
+            # user=None lets common/ssh.py resolve ssh_user from
+            # cluster_config.yaml, matching every run_ssh call site in
+            # dgx-orchestrator.py. Do not hardcode an account here.
+            res = run_ssh(meta["ip"], None, ["docker", "pull", img],
+                          timeout=1800, tty=True, capture=False, connect_timeout=10)
             if res.returncode == 0:
                 print(f"[✓] Successfully pulled '{img}' on {host}")
             else:
                 print(f"[-] Failed to pull '{img}' on {host}")
 
+
 def prefetch_hf_models(repo_to_image: dict):
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("STAGE 2: PRE-FETCHING HUGGINGFACE MODEL CHECKPOINTS & TOKENIZERS")
-    print("="*80)
-    
+    print("=" * 80)
+
     hf_token = get_hf_token()
-    vol_mount = "/home/tetrel/.cache/huggingface:/root/.cache/huggingface"
+    cluster = load_cluster_config()
 
     # Repo id comes in via REPO_ID env var rather than being interpolated
     # directly into the embedded Python source. hf_path values are
-    # admin-controlled (they come from models.yaml, not end-user input), but
+    # admin-controlled (they come from recipes, not end-user input), but
     # this avoids relying on that being true forever and sidesteps having to
     # think about escaping quotes/backslashes in repo names.
     py_download_script = """
@@ -190,13 +220,22 @@ except Exception as e:
         image_for_repo = repo_to_image[repo]
 
         for host, meta in HOSTS.items():
+            # Per-host mount from cluster_config.yaml, same source
+            # _execute_deployment_impl() uses. Hosts are not required to
+            # share a home directory.
+            try:
+                vol_mount = cluster.hosts[host].volume_mount
+            except (KeyError, AttributeError):
+                print(f"[-] No volume_mount configured for {host}; skipping {repo} there.")
+                continue
+
             print(f"\n[+] Processing Checkpoint: {repo} on {host} ({meta['ip']}) via image '{image_for_repo}'")
-            
+
             env_flags = ["-e", "PYTHONUNBUFFERED=1", "-e", f"REPO_ID={repo}"]
             if hf_token:
                 env_flags.extend(["-e", f"HF_TOKEN={hf_token}"])
 
-            # Added -t flag to docker run for interactive TTY progress rendering
+            # -t gives the download an interactive TTY for progress rendering
             docker_cmd = [
                 "docker", "run", "--rm", "-t",
                 "-v", vol_mount
@@ -205,15 +244,17 @@ except Exception as e:
                 "python3", "-c", py_download_script
             ]
 
-            res = run_ssh(meta["ip"], "tetrel", docker_cmd, timeout=3600, tty=True, capture=False, connect_timeout=10)
+            res = run_ssh(meta["ip"], None, docker_cmd,
+                          timeout=3600, tty=True, capture=False, connect_timeout=10)
             if res.returncode == 0:
                 print(f"[✓] Checkpoint {repo} fully cached on {host}")
             else:
                 print(f"[-] Failed to cache {repo} on {host} (image: {image_for_repo})")
 
+
 def main():
     images, repo_to_image = extract_manifest()
-    
+
     print("=== TETREL SECURITY - CLUSTER CACHE PRE-FETCHER ===")
     print(f"Target Nodes: {', '.join(HOSTS.keys())}")
     print(f"Discovered Docker Images ({len(images)}): {', '.join(sorted(images))}")
@@ -226,9 +267,10 @@ def main():
     # image (see extract_manifest / prefetch_hf_models), not a single guess.
     prefetch_hf_models(repo_to_image)
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("[✓] ALL CLUSTER ASSETS CACHED LOCALLY!")
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
+
 
 if __name__ == "__main__":
     main()
