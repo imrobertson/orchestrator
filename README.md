@@ -438,6 +438,13 @@ against a live cluster.
 | [`docs/SMOKE-TEST-PLAYBOOK.md`](docs/SMOKE-TEST-PLAYBOOK.md) | Post-change verification procedure |
 | [`docs/AB_TEST_USAGE.md`](docs/AB_TEST_USAGE.md) | A/B benchmark harness usage |
 | [`docs/reference/`](docs/reference/) | Durable notes on third-party dependencies: `community-sources.md` (where every image, checkpoint and fix came from, with URLs) and `flashinfer-autotune-internals.md` |
+| [`tools/smoke_test.py`](tools/smoke_test.py) | Control-plane go/no-go gate: every host reachable, catalog non-empty. Exit 0/1. Run it after any change before trusting a deploy — an empty catalog surfaces here in a second rather than as a confusing failure downstream |
+| [`tools/doc_health.py`](tools/doc_health.py) | One command for the state of the documentation set. Tolerant of work done by hand; exit 0 healthy, 1 incomplete, 2 something lost |
+| [`tools/file_inventory.py`](tools/file_inventory.py) | Every tracked file must have a documented purpose. This enforces it |
+| [`tools/check_doc_references.py`](tools/check_doc_references.py) | Broken-link and phantom-file checker. Advisory; `--strict` to fail |
+| [`tools/finalize_docs.py`](tools/finalize_docs.py) | Manifest-driven archive mover; refuses to retire anything whose content has not landed elsewhere |
+| [`tools/run_verification.py`](tools/run_verification.py) | Read-only verification sweep against a live cluster. Writes one pasteable report |
+| [`tools/real_dry_run_capture.py`](tools/real_dry_run_capture.py) | Dumps every model × topology's dry-run argv to JSON for byte-diffing before and after a refactor — the #90 verification pattern, automated. Note a 2-node capture holds only the Ray bootstrap |
 | [`tools/verify/`](tools/verify/) | The verification harnesses behind individual tombstone entries. Not a test suite — see its `purpose.md` |
 
 `UsageShortcut.md` is folded into `USERMANUAL.md`, `REFERENCE-decode-speeds.md`

@@ -1,9 +1,21 @@
 # Smoke-test playbook
 
+**Three different things are called "smoke test" here. This document is the
+third one.**
+
+| | |
+|---|---|
+| `tools/smoke_test.py` | The control-plane go/no-go gate. Every host reachable, catalog non-empty, exit 0/1. **Run this after any change, before trusting a deploy** — an empty catalog surfaces here in a second rather than as a confusing failure downstream. It caught nothing on 2026-09-10 because nobody thought to run it; the catalog had been emptied by stray macOS sidecar files and was diagnosed the long way instead. |
+| `tests/smoke_test_mc.py`, `tests/smoke_test_mods.py` | Phase functional tests. They import `dgx-orchestrator.py` and exercise real code paths against fixtures. |
+| **this file** | How the phase tests were built and what it cost, so the next one starts here instead of re-deriving it. |
+
 How we built `smoke_test_mc.py` and what it cost to get there, so the next
-phase's smoke test (MD, ME, ...) starts from this instead of re-deriving it
-turn by turn. This is a process document, not a code module — nothing here
-is imported by anything.
+phase's smoke test starts from this instead of re-deriving it turn by turn.
+This is a process document, not a code module — nothing here is imported by
+anything. The mods phase (MA–ME) is complete and Phase 3 is hardware-gated,
+so "the next phase" is not imminent — but the dependency closure below is
+what any future standalone import of `dgx-orchestrator.py` needs, and that
+has not changed.
 
 ## The dependency closure, once and for all
 
@@ -34,7 +46,9 @@ order:**
 3. `common/recipes.py` — real (needs `pydantic`, `pydantic_core`,
    `typing_extensions`, `typing_inspection`, `annotated_types`, `pyyaml`
    installed; see wheel gotcha below). Reads `RECIPES_DIR = BASE_DIR /
-   "recipes"` (subdirs `local/`, `eugr/`) and defines `MODS_DIR = BASE_DIR
+   "recipes"` (subdir `local/` only — `eugr/` was retired 2026-09-09;
+   `RECIPE_SUBDIRS` is the list, and both consumers skip a missing
+   directory) and defines `MODS_DIR = BASE_DIR
    / "mods"`. **Does not surface `mods:` in `build_catalog_response()`'s
    output** — if a smoke test needs a model's mod list, read it via
    `load_recipes()`, not the catalog dict.
@@ -71,6 +85,17 @@ and `"100.64.0.3"`/`"100.64.0.4"` (a fake fixture's host IPs) directly into
 assertions. The moment a real `cluster_config.yaml` was swapped in — with
 a different real image and real IPs — those assertions failed even though
 the code under test was correct.
+
+**This rule generalizes well past smoke tests, and was under-applied.**
+A 2026-09-10 audit found the same shape in five more places, all written
+after this was recorded: `sweep.py`/`sweep2.py` hardcoded a repo path that
+had moved, `benchmark.py` defaults `--host` to a literal IP rather than the
+serving host, `cache_cluster_assets.py` hardcoded the SSH user and cache
+mount instead of reading `ssh_user`/`volume_mount`, and two verification
+harnesses resolved the repo root from their own location and so could not
+run once they were moved. Same root cause, same fix: **derive it from the
+config or the loaded module; never restate it.** If a literal you are about
+to type also appears in a config file, that is the signal.
 
 **The fix, generalized:** after importing the module under test, read
 every config-derived expected value back out of the *loaded* module
@@ -148,4 +173,13 @@ file-by-file, when a load-bearing dependency is missing.
 6. If a check ever needs to be trusted, sabotage-test it once: revert the
    line it's supposed to catch and confirm the check actually fails. This
    session did this for MC's tag-substitution line; worth doing again for
-   whatever MD's/ME's most load-bearing new check turns out to be.
+   whatever the next phase's most load-bearing new check turns out to be.
+
+   **`tools/verify/purpose.md` states the same rule independently**, arrived
+   at a week later from the other direction (#83: two broken checks agreeing
+   to produce a PASS; #94: a marker-presence assertion passing on output that
+   still contained the live credential). `verify_entrypoint_schema.py` [7]
+   and `verify_secret_masking.py` [6] are the worked examples. Two documents
+   reaching the same rule from different incidents is the strongest argument
+   available that it is the right rule — keep them cross-referenced rather
+   than letting one drift.
