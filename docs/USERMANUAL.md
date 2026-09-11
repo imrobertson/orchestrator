@@ -355,6 +355,19 @@ SSH connection or touching either host**. The fastest way to confirm a recipe
 does what you expect, or to compare two recipes' generated commands side by side,
 with zero risk to a running cluster.
 
+> **A 2-node dry run shows only the Ray bootstrap, not the engine.**
+> Confirmed on hardware 2026-09-10. `docker_run_commands` for a 2-node
+> deploy contains two containers running `ray start --head` and
+> `ray start --address=…` and nothing else — the engine is `docker exec`'d
+> in after the Ray cluster forms. So `--model`, `tp_size`/`pp_size` and
+> **every `vllm_args` flag are absent from the preview**, and no
+> `errata.yaml` rule about `vllm_args` is checkable this way. For a 2-node
+> recipe, `--dry-run` verifies the image, the mounts and the environment —
+> not the engine invocation. Read the recipe for that. WORKSTREAMS WS-12.
+
+The claim above that it prints "every flag" therefore holds for 1-node and
+not for 2-node.
+
 **Dry-run output is safe to paste.** Credential values are masked before they
 reach the response (`HF_TOKEN=***MASKED***`), so you don't have to trim it by
 hand. The variable *name* is kept so you can see which credentials a deploy

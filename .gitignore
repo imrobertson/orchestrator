@@ -68,3 +68,8 @@ benchmark_results.txt
 run_logs/
 verification-report.txt
 out
+
+# Patch/backup artifacts (added 2026-09-10)
+*.orig
+*.rej
+*.bak-*

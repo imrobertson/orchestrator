@@ -226,7 +226,7 @@ operator needs.
 | `REFERENCE-control-surfaces.md` | **Keep until the interface spike lands, then delete.** It says so itself, and is deliberately absent from the doc map above so it can be removed without leaving a dangling reference. |
 | `PHASE-2-PROMPTS.md` | **Archive.** Phase 2 complete. |
 | `PHASE-MODS-PROMPTS.md` | **Append MA/MB/MC results, then archive.** Records only M0's today, so it reads as though the sequence stalled at the gate. |
-| `MA/MB/MC/MD/ME-REVIEW.md`, `tests/TESTING-MB.md`, `tests/TESTING-MC.md` | **Archive.** ~185 KB of per-task review. Confirm first that nothing durable is only there — `TOMBSTONES.md` #85 cites `M{X}-REVIEW.md`'s "Contradictions" section directly, and `MD-REVIEW.md`'s contradictions section is `errata.yaml` material. |
+| `MA/MB/MC/MD/ME-REVIEW.md`, `TESTING-MB.md`, `TESTING-MC.md` | **Archived 2026-09-10.** ~185 KB of per-task review. The #85 citation was checked before the move: it cites `M{X}-REVIEW.md`'s Contradictions item 5 as "for the full reasoning" behind a decision the entry states completely on its own, so it is supporting detail and it is preserved in the archive. Nothing cites the two TESTING files at all. `MD-REVIEW.md`'s contradictions section remains `errata.yaml` material. |
 | `REFERENCE-dspark-shared-expert-fix.md` | **Does not exist.** Cited by `BACKLOG-dspark-sm120-image.md` as "saved as" and by `TROUBLESHOOTING.md`, but absent from `docs/` and the repo root. Either re-save it from tonyd2wild's repo or delete both citations. The conclusion it supports — the shared-expert bug does not apply to our image — survives in WS-9 and `reference/community-sources.md`. |
 
 **Archive by moving to `docs/archive/`, not by leaving files in place.** A

@@ -34,6 +34,13 @@ item in `WORKSTREAMS.md`.
 **Speed** is recorded as a range where more than one run exists, per the
 two-runs-minimum rule. A blank means unmeasured, not slow.
 
+**A 2-node row cannot be checked with `--dry-run`.** That preview shows
+only the Ray bootstrap containers; the engine is `docker exec`'d in
+afterwards, so no `vllm_args` flag appears in it (confirmed 2026-09-10,
+WORKSTREAMS WS-12). For a 2-node recipe the only verification is a real
+deploy — which is why the untested 2-node rows below stay blank rather than
+being marked plausible.
+
 ---
 
 ## Single-node (`1_node`)

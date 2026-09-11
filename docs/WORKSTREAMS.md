@@ -875,7 +875,7 @@ Tracing the specific trigger stopped at a JIT-compiled CUDA extension
 boundary (`get_cutlass_fused_moe_module()` → `build_and_load()`); the
 mechanism above is confirmed as real and possible, not confirmed as what
 actually happened here. **Full call-chain map, triage checklist, and a
-confirmed/ruled-out/open table: `REFERENCE-flashinfer-autotune-internals.md`**
+confirmed/ruled-out/open table: `docs/reference/flashinfer-autotune-internals.md`**
 — read that first if this recurs, before re-deriving any of this from grep.
 
 **What this means for `llama-4-fp8-tp` specifically:** the real cause of
@@ -2558,3 +2558,23 @@ problem, not a series of bugs.
 produces, for the first time, a complete picture of every identity the
 system has ever minted and which of them agree. That artifact is a far
 better input to a refactor decision than any amount of further reading.
+
+
+---
+
+# 6. Repository hygiene — found 2026-09-10 in a full tree walk
+
+None of these is urgent. All are the kind of thing that is invisible until
+someone diffs `git ls-files` against the filesystem, which is worth doing
+about once a quarter.
+
+| Item | Status | Notes |
+|---|---|---|
+| Four sweep artifacts are tracked at the repo root AND under `tests/data/` | **OPEN, trivial** | `sweep_results.tsv`, `sweep2_results.tsv`, `sweep_transcript.log`, `sweep2_transcript.log` sit at the root; `tests/data/` holds its own copies of the two `.tsv` files. Diff them, keep the `tests/data/` copies, delete the root ones. Two files claiming to be the same results is #57's shape applied to data. |
+| `tests/logs/run-20260903-154922.log` is tracked | **OPEN, trivial** | `.gitignore` has `*.log`, but ignore rules do not untrack a file that was added before them. `git rm --cached` it. |
+| `tools/convert_models_yaml.py` is dead code | **OPEN** | A one-shot converter from `models.yaml`, which #112 deleted. It cannot run — its input does not exist. Same class as `verify_recipe_equivalence.py`: archive it with a banner, or delete it. It is currently the largest single source of `models.yaml` hits in the K10 verification grep, which makes that grep harder to read than it should be. |
+| ~650 KB of vendored third-party source sits at the repo root | **OPEN, worth a decision** | `autotuner.py` (128 KB), `flashinfer_fused_moe_core.py` (306 KB), `flashinfer_fused_moe_runners.py` (213 KB), `autotuner_init.py`. These are reference copies pulled during the FlashInfer investigation (#116–#126), and `docs/reference/flashinfer-autotune-internals.md` is the distillation of them. They are not part of the orchestrator and they are the first thing a new reader sees in the root listing. Move to `docs/reference/vendored/` or delete — but **check first** whether `autotuner_init.py` is the re-export shim the deploy path imports, since `SESSION-HANDOFF-2026-09-06` §2 lists it as "checked and confirmed needing no change", which implies it is live. |
+| `correct.py` at the repo root vs `correct_ledger.py` in TOMBSTONES | **OPEN, trivial** | The tombstone names a file that does not exist under that name. Either rename the file to match the citation, or leave it and know the citation is loose. `clean_ledger.py` is correctly named. |
+| `K12_dflash2_prompt.md` is committed at the repo root | **OPEN, trivial** | Every other kickoff prompt lives in this file's §3. A root-level `.md` outside the doc map is how the last drift started. Move it into §3 or into `docs/`. |
+| `tests/smoke_test_mc.py` T9 exercises a removed feature | **OPEN** | It writes a `models.yaml` into a temp dir and sets `USE_LEGACY_CATALOG=1` to test the legacy fallback, which #112 removed and the 2026-09-09 pass removed from `cache_cluster_assets.py` too. Either it passes (asserting nothing) or it has been red and unnoticed. Same class as `verify_recipe_equivalence.py`, and it should get the same treatment: delete the case, or banner it as obsolete. |
+| `docs/AB_TEST_USAGE.md` names an archived document twice | **OPEN, trivial** | It cites `docs/BACKLOG-session-tracker-multi-model.md`, now in `docs/archive/`. If those are "go read this" pointers they are defects; if they are mentions they are fine. `tools/check_doc_references.py` reports them as INFO because they are code spans, not links — read the two sentences and decide. |

@@ -41,8 +41,8 @@ All eight were re-run from this directory against the current tree.
 | `verify_loaded_model_parse.py` | #140, #141 | **PASSES** |
 | `verify_secret_masking.py` | #86, #94, #138 | **PASSES** |
 | `verify_pending_launch.py` | #127–#131, reserved-host guard, 423 mapping | **PASSES** (was unrunnable in `tools/`; repathed) |
-| `verify_gemma4_recipe.py` | #133, the AEON DFlash recipe | Not re-run — needs `recipes/local/gemma4-26b-a4b-aeon-dflash.yaml` present |
-| `verify_glm_recipe.py` | #133, E019, E020 | Not re-run — see the caveat below |
+| `verify_gemma4_recipe.py` | #133, the AEON DFlash recipe | **PASSES** — re-run 2026-09-10; reproduces the validated AEON argv flag for flag |
+| `verify_glm_recipe.py` | #133, E019, E020 | **PASSES, AND THAT IS THE PROBLEM** — see below |
 | `verify_recipe_equivalence.py` | Phase 2 Task 2C migration | **OBSOLETE — do not revive.** See its banner |
 
 ### What had to be repaired
@@ -91,9 +91,13 @@ if a future migration needs this proof.
 
 ## The caveat on `verify_glm_recipe.py`
 
+**CONFIRMED 2026-09-10, not suspected.** `glm-5_3-flash-nvfp4-mtp.yaml`
+line 203 sets `launch_argv_prefix: ["vllm", "serve", "{model}"]`. This
+harness exits 0. **A green run from it currently means nothing.**
+
 Its filename reference is updated (`_glm-5.3-flash-nvfp4-tp2` →
-`glm-5_3-flash-nvfp4-mtp`), but **its argv reconstruction may now be wrong
-in a way that matters.** It hardcodes
+`glm-5_3-flash-nvfp4-mtp`), but **its argv reconstruction is wrong in a way
+that matters.** It hardcodes
 
     python3 -m vllm.entrypoints.openai.api_server --model <path>
 
