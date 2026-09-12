@@ -84,7 +84,14 @@ Read the `AGGREGATE ACROSS N REPEATS` block for that.
 
 ## `test_config.py`, `test_recipes.py`, `test_ssh.py`
 
-Unit tests for the matching `common/` module. `pytest tests/`.
+Plain-assert tests for the matching `common/` module. Run them directly,
+one at a time; pytest is not provisioned by this repository:
+
+```bash
+python3 tests/test_config.py
+python3 tests/test_recipes.py
+python3 tests/test_ssh.py
+```
 
 ## `smoke_test_mc.py`, `smoke_test_mods.py`
 
