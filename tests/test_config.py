@@ -23,8 +23,18 @@ def test_load_cluster_config_default():
 def test_legacy_hosts_dict_shape():
     result = legacy_hosts_dict()
     expected = {
-        "spark-4": {"ip": "10.0.14.43", "alias": "spark-9dbe", "role": "head"},
-        "spark-3": {"ip": "10.0.14.41", "alias": "spark-6e63", "role": "worker"},
+        "spark-3": {
+            "ip": "10.0.14.41",
+            "alias": "spark-6e63",
+            "role": "head",
+            "reserved": True,
+        },
+        "spark-4": {
+            "ip": "10.0.14.43",
+            "alias": "spark-9dbe",
+            "role": "worker",
+            "reserved": False,
+        },
     }
     assert result == expected, f"legacy_hosts_dict() mismatch: {result}"
     print("PASS: legacy_hosts_dict() matches expected legacy shape")
@@ -84,7 +94,12 @@ network:
         legacy = legacy_hosts_dict(temp_path)
         assert "spark-3" not in legacy, "inactive host should be excluded from legacy_hosts_dict()"
         assert legacy == {
-            "spark-4": {"ip": "10.0.14.43", "alias": "spark-9dbe", "role": "head"}
+            "spark-4": {
+                "ip": "10.0.14.43",
+                "alias": "spark-9dbe",
+                "role": "head",
+                "reserved": False,
+            }
         }, f"legacy_hosts_dict() mismatch: {legacy}"
         print("PASS: inactive host excluded from legacy_hosts_dict()")
     finally:
