@@ -4491,6 +4491,29 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
             "head": head,
             "docker_run_commands": docker_run_commands,
         }
+        # The engine argv, for the 2-node case where docker_run_commands
+        # holds only `ray start`. Added 2026-09-10.
+        #
+        # Without this a 2-node dry run previews the bootstrap and nothing
+        # else: no --model, no tp/pp, no vllm_args -- so no errata rule
+        # about vllm_args is checkable at the cheapest possible moment, and
+        # any harness wanting the engine argv has to RECONSTRUCT it, which
+        # is precisely how verify_glm_recipe.py drifted into asserting a
+        # shape we no longer emit.
+        #
+        # `vllm_head_args` is already populated for the head host whether or
+        # not this is a dry run; only the `docker exec` that consumes it is
+        # gated on `not dry_run`. So this reports what WOULD be exec'd, from
+        # the same variable the real deploy uses -- not a second derivation
+        # that can disagree with the first.
+        #
+        # Absent for 1-node, where the engine argv is already the container
+        # CMD inside docker_run_commands and repeating it would invite the
+        # reader to diff two copies of the same thing.
+        if use_ray and vllm_head_args:
+            dry_run_result["engine_exec_argv"] = {
+                head: _mask_secret_argv(vllm_head_args)
+            }
         # Only added when at least one host actually has mods to report --
         # every existing recipe (mods: [] everywhere) leaves mods_report
         # empty, so this key is simply absent for them, keeping --dry-run
