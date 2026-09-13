@@ -93,6 +93,27 @@ python3 tests/test_recipes.py
 python3 tests/test_ssh.py
 ```
 
+GitHub Actions runs those three scripts on Python 3.12 for every pull request
+and every push to `main`. It also compiles all Python sources and runs the
+documentation-reference, documentation-health, and tracked-file inventory
+checks. The workflow is intentionally made from the repository's existing
+commands rather than introducing pytest as a second test runner.
+
+`test_recipes.py` compares the live recipe names and topology keys against
+`data/recipe_catalog_snapshot.json`. This catches additions, removals, renames,
+and topology changes without embedding counts throughout the assertions. It
+also enforces an independent minimum of 30 recipes, so accidentally regenerating
+the snapshot from a badly truncated catalog still fails. After reviewing an
+intentional catalog change, update the snapshot with:
+
+```bash
+python3 tests/test_recipes.py --update-catalog-snapshot
+python3 tests/test_recipes.py
+```
+
+Commit the recipe and snapshot together. Do not regenerate the snapshot merely
+to make an unexplained CI failure green.
+
 ## `smoke_test_mc.py`, `smoke_test_mods.py`
 
 Post-change smoke tests from the mods phase. Procedure:
