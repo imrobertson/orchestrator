@@ -283,9 +283,11 @@ suffix silently `+unknown` twice), #82 (silent HF token failure, twice, via
 two different paths), #83 (two broken checks agreeing produced a PASS), #93
 (a failed `docker logs` archived as though it were the log), #97 (substring
 match), #100 (partial marker mismatch reported 100% of runtime as one
-phase). The repo has already derived the right rule from these — assert what
-a failure path *returned*, not that it survived — but it is a convention, not
-a structure.
+phase). The repo derived the right rule from these — assert what a failure path
+*returned*, not that it survived. The deploy path now enforces that rule with
+the typed deployment-stage result contract in `common/deployment.py`: required
+stage failures must be consumed and a failed deployment cannot be represented
+as success. Other maintenance paths have not yet adopted that structure.
 
 **3. The control plane reasons about processes it cannot see.**
 #50, #55, #63, #64, #69, #70, #80, #81. Container PID namespaces,
@@ -309,10 +311,11 @@ diff it byte-for-byte) exists and works — #90 caught a real regression
 before it reached hardware — but is applied by hand, per task.
 
 **A refactor is worth considering if and only if it collapses class 1 and
-class 3.** Classes 2, 4, and 5 are being managed adequately by convention
-and targeted fixes; classes 1 and 3 keep producing new instances despite
-having been "fixed" several times each, which is the signature of a
-structural problem rather than a series of bugs.
+class 3.** Class 2 now has a structural contract in the deploy path, while
+classes 4 and 5 remain managed by convention and targeted fixes. Classes 1
+and 3 keep producing new instances despite having been "fixed" several times
+each, which is the signature of a structural problem rather than a series of
+bugs.
 
 **A sixth pattern, not yet a class, worth watching.** Rules written from real
 incidents are being violated by recipes that nobody checks, because nothing
