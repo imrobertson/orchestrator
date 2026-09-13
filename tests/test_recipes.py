@@ -3,12 +3,12 @@
 Plain-assert tests for common/recipes.py. Run with:
     python3 tests/test_recipes.py
 
-Assumes tools/convert_models_yaml.py has already been run so
-recipes/local/*.yaml exists (the Phase 2A verification steps run the
-conversion first -- see docs/PHASE-2-PROMPTS.md).
+The checked-in catalog snapshot makes recipe additions, removals, renames,
+and topology changes explicit review events. Update it deliberately with:
+    python3 tests/test_recipes.py --update-catalog-snapshot
 """
 
-import shutil
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -19,6 +19,27 @@ sys.path.insert(0, str(REPO_ROOT))
 import common.recipes as recipes_mod
 from common.recipes import build_catalog_response, load_recipes
 import common.config as config_mod
+
+CATALOG_SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "recipe_catalog_snapshot.json"
+# Independent last-resort guard: even if somebody accidentally regenerates
+# the snapshot from a badly truncated catalog, that shrinkage still fails.
+MIN_EXPECTED_RECIPES = 30
+
+
+def _catalog_shape() -> dict[str, list[str]]:
+    recipes = load_recipes(bypass_cache=True)
+    return {
+        name: sorted(recipe.topologies)
+        for name, recipe in sorted(recipes.items())
+    }
+
+
+def _write_catalog_snapshot() -> None:
+    CATALOG_SNAPSHOT_PATH.write_text(
+        json.dumps(_catalog_shape(), indent=2, sort_keys=True) + "\n"
+    )
+    print(f"Updated {CATALOG_SNAPSHOT_PATH}")
+
 
 
 def _fresh_cluster_config():
@@ -31,76 +52,37 @@ def _fresh_cluster_config():
     return config_mod.load_cluster_config()
 
 
-def test_load_recipes_count():
-    recipes = load_recipes(bypass_cache=True)
-    # NOTE: this count reflects whatever's currently in recipes/local +
-    # recipes/eugr and needs updating whenever a recipe is added/removed --
-    # it's a tripwire against silent catalog shrinkage, not a fixed target.
-    assert len(recipes) == 16, f"expected 16 models, got {len(recipes)}"
-    print(f"PASS: load_recipes() returns {len(recipes)} models")
+def test_recipe_catalog_matches_snapshot():
+    actual = _catalog_shape()
+    expected = json.loads(CATALOG_SNAPSHOT_PATH.read_text())
 
+    assert len(actual) >= MIN_EXPECTED_RECIPES, (
+        f"catalog shrank below the independent safety floor: "
+        f"{len(actual)} < {MIN_EXPECTED_RECIPES}"
+    )
 
-def test_topology_count():
-    recipes = load_recipes(bypass_cache=True)
-    n1 = sum(1 for r in recipes.values() if "1_node" in r.topologies)
-    n2 = sum(1 for r in recipes.values() if "2_node" in r.topologies)
-    total = sum(len(r.topologies) for r in recipes.values())
-    assert n1 == 12, f"expected 12 models with 1_node, got {n1}"
-    assert n2 == 11, f"expected 11 models with 2_node, got {n2}"
-    assert total == 23, f"expected 23 total topology combinations, got {total}"
-    print(f"PASS: topology counts are 1_node={n1}, 2_node={n2}, total={total}")
+    if actual != expected:
+        actual_names = set(actual)
+        expected_names = set(expected)
+        missing = sorted(expected_names - actual_names)
+        added = sorted(actual_names - expected_names)
+        changed = {
+            name: {"expected": expected[name], "actual": actual[name]}
+            for name in sorted(actual_names & expected_names)
+            if actual[name] != expected[name]
+        }
+        raise AssertionError(
+            "recipe catalog differs from the reviewed snapshot; "
+            f"missing={missing}, added={added}, topology_changes={changed}. "
+            "If intentional, review the recipe change and run "
+            "python3 tests/test_recipes.py --update-catalog-snapshot."
+        )
 
-
-def test_local_eugr_collision_raises():
-    """
-    Two recipe files with the SAME FILENAME STEM in local/ and eugr/ must
-    still raise -- this is the one real collision case now that there's no
-    separate `name:` field to also collide on. Previously this test used
-    matching `name:` values inside two differently-purposed fixtures; now
-    the filename stem alone is what collides, so both fixtures just need
-    the same filename.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        local_dir = tmp_path / "local"
-        eugr_dir = tmp_path / "eugr"
-        local_dir.mkdir()
-        eugr_dir.mkdir()
-
-        recipe_yaml = """
-recipe_version: "1"
-hf_path: someorg/dupe-model
-gpu_util: 0.7
-topologies:
-  1_node:
-    max_model_len: 4096
-    tp_size: 1
-    pp_size: 1
-    env_vars: []
-    vllm_args: "--trust-remote-code"
-"""
-        local_path = local_dir / "dupe-model.yaml"
-        eugr_path = eugr_dir / "dupe-model.yaml"
-        local_path.write_text(recipe_yaml)
-        eugr_path.write_text(recipe_yaml)
-
-        original_dir = recipes_mod.RECIPES_DIR
-        recipes_mod.RECIPES_DIR = tmp_path
-        try:
-            error_raised = False
-            error_message = ""
-            try:
-                load_recipes(bypass_cache=True)
-            except ValueError as exc:
-                error_raised = True
-                error_message = str(exc)
-            assert error_raised, "duplicate filename stem across local/ and eugr/ should raise"
-            assert str(local_path) in error_message, f"error should name {local_path}: {error_message}"
-            assert str(eugr_path) in error_message, f"error should name {eugr_path}: {error_message}"
-            print("PASS: local/eugr filename collision raises, naming both paths")
-        finally:
-            recipes_mod.RECIPES_DIR = original_dir
-            load_recipes(bypass_cache=True)
+    topology_count = sum(len(topologies) for topologies in actual.values())
+    print(
+        f"PASS: catalog matches reviewed snapshot "
+        f"({len(actual)} recipes, {topology_count} topologies)"
+    )
 
 
 def test_unknown_recipe_version_warns_but_loads():
@@ -108,8 +90,6 @@ def test_unknown_recipe_version_warns_but_loads():
         tmp_path = Path(tmp)
         local_dir = tmp_path / "local"
         local_dir.mkdir()
-        (tmp_path / "eugr").mkdir()
-
         recipe_yaml = """
 recipe_version: "99"
 hf_path: someorg/future-model
@@ -184,7 +164,7 @@ def test_offline_flags_both_one_inject_exactly_once():
                 f"{name}.{topo_name}: expected exactly one TRANSFORMERS_OFFLINE=1, got {tf_matches}"
             )
             checked += 1
-    assert checked == 23, f"expected to check 23 topology combinations, checked {checked}"
+    assert checked > 0, "expected at least one topology to exercise"
     print(f"PASS: both offline flags 1 -> exactly one injected entry each, across {checked} topologies")
     config_mod.load_cluster_config.cache_clear()
 
@@ -199,8 +179,6 @@ def test_offline_flag_filters_existing_entry_not_duplicates():
         tmp_path = Path(tmp)
         local_dir = tmp_path / "local"
         local_dir.mkdir()
-        (tmp_path / "eugr").mkdir()
-
         recipe_yaml = """
 recipe_version: "1"
 hf_path: someorg/offline-flag-model
@@ -253,8 +231,6 @@ def test_cluster_only_is_parsed_but_not_exposed_in_catalog():
         tmp_path = Path(tmp)
         local_dir = tmp_path / "local"
         local_dir.mkdir()
-        (tmp_path / "eugr").mkdir()
-
         recipe_yaml = """
 recipe_version: "1"
 hf_path: someorg/cluster-only-model
@@ -293,9 +269,15 @@ topologies:
 
 
 if __name__ == "__main__":
-    test_load_recipes_count()
-    test_topology_count()
-    test_local_eugr_collision_raises()
+    if sys.argv[1:] == ["--update-catalog-snapshot"]:
+        _write_catalog_snapshot()
+        raise SystemExit(0)
+    if sys.argv[1:]:
+        raise SystemExit(
+            "usage: python3 tests/test_recipes.py [--update-catalog-snapshot]"
+        )
+
+    test_recipe_catalog_matches_snapshot()
     test_unknown_recipe_version_warns_but_loads()
     test_offline_flags_both_zero_no_injection()
     test_offline_flags_both_one_inject_exactly_once()
