@@ -50,6 +50,7 @@ from common.config import (
     reserved_hosts,
 )
 from common.constants import ContainerRole
+from common.deployment import DeploymentProgress, DeploymentStage
 from common.mods import ModBakeError, ModResolutionError, ensure_mods_baked, resolve_mod_tag
 from common.runlog import archive_run_log
 from common.recipes import (
@@ -3746,26 +3747,43 @@ def execute_teardown(target_hosts: list = None, force: bool = False) -> dict:
 
 def execute_deployment(model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False, force: bool = False) -> dict:
     """Thread-safe public wrapper for cluster model deployments."""
+    progress = DeploymentProgress()
+    target_hosts = deployment_target_hosts(nodes, head)
+
     # Checked before the lock and before any SSH: a refusal should be
-    # instant and should not make a queued caller wait on it. A deploy
-    # tears its target hosts down first, so deploying onto a reserved host
-    # destroys the thing it was reserved for -- the same protection
-    # teardown gets, applied at the other door into the same outcome.
-    #
-    # dry_run is deliberately NOT exempt. It reports what a real deploy
-    # would do, so it should report the refusal a real deploy would hit
-    # rather than printing a docker command that would in fact be blocked.
+    # instant and should not make a queued caller wait on it.
     blocked = check_reserved_hosts(
-        deployment_target_hosts(nodes, head), force,
-        f"deploy {model!r} ({nodes}-node)"
+        target_hosts, force, f"deploy {model!r} ({nodes}-node)"
     )
     if blocked:
-        return {"status": "error", **blocked}
+        message = blocked.get("message", "Deployment refused by reserved-host policy.")
+        extra = {key: value for key, value in blocked.items() if key != "message"}
+        return progress.failure_response(
+            DeploymentStage.VALIDATION,
+            message,
+            targets=target_hosts,
+            head=head,
+            **extra,
+        )
 
     acquired = CLUSTER_OP_LOCK.acquire(timeout=CLUSTER_OP_LOCK_TIMEOUT)
-    if not acquired: return {"status": "error", "message": "Cluster is busy with another deploy/teardown operation. Try again shortly."}
+    if not acquired:
+        return progress.failure_response(
+            DeploymentStage.OPERATION_LOCK,
+            "Cluster is busy with another deploy/teardown operation. Try again shortly.",
+            targets=target_hosts,
+            head=head,
+        )
     try:
-        return _execute_deployment_impl(model, nodes, head, user_id, wait=wait, run_benchmark=run_benchmark, dry_run=dry_run)
+        return _execute_deployment_impl(
+            model,
+            nodes,
+            head,
+            user_id,
+            wait=wait,
+            run_benchmark=run_benchmark,
+            dry_run=dry_run,
+        )
     finally:
         CLUSTER_OP_LOCK.release()
 
@@ -4018,6 +4036,7 @@ def _resolve_launch_argv(model_config: dict, model_effective: str) -> tuple:
 def _execute_deployment_impl(
 model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchmark: bool = False, dry_run: bool = False) -> dict:
     deploy_start_time = time.time()
+    progress = DeploymentProgress()
     docker_run_commands: dict = {}
     env_collisions: dict = {}
     # Populated only for hosts whose mod set is non-empty (see
@@ -4028,20 +4047,46 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
     # catalog.
     mods_report: dict = {}
 
-    if nodes not in (1, 2): return {"status": "error", "message": f"Invalid 'nodes' value {nodes!r}: must be 1 or 2."}
-    if head not in HOSTS: return {"status": "error", "message": f"Invalid 'head' value {head!r}: must be one of {list(HOSTS.keys())}."}
+    if nodes not in (1, 2):
+        return progress.failure_response(
+            DeploymentStage.VALIDATION,
+            f"Invalid 'nodes' value {nodes!r}: must be 1 or 2.",
+            head=head,
+        )
+    if head not in HOSTS:
+        return progress.failure_response(
+            DeploymentStage.VALIDATION,
+            f"Invalid 'head' value {head!r}: must be one of {list(HOSTS.keys())}.",
+            head=head,
+        )
 
     target_hosts = deployment_target_hosts(nodes, head)
     catalog_resp = load_model_catalog()
     models_catalog = catalog_resp.get("catalog", {}).get("models", {})
 
-    if model not in models_catalog: return {"status": "error", "message": f"Model '{model}' not defined in catalog."}
+    if model not in models_catalog:
+        return progress.failure_response(
+            DeploymentStage.VALIDATION,
+            f"Model '{model}' not defined in catalog.",
+            targets=target_hosts,
+            head=head,
+        )
 
     model_config = models_catalog[model]
     topologies = model_config.get("topologies", {})
     topo_key = "2_node" if nodes == 2 else "1_node"
 
-    if topo_key not in topologies: return {"status": "error", "message": f"Topology '{topo_key}' not supported for model '{model}'."}
+    if topo_key not in topologies:
+        return progress.failure_response(
+            DeploymentStage.VALIDATION,
+            f"Topology '{topo_key}' not supported for model '{model}'.",
+            targets=target_hosts,
+            head=head,
+        )
+    progress.succeed(
+        DeploymentStage.VALIDATION,
+        f"Validated {model} for {topo_key}.",
+    )
 
     offline_mode = False
     if NETWORK_STATE_FILE.exists():
@@ -4118,20 +4163,23 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
             )
             print(f"[i] {gpu_util_ceiling_note}")
         elif _mode == "error":
-            return {
-                "status": "error",
-                "code": "gpu_util_ceiling",
-                "model": model,
-                "gpu_util": gpu_util,
-                "ceiling": _ceiling,
-                "message": (
-                    f"Refusing to deploy '{model}': {_over}, and the recipe does not "
-                    f"set gpu_util_ceiling_exempt: true. Either add that field to the "
-                    f"recipe (if the higher value is validated and intended), lower the "
-                    f"recipe's gpu_util, or raise the ceiling in cluster_config.yaml. "
-                    f"Set gpu_util_ceiling_enforce: warn to downgrade this to a warning."
-                ),
-            }
+            message = (
+                f"Refusing to deploy '{model}': {_over}, and the recipe does not "
+                f"set gpu_util_ceiling_exempt: true. Either add that field to the "
+                f"recipe (if the higher value is validated and intended), lower the "
+                f"recipe's gpu_util, or raise the ceiling in cluster_config.yaml. "
+                f"Set gpu_util_ceiling_enforce: warn to downgrade this to a warning."
+            )
+            return progress.failure_response(
+                DeploymentStage.VALIDATION,
+                message,
+                targets=target_hosts,
+                head=head,
+                code="gpu_util_ceiling",
+                model=model,
+                gpu_util=gpu_util,
+                ceiling=_ceiling,
+            )
         elif _mode == "warn":
             gpu_util_ceiling_note = (
                 f"'{model}' requests {_over}, and does not set "
@@ -4177,12 +4225,67 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
     if not dry_run:
         SESSION_TRACKER._commit_session()
         SESSION_TRACKER.active = False
-        _execute_teardown_impl(target_hosts=target_hosts)
+        try:
+            teardown_results = _execute_teardown_impl(target_hosts=target_hosts)
+        except Exception as exc:
+            return progress.failure_response(
+                DeploymentStage.PRE_DEPLOY_TEARDOWN,
+                f"Pre-deploy teardown raised {type(exc).__name__}: {exc}",
+                targets=target_hosts,
+                head=head,
+            )
+        if not _teardown_results_are_clean(teardown_results, target_hosts):
+            return progress.failure_response(
+                DeploymentStage.PRE_DEPLOY_TEARDOWN,
+                f"Pre-deploy teardown did not clean every target: {teardown_results}",
+                details={"results": teardown_results},
+                targets=target_hosts,
+                head=head,
+            )
+        progress.succeed(
+            DeploymentStage.PRE_DEPLOY_TEARDOWN,
+            "All target hosts were cleanly torn down.",
+        )
+
         for h in target_hosts:
             ip = HOSTS[h]["ip"]
-            run_ssh(ip, None, ["sudo", "nvidia-smi", "-lgc", tuning.gpu_clock_lock], timeout=10)
-            run_ssh(ip, None, ["bash", "-c", "mkdir -p ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton ~/.cache/vllm ~/.cache/flashinfer"], timeout=10)
-            run_ssh(ip, None, ["bash", "-c", f"mkdir -p ~/.cache/ray-logs/{deploy_run_id}/{h}"], timeout=10)
+            preparation_commands = [
+                (
+                    "GPU clock lock",
+                    ["sudo", "nvidia-smi", "-lgc", tuning.gpu_clock_lock],
+                ),
+                (
+                    "JIT cache directories",
+                    ["bash", "-c", "mkdir -p ~/.cache/tilelang ~/.cache/deepgemm ~/.cache/triton ~/.cache/vllm ~/.cache/flashinfer"],
+                ),
+                (
+                    "Ray log directory",
+                    ["bash", "-c", f"mkdir -p ~/.cache/ray-logs/{deploy_run_id}/{h}"],
+                ),
+            ]
+            for preparation_name, command in preparation_commands:
+                result = run_ssh(ip, None, command, timeout=10)
+                if result.returncode != 0:
+                    message = (
+                        f"{preparation_name} failed on {h}: "
+                        f"{result.stderr.strip() or result.stdout.strip() or 'no output'}"
+                    )
+                    return progress.failure_response(
+                        DeploymentStage.HOST_PREPARATION,
+                        message,
+                        host=h,
+                        details={
+                            "operation": preparation_name,
+                            "returncode": result.returncode,
+                        },
+                        targets=target_hosts,
+                        head=head,
+                    )
+            progress.succeed(
+                DeploymentStage.HOST_PREPARATION,
+                "Required host preparation completed.",
+                host=h,
+            )
 
     default_img = catalog_resp.get("catalog", {}).get("default_image", load_cluster_config().default_image)
     image_tag = model_config.get("image", default_img)
@@ -4323,7 +4426,13 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
         try:
             host_image_tag = _resolve_host_image_tag(head, ip, image_tag, mod_names, dry_run)
         except (ModResolutionError, ModBakeError) as exc:
-            return {"status": "error", "message": f"Mod resolution failed for {model} on {head}: {exc}"}
+            return progress.failure_response(
+                DeploymentStage.MOD_RESOLUTION,
+                f"Mod resolution failed for {model} on {head}: {exc}",
+                host=head,
+                targets=target_hosts,
+                head=head,
+            )
         if mod_names:
             mods_report[head] = {"base_image": image_tag, "mod_names": mod_names, "resolved_tag": host_image_tag}
 
@@ -4339,7 +4448,21 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
         res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
         env_collisions[head] = _env_flag_collisions(env_flags)
         if dry_run: docker_run_commands[head] = _mask_secret_argv(docker_cmd)
-        elif res.returncode != 0: return {"status": "error", "message": f"Docker run command failed on {head}: {res.stderr}"}
+        elif res.returncode != 0:
+            return progress.failure_response(
+                DeploymentStage.CONTAINER_LAUNCH,
+                f"Docker run command failed on {head}: {res.stderr}",
+                host=head,
+                details={"returncode": res.returncode},
+                targets=target_hosts,
+                head=head,
+            )
+        else:
+            progress.succeed(
+                DeploymentStage.CONTAINER_LAUNCH,
+                "Standalone container launched.",
+                host=head,
+            )
     else:
         vllm_head_args = None
         cluster_ports = load_cluster_config().ports
@@ -4420,7 +4543,13 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
             try:
                 host_image_tag = _resolve_host_image_tag(host, ip, image_tag, mod_names, dry_run)
             except (ModResolutionError, ModBakeError) as exc:
-                return {"status": "error", "message": f"Mod resolution failed for {model} on {host}: {exc}"}
+                return progress.failure_response(
+                    DeploymentStage.MOD_RESOLUTION,
+                    f"Mod resolution failed for {model} on {host}: {exc}",
+                    host=host,
+                    targets=target_hosts,
+                    head=head,
+                )
             if mod_names:
                 mods_report[host] = {"base_image": image_tag, "mod_names": mod_names, "resolved_tag": host_image_tag}
 
@@ -4439,22 +4568,88 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
             res = None if dry_run else run_ssh(ip, None, docker_cmd, timeout=60)
             env_collisions[host] = _env_flag_collisions(env_flags)
             if dry_run: docker_run_commands[host] = _mask_secret_argv(docker_cmd)
-            elif res.returncode != 0: return {"status": "error", "message": f"Docker run failed on {host}: {res.stderr}"}
+            elif res.returncode != 0:
+                return progress.failure_response(
+                    DeploymentStage.CONTAINER_LAUNCH,
+                    f"Docker run failed on {host}: {res.stderr}",
+                    host=host,
+                    details={"returncode": res.returncode},
+                    targets=target_hosts,
+                    head=head,
+                )
+            else:
+                progress.succeed(
+                    DeploymentStage.CONTAINER_LAUNCH,
+                    f"{role_name} container launched.",
+                    host=host,
+                )
 
         if use_ray and vllm_head_args and not dry_run:
             print("[+] Waiting for Ray cluster to register worker nodes (max 60s)...")
             worker_hosts = [k for k, v in HOSTS.items() if v["role"] == "worker"]
             worker_ip = HOSTS[worker_hosts[0]]["ip"] if worker_hosts else ""
-            
+            ray_registered = False
+            check_ray = None
+
             for _ in range(30):
-                check_ray = run_ssh(head_ip, None, ["docker", "exec", ContainerRole.HEAD, "ray", "status"], timeout=10)
-                if check_ray.returncode == 0 and (worker_ip in check_ray.stdout or "2 active nodes" in check_ray.stdout or "Healthy: 2" in check_ray.stdout):
+                check_ray = run_ssh(
+                    head_ip,
+                    None,
+                    ["docker", "exec", ContainerRole.HEAD, "ray", "status"],
+                    timeout=10,
+                )
+                if check_ray.returncode == 0 and (
+                    worker_ip in check_ray.stdout
+                    or "2 active nodes" in check_ray.stdout
+                    or "Healthy: 2" in check_ray.stdout
+                ):
+                    ray_registered = True
                     break
                 time.sleep(2)
-            
+
+            if not ray_registered:
+                details = {}
+                if check_ray is not None:
+                    details = {
+                        "returncode": check_ray.returncode,
+                        "stdout": check_ray.stdout.strip(),
+                        "stderr": check_ray.stderr.strip(),
+                    }
+                return progress.failure_response(
+                    DeploymentStage.RAY_CLUSTER_READY,
+                    "Ray worker did not register before the 60-second deadline.",
+                    host=head,
+                    details=details,
+                    targets=target_hosts,
+                    head=head,
+                )
+            progress.succeed(
+                DeploymentStage.RAY_CLUSTER_READY,
+                "Ray worker registered with the head.",
+                host=head,
+            )
+
             exec_str = " ".join(shlex.quote(arg) for arg in vllm_head_args)
-            vllm_exec_cmd = ["docker", "exec", "-d", ContainerRole.HEAD, "bash", "-c", f"{exec_str} > /proc/1/fd/1 2>&1"]
-            run_ssh(head_ip, None, vllm_exec_cmd, timeout=30)
+            vllm_exec_cmd = [
+                "docker", "exec", "-d", ContainerRole.HEAD,
+                "bash", "-c", f"{exec_str} > /proc/1/fd/1 2>&1",
+            ]
+            exec_result = run_ssh(head_ip, None, vllm_exec_cmd, timeout=30)
+            if exec_result.returncode != 0:
+                return progress.failure_response(
+                    DeploymentStage.ENGINE_LAUNCH,
+                    f"vLLM engine launch failed on {head}: "
+                    f"{exec_result.stderr.strip() or exec_result.stdout.strip() or 'no output'}",
+                    host=head,
+                    details={"returncode": exec_result.returncode},
+                    targets=target_hosts,
+                    head=head,
+                )
+            progress.succeed(
+                DeploymentStage.ENGINE_LAUNCH,
+                "Detached vLLM engine command accepted by the Ray head.",
+                host=head,
+            )
 
     # A CONFLICTING duplicate is worth saying out loud on a real deploy,
     # not only in a dry-run someone may never run: it means the recipe
@@ -4490,6 +4685,7 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
             "targets": target_hosts,
             "head": head,
             "docker_run_commands": docker_run_commands,
+            "stages": [stage.as_dict() for stage in progress.stages],
         }
         # The engine argv, for the 2-node case where docker_run_commands
         # holds only `ray start`. Added 2026-09-10.
@@ -4550,14 +4746,54 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
     time.sleep(4)
     for host in target_hosts:
         ip = HOSTS[host]["ip"]
-        check_res = run_ssh(ip, None, ["docker", "ps", "--filter", "status=running", "--format", "{{.Names}}"], timeout=10)
-        running = [c.strip() for c in check_res.stdout.splitlines() if c.strip() in [ContainerRole.STANDALONE, ContainerRole.HEAD, ContainerRole.WORKER]]
-        
-        if not running:
-            target_role = ContainerRole.STANDALONE if nodes == 1 else (ContainerRole.HEAD if host == head else ContainerRole.WORKER)
-            log_res = run_ssh(ip, None, ["docker", "logs", "--tail", "50", target_role], timeout=10)
-            err_log = log_res.stdout.strip() or log_res.stderr.strip() or "No logs captured."
-            return {"status": "error", "message": f"Container '{target_role}' crashed on {host} immediately after startup.\nLogs:\n{err_log}"}
+        target_role = (
+            ContainerRole.STANDALONE
+            if nodes == 1
+            else (ContainerRole.HEAD if host == head else ContainerRole.WORKER)
+        )
+        check_res = run_ssh(
+            ip,
+            None,
+            ["docker", "ps", "--filter", "status=running", "--format", "{{.Names}}"],
+            timeout=10,
+        )
+        if check_res.returncode != 0:
+            return progress.failure_response(
+                DeploymentStage.CONTAINER_SURVIVAL,
+                f"Could not verify container state on {host}: "
+                f"{check_res.stderr.strip() or check_res.stdout.strip() or 'no output'}",
+                host=host,
+                details={"returncode": check_res.returncode},
+                targets=target_hosts,
+                head=head,
+            )
+        running = {line.strip() for line in check_res.stdout.splitlines()}
+
+        if str(target_role) not in running:
+            log_res = run_ssh(
+                ip,
+                None,
+                ["docker", "logs", "--tail", "50", target_role],
+                timeout=10,
+            )
+            err_log = (
+                log_res.stdout.strip()
+                or log_res.stderr.strip()
+                or "No logs captured."
+            )
+            return progress.failure_response(
+                DeploymentStage.CONTAINER_SURVIVAL,
+                f"Container '{target_role}' crashed on {host} immediately after startup.\n"
+                f"Logs:\n{err_log}",
+                host=host,
+                targets=target_hosts,
+                head=head,
+            )
+        progress.succeed(
+            DeploymentStage.CONTAINER_SURVIVAL,
+            f"Container '{target_role}' remained running after startup.",
+            host=host,
+        )
 
     # Drop a pending launch-confirmation record regardless of wait/
     # run_benchmark -- this is what lets a plain "Deploy" click (which
@@ -4577,48 +4813,94 @@ model: str, nodes: int, head: str, user_id: str, wait: bool = False, run_benchma
     # health check the way launch-success recording is).
     try:
         recipe = load_recipes().get(model)
-        if recipe is not None:
-            cfg_hash = compute_config_hash(recipe, topo_key)
-            for h in target_hosts:
-                _set_active_deployment(h, model, topo_key, cfg_hash)
-            # Head only: a 2-node deploy is one thing to confirm healthy,
-            # not two, and the worker exposes no /health to confirm it
-            # against. Written to disk (not a module global) so a deploy
-            # issued from `dgx-config` -- a separate process that exits
-            # immediately -- is still visible to the daemon's status poll,
-            # which is the only thing that ever promotes it.
-            _set_pending_launch(head, model, topo_key, cfg_hash)
+        if recipe is None:
+            raise ValueError(f"recipe {model!r} disappeared after validation")
+        cfg_hash = compute_config_hash(recipe, topo_key)
+        for h in target_hosts:
+            _set_active_deployment(h, model, topo_key, cfg_hash)
+        _set_pending_launch(head, model, topo_key, cfg_hash)
     except Exception as exc:
-        # PENDING_LAUNCH_STATE staying unset here is genuinely fine
-        # (it's just a launch-success telemetry marker, as noted
-        # above) -- but ACTIVE_DEPLOYMENT_STATE staying unset is NOT
-        # fine. It's what lets the dashboard show the correct recipe
-        # instead of falling back to the ambiguous fuzzy served-name
-        # match (see ACTIVE_DEPLOYMENT_STATE's module comment -- this
-        # whole mechanism exists specifically to fix that ambiguity).
-        # A silent failure here would silently reintroduce it. Print
-        # so a broken load_recipes()/compute_config_hash() call after
-        # this deploy shows up in the daemon log immediately, not as
-        # a confusing "why did the dropdown revert again" report.
-        print(f"[!] _execute_deployment_impl({model}): failed to record ACTIVE_DEPLOYMENT_STATE - {exc}")
+        return progress.failure_response(
+            DeploymentStage.STATE_RECORDING,
+            f"Containers launched, but deployment identity could not be recorded: "
+            f"{type(exc).__name__}: {exc}",
+            targets=target_hosts,
+            head=head,
+        )
+    progress.succeed(
+        DeploymentStage.STATE_RECORDING,
+        "Active and pending deployment identity recorded.",
+    )
 
     if wait or run_benchmark:
         head_ip = HOSTS[head]["ip"]
-        is_ready = wait_for_cluster_ready(head_ip=head_ip, timeout_sec=tuning.deploy_wait_timeout_sec, poll_interval=tuning.deploy_poll_interval_sec)
-        
-        if is_ready:
-            total_duration = int(time.time() - deploy_start_time)
-            record_load_time(model, topo_key, total_duration, "cached")
+        is_ready = wait_for_cluster_ready(
+            head_ip=head_ip,
+            timeout_sec=tuning.deploy_wait_timeout_sec,
+            poll_interval=tuning.deploy_poll_interval_sec,
+        )
+        if not is_ready:
+            return progress.failure_response(
+                DeploymentStage.READINESS,
+                f"Deployment did not pass its health check within "
+                f"{tuning.deploy_wait_timeout_sec} seconds.",
+                host=head,
+                details={"timeout_sec": tuning.deploy_wait_timeout_sec},
+                targets=target_hosts,
+                head=head,
+            )
+        progress.succeed(
+            DeploymentStage.READINESS,
+            "vLLM health check passed.",
+            host=head,
+        )
+        total_duration = int(time.time() - deploy_start_time)
+        record_load_time(model, topo_key, total_duration, "cached")
 
-            if run_benchmark:
-                execute_standalone_benchmark(head=head, nodes=nodes, model_key=model)
+        if run_benchmark:
+            benchmark_result = execute_standalone_benchmark(
+                head=head,
+                nodes=nodes,
+                model_key=model,
+            )
+            if benchmark_result.get("status") != "success":
+                return progress.failure_response(
+                    DeploymentStage.BENCHMARK,
+                    benchmark_result.get(
+                        "message", "Benchmark could not be started."
+                    ),
+                    host=head,
+                    details={"result": benchmark_result},
+                    targets=target_hosts,
+                    head=head,
+                )
+            progress.succeed(
+                DeploymentStage.BENCHMARK,
+                benchmark_result.get(
+                    "message", "Benchmark background task initiated."
+                ),
+                host=head,
+            )
+        else:
+            progress.skip(
+                DeploymentStage.BENCHMARK,
+                "Benchmark was not requested.",
+            )
+    else:
+        progress.skip(
+            DeploymentStage.READINESS,
+            "Blocking readiness was not requested.",
+        )
+        progress.skip(
+            DeploymentStage.BENCHMARK,
+            "Benchmark was not requested.",
+        )
 
-    return {
-        "status": "success",
-        "message": f"Deployment sequence for {model} across {nodes} node(s) initiated.",
-        "targets": target_hosts,
-        "head": head
-    }
+    return progress.success_response(
+        f"Deployment sequence for {model} across {nodes} node(s) initiated.",
+        targets=target_hosts,
+        head=head,
+    )
 
 def get_container_logs(host: str, tail: int = 40) -> dict:
     if host not in HOSTS: return {"logs": ["Invalid target host specified."]}
