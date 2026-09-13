@@ -16,6 +16,7 @@ from typing import Any, Literal, Mapping, Optional
 class DeploymentStage(StrEnum):
     VALIDATION = "validation"
     OPERATION_LOCK = "operation_lock"
+    OPERATION_LOCK = "operation_lock"
     PRE_DEPLOY_TEARDOWN = "pre_deploy_teardown"
     HOST_PREPARATION = "host_preparation"
     MOD_RESOLUTION = "mod_resolution"
