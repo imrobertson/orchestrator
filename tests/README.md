@@ -102,8 +102,9 @@ commands rather than introducing pytest as a second test runner.
 
 `test_deployment.py` imports the real orchestrator but replaces every SSH and
 hardware boundary. It verifies that pre-deploy teardown failure, required
-host-preparation failure, detached Ray engine-launch failure, and requested
-readiness timeout all produce a structured error naming the failed stage.
+host-preparation failure, Ray registration timeout, detached Ray engine-launch
+failure, and requested readiness timeout all produce a structured error naming
+the failed stage.
 It also asserts that the response contract cannot serialize success after any
 stage has failed.
 
