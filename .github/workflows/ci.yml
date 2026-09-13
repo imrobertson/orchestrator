@@ -38,6 +38,9 @@ jobs:
       - name: Run SSH regression tests
         run: python tests/test_ssh.py
 
+      - name: Run deployment contract regression tests
+        run: python tests/test_deployment.py
+
       - name: Check documentation references
         run: python tools/check_doc_references.py --repo .
 

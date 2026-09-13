@@ -5,6 +5,11 @@ backlog role of `ARCHITECTURE-MIGRATION-PLAN.md`. For direction and
 decisions of record see `DIRECTION.md`; for per-fix history see
 `TOMBSTONES.md`; for machine-readable recipe rules see `errata.yaml`.
 
+Revision 6, 2026-09-13. Adds the deployment-stage result contract and
+hardware-free regressions for pre-deploy teardown, host preparation, Ray
+registration, detached engine launch, and readiness timeout failures. No live
+cluster deployment was performed for this revision.
+
 Revision 5, 2026-09-09. Built from `TOMBSTONES.md` #27–#143,
 `TROUBLESHOOTING.md` #1–14, `errata.yaml` E001–E022, `model_ledger.json`, and
 verification against `dgx-orchestrator.py`, `common/recipes.py`,
@@ -761,6 +766,7 @@ evidence. Ordered by what each unblocks.
 
 | Item | Status | Notes |
 |---|---|---|
+| Deployment-stage result contract | **LANDED + CI 2026-09-13** | `common/deployment.py` defines typed, ordered stage results and prevents a deployment with any failed required stage from being represented as success. `_execute_deployment_impl()` consumes teardown, host-preparation, container-launch, Ray-registration, detached engine-launch, container-survival, state-recording, readiness, and requested benchmark results. Responses retain their existing fields and add `stages` plus `failed_stage` on error. Hardware-free coverage is in `tests/test_deployment.py`; live-cluster verification remains outstanding. |
 | Retain the full vLLM container log per deploy | **OPEN — highest leverage here** | Docker already persists stdout via `json-file`; containers run `-d` without `--rm`, so nothing needs flushing. Design: capture at teardown before `docker rm`, plus a low-frequency incremental `docker logs --since` net (60s, must be incremental). **Do not** `docker logs -f` from the daemon — orphaned children are an existing bug class (#81). Storage: reuse `~/.cache/ray-logs/<deploy_run_id>/<host>/`, with its own `vllm_log_retention_hours` (default 24) — not `crash_log_retention_days`, since Ray dumps are tiny and vLLM logs are not. Keep whole logs initially: a head/tail policy would discard exactly the hours in which slow degradations are visible. **Check first** whether `/etc/docker/daemon.json` sets `log-opts max-size`/`max-file`; if it does, the whole premise changes. |
 | **`earlyoom` as a userspace OOM guard — never evaluated** | **OPEN, new 2026-09-09** | eugr bakes the `earlyoom` daemon into their image with tuned thresholds, exposed as `launch-cluster.sh --earlyoom`. Recorded because we have the problem it addresses and they do not appear to: TOMBSTONES #71 is Ray's memory monitor OOM-killing a worker as unified-memory headroom ran out over hours, WS-9's 512K soak exists to watch for that exact mode, and tonyd2wild's `--kv-cache-memory` finding is their own watchdog killing an engine at 3.06 GB MemAvailable. A killer acting on a threshold we choose, ahead of the kernel's, is a plausible mitigation. **Wants it as a host service, not a mod** — same shape as `drop-caches`: a host-level tool wrapped as a container concern because an on-node container was eugr's only execution surface, and we have an off-node control plane that already runs commands over SSH. Nobody here has run it; the in-container mechanics (host `/proc/meminfo` visible, signalling confined to its own PID namespace) are reasoned, not observed. See `docs/reference/community-sources.md`. |
 | `/api/status` reports nothing about `common/` | **OPEN** | `docker-compose.yml` bind-mounts `.:/app`, so a `common/*.py` edit lands on disk instantly while the daemon keeps running the imported version. `orchestrator_version` cannot catch this — it hashes `dgx-orchestrator.py` only. Cost a real debugging round. Options: a `modules` block hashing what was loaded at import time, or simply always restarting the API container on deploy (cheaper, strictly more reliable). |
@@ -773,7 +779,7 @@ evidence. Ordered by what each unblocks.
 | POSIX `/dev/shm` files never swept | **OPEN, second real confirmation 2026-09-04** | SysV segments with `nattch == 0` are swept every teardown (a hard kernel guarantee). `/dev/shm` needs a `/proc/*/fd` + `/proc/*/maps` cross-reference — buildable, but riskier to get subtly wrong, deliberately deferred. SysV semaphores are inventoried, not swept. #116 independently confirmed this gap while investigating an unrelated deadlock: 29 orphaned `psm_*` files on spark-4 spanning ~36 hours, zero on spark-3, `ipcs -m` clean on both. Capacity-innocent (`df -h /dev/shm`: 1.3M/61G) and ruled out as that bug's cause, but the leak itself is real and this makes two suspected-or-confirmed incidents (2026-08-23, 2026-09-04) rather than one. |
 | Cache integrity retrospection | **OPEN, wants ground truth** | One concrete artifact: a `tilelang` entry named `tmp` with an implausible ~56-year age. The heuristic needs real Triton/TileLang/DeepGEMM cache-layout contracts before it can be trusted. |
 | `serving_host` ignored container run state | **LANDED 2026-09-07** | #136. The selection loop matched `active_container` by name regardless of `is_crashed`, so a stale `EXITED` container on an earlier-listed host shadowed a genuinely serving one and reported the whole cluster not-ready. Survived both #130 and #131 untouched -- neither had reason to distinguish running from dead until host order changed. Now gated on `not is_crashed`. Adjacent to *Engine health monitoring* above: that row's "container RUNNING, engine absent" case is this one's mirror image and is **not** caught by this fix. |
-| `wait_for_cluster_ready()` timeout fails silently | **OPEN, new 2026-09-07** | `_execute_deployment_impl()` wraps both load-time recording and the auto-benchmark trigger in a single `if is_ready:`. A `deploy_wait_timeout_sec` expiry (900s default) drops both with no error surfaced to dashboard, CLI, or toast -- indistinguishable from "auto-benchmark is broken". Suspected but **not confirmed** as a second cause of missed auto-benchmarks alongside #137; the evidence to settle it is `benchmark_ledger.csv` timestamps against deploy logs. At minimum, log and surface the timeout distinctly from success. |
+| `wait_for_cluster_ready()` timeout fails silently | **LANDED + REGRESSION 2026-09-13** | A requested `--wait` or auto-benchmark readiness timeout now returns a structured error with `failed_stage: readiness`; the benchmark stage cannot be reported as successful or silently omitted. `tests/test_deployment.py` reproduces the timeout without hardware and asserts the failure contract. This has not yet been re-exercised on a live 2-node deployment. |
 | `ab_test.py` cannot run a 2-node comparison while a host is reserved | **OPEN, blocks K12** | 2-node variants span both hosts; `spark-3` is reserved; `ab_test.py` has no `--force` and that omission is deliberate (a force flag surviving in a saved benchmark invocation is exactly what the reserved-host design rejects). So the MTP-vs-DFlash2 comparison K12 is built around cannot run through it today. Options, in rough order of preference: (a) an explicit `--force-reserved` that must be passed per-invocation and is refused if it appears in a saved/scripted call, (b) teach it to run the comparison sequentially through `dgx-orchestrator.py deploy --force` rather than its own deploy path, (c) accept manual sequential benchmarking for 2-node and document it. Decide before K12 rather than during. |
 | Long operations write their output at the end and check writability never | **OPEN, new 2026-09-09** | A 3-pass `benchmark.py` run completed, printed its numbers, and then failed with `Permission denied: benchmark_ledger.csv` — the file was root-owned from the container writing through the bind mount. The run is simply lost, and the error arrives AFTER the results have scrolled past, so it is easy to miss entirely. Cheap fix: check the output path is writable BEFORE doing the work, in `benchmark.py` and anything else with a write-at-the-end shape (`ab_test.py`, the run-log archival path). |
 | A fix to a shared element must be preceded by an audit of its other readers | **PRACTICE, adopted 2026-09-08** | #141. #134 fixed one reader of `headSelect` and left another broken for a day, which then aimed the benchmark at a headless worker. `grep -n "headSelect'" index.html` returns seven hits and takes five minutes; doing it at fix time would have caught #141 immediately, and it also establishes which other readers are already safe (two were) rather than leaving that to assumption. Cheap, mechanical, and it does not depend on having a browser harness — which is the other open row above, still unaddressed. |
@@ -2002,27 +2008,19 @@ keeps getting lost.
 > already happened once. Both are recorded: `TOMBSTONES.md` #137 and #136,
 > WS-10 and WS-7 respectively.
 >
-> ### Part 1 — diagnose `wait_for_cluster_ready()`'s silent timeout (do this first, it is cheap)
+> ### Part 1 — RESOLVED 2026-09-13: surface readiness timeout
 >
-> `_execute_deployment_impl()` wraps both load-time recording and the
-> auto-benchmark trigger in a single `if is_ready:`. When
-> `wait_for_cluster_ready()` exhausts `tuning.deploy_wait_timeout_sec`
-> (900s), it returns false and **both** are skipped, with no error surfaced
-> to the dashboard, the CLI, or a toast. That is indistinguishable from
-> "the feature is broken."
+> The silent branch was reproduced at the deployment boundary with mocked SSH
+> and readiness checks. A requested wait that exhausts
+> `tuning.deploy_wait_timeout_sec` now returns `status: error` with
+> `failed_stage: readiness`; the ordered `stages` evidence also makes clear
+> that the requested benchmark did not run. The regression lives in
+> `tests/test_deployment.py` and runs in CI.
 >
-> This is **suspected, not confirmed**, as a second cause of missed
-> auto-benchmarks alongside #137. Confirm or rule it out before changing
-> anything: cross-reference `benchmark_ledger.csv` timestamps against deploy
-> logs for runs where auto-benchmark was requested. A deploy that reached
-> READY well after its 900s window, with no ledger row, is the signature.
->
-> If confirmed, the fix is not "raise the timeout" — a longer wrong answer
-> is still wrong. Surface the timeout distinctly from success: it should be
-> visible on the dashboard and in the CLI's return value, and it should say
-> which of the two things it skipped. Consider whether load-time recording
-> and the benchmark trigger should share a single gate at all — a model that
-> booted slowly still produced real load-time data worth recording.
+> This is source-level and hardware-free verification. No historical
+> `benchmark_ledger.csv` correlation or live slow-boot reproduction was
+> performed, so this closes the deterministic silent-success defect without
+> claiming that it was the cause of any particular missed historical benchmark.
 >
 > ### Part 2 — close `awaitingReady`'s page-reload hole
 >
@@ -2541,9 +2539,11 @@ them. See TOMBSTONES #143.
 `TOMBSTONES.md` #27–#110. The short version, because it bears on
 sequencing here:
 
-Classes 2 (failures returning plausible values), 4 (state inferred from log
-text), and 5 (config-to-argv construction) are being managed adequately —
-each has a working convention and targeted fixes that hold.
+Class 2 (failures returning plausible values) now has a structural contract
+in the deploy path; its regression suite covers the previously silent
+deployment stages. Other maintenance paths have not yet adopted it. Classes
+4 (state inferred from log text) and 5 (config-to-argv construction) remain
+managed by convention and targeted fixes.
 
 Classes 1 (identity derived independently in many places) and 3 (the control
 plane reasoning about processes it cannot see) keep producing new instances
