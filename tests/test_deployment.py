@@ -13,9 +13,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from common.deployment import (
+    DeploymentProgress,
     DeploymentStage,
     DeploymentStageResult,
-    deployment_response,
 )
 
 
@@ -103,11 +103,11 @@ def test_contract_rejects_success_after_failure():
             "simulated failure",
         )
     ]
+    progress = DeploymentProgress()
+    progress.record(stages[0])
     try:
-        deployment_response(
-            "success",
+        progress.success_response(
             "this must be rejected",
-            stages,
             targets=["spark-4"],
             head="spark-4",
         )
