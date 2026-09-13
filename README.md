@@ -286,7 +286,25 @@ computation surfaces this instead of silently serving a frozen snapshot
 indefinitely. **If the dashboard ever looks frozen, check these two fields
 first.** Not yet surfaced as a dashboard banner; API-only.
 
+### 8. Deployment-stage result contract
+
+Every deploy now reports an ordered `stages` list in addition to the existing
+`status`, `message`, `targets`, and `head` fields. Each stage has an explicit
+`success`, `error`, or `skipped` result; an error response also names
+`failed_stage`. A deployment cannot report success after any required stage
+has failed.
+
+The deploy path consumes teardown, host preparation, container launch, Ray
+registration, detached engine launch, container-survival, state-recording,
+readiness, and requested benchmark results. In particular, a `--wait` timeout
+is an error rather than a plausible success, and a failed detached Ray engine
+command is surfaced immediately. A deploy without `--wait` still returns after
+launch and container-survival checks; its readiness and benchmark stages are
+reported as `skipped`, not implied to have passed.
+
 ---
+
+
 
 ## Network fabric & transport
 
