@@ -82,24 +82,25 @@ to take any pair list, which covers parameter sweeps such as the
 A PASS means both sides booted and benchmarked, **not** that either won.
 Read the `AGGREGATE ACROSS N REPEATS` block for that.
 
-## `test_config.py`, `test_recipes.py`, `test_ssh.py`
+## Regression tests
 
-Plain-assert tests for the matching `common/` module. Run them directly,
-one at a time; pytest is not provisioned by this repository:
+The four hardware-free, plain-assert suites run directly; pytest is not
+required by this repository:
 
 ```bash
 python3 tests/test_config.py
 python3 tests/test_recipes.py
 python3 tests/test_ssh.py
+python3 tests/test_deployment.py
 ```
 
-GitHub Actions runs those three scripts on Python 3.12 for every pull request
+GitHub Actions runs those four scripts on Python 3.12 for every pull request
 and every push to `main`. It also compiles all Python sources and runs the
 documentation-reference, documentation-health, and tracked-file inventory
 checks. The workflow is intentionally made from the repository's existing
 commands rather than introducing pytest as a second test runner.
 
-`test_recipes.py` compares the live recipe names and topology keys against
+`test_deployment.py` imports the real orchestrator but replaces every SSH and\nhardware boundary. It verifies that pre-deploy teardown failure, required\nhost-preparation failure, detached Ray engine-launch failure, and requested\nreadiness timeout all produce a structured error naming the failed stage.\nIt also asserts that the response contract cannot serialize success after any\nstage has failed.\n\n`test_recipes.py` compares the live recipe names and topology keys against
 `data/recipe_catalog_snapshot.json`. This catches additions, removals, renames,
 and topology changes without embedding counts throughout the assertions. It
 also enforces an independent minimum of 30 recipes, so accidentally regenerating
