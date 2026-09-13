@@ -304,8 +304,6 @@ reported as `skipped`, not implied to have passed.
 
 ---
 
-
-
 ## Network fabric & transport
 
 - **Management TCP interface (`enp1s0f0np0`)** — all SSH orchestration,
