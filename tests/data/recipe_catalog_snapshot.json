@@ -1,0 +1,118 @@
+{
+  "_deepseek-v4-flash-vision-exp": [
+    "2_node"
+  ],
+  "_llama-4-fp8-tp-noep": [
+    "2_node"
+  ],
+  "_nemotron-3.5-lightning-nvfp4-tools": [
+    "1_node"
+  ],
+  "deepseek-r1-distill-qwen-32b": [
+    "1_node",
+    "2_node"
+  ],
+  "deepseek-v4-flash-0731-1M": [
+    "2_node"
+  ],
+  "deepseek-v4-flash-0731-dspark-512k": [
+    "2_node"
+  ],
+  "deepseek-v4-flash-0731-dspark": [
+    "2_node"
+  ],
+  "gemma-4-31b": [
+    "1_node",
+    "2_node"
+  ],
+  "gemma4-26b-a4b-aeon-dflash": [
+    "1_node"
+  ],
+  "gemma4-26b-a4b-nvfp4-tools": [
+    "1_node"
+  ],
+  "gemma4-26b-a4b-nvfp4": [
+    "1_node"
+  ],
+  "glm-5_3-flash-nvfp4-mtp": [
+    "2_node"
+  ],
+  "llama-3.3-70b": [
+    "2_node"
+  ],
+  "llama-4-fp4": [
+    "1_node",
+    "2_node"
+  ],
+  "llama-4-fp8-tp": [
+    "2_node"
+  ],
+  "llama-4-fp8": [
+    "1_node",
+    "2_node"
+  ],
+  "minimax-m2_7-nvfp4-gb10": [
+    "2_node"
+  ],
+  "muse-glimmer-30b-nvfp4-dflash-tools": [
+    "1_node"
+  ],
+  "muse-glimmer-30b-nvfp4": [
+    "1_node"
+  ],
+  "muse-glimmer-30b": [
+    "1_node"
+  ],
+  "nemotron-3-nano-30b-a3b-nvfp4": [
+    "1_node",
+    "2_node"
+  ],
+  "nemotron-3.5-lightning-nvfp4": [
+    "1_node"
+  ],
+  "nemotron-3_5-lightning-bf16": [
+    "1_node",
+    "2_node"
+  ],
+  "qwen-2_5-coder-32b-tp": [
+    "1_node",
+    "2_node"
+  ],
+  "qwen-2_5-coder-32b": [
+    "1_node",
+    "2_node"
+  ],
+  "qwen-3.5-122b-mtp2": [
+    "2_node"
+  ],
+  "qwen-3.5-122b-mtp4": [
+    "2_node"
+  ],
+  "qwen-3.5-122b-tp": [
+    "2_node"
+  ],
+  "qwen-3.6-35b-a3b-hauhaucs-nvfp4-nospec": [
+    "1_node"
+  ],
+  "qwen-3.6-35b-a3b-nvfp4-nothink": [
+    "1_node"
+  ],
+  "qwen-3.6-35b-a3b-nvfp4": [
+    "1_node"
+  ],
+  "qwen-3.8-27b-nvfp4-sqk2": [
+    "1_node"
+  ],
+  "qwen-3.8-27b-nvfp4": [
+    "1_node",
+    "2_node"
+  ],
+  "qwen-3.8-27b": [
+    "1_node",
+    "2_node"
+  ],
+  "qwen-3_6-27b-nvfp4-tp": [
+    "1_node",
+    "2_node"
+  ]
+}
