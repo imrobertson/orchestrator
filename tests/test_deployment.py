@@ -49,6 +49,16 @@ def _patched(**replacements):
 
 
 @contextmanager
+def _without_sleep():
+    original = ORCH.time.sleep
+    ORCH.time.sleep = lambda seconds: None
+    try:
+        yield
+    finally:
+        ORCH.time.sleep = original
+
+
+@contextmanager
 def _isolated_deploy(teardown_result, run_ssh, **extra):
     original_commit = ORCH.SESSION_TRACKER._commit_session
     original_active = ORCH.SESSION_TRACKER.active
@@ -163,6 +173,36 @@ def test_host_preparation_failure_stops_launch():
     print("PASS: required host preparation failure stops launch")
 
 
+def test_ray_registration_timeout_stops_engine_launch():
+    model = _model_for("2_node", ray=True)
+    head = ORCH.PRIMARY_HOST
+    targets = ORCH.deployment_target_hosts(2, head)
+    engine_launch_seen = False
+
+    def fake_ssh(ip, user, command, timeout=30):
+        nonlocal engine_launch_seen
+        if command[:4] == [
+            "docker", "exec", ORCH.ContainerRole.HEAD, "ray"
+        ]:
+            return _completed(1, stderr="worker not registered")
+        if command[:3] == ["docker", "exec", "-d"]:
+            engine_launch_seen = True
+        return _completed()
+
+    with _without_sleep():
+        with _isolated_deploy(
+            {host: "Purged" for host in targets},
+            fake_ssh,
+        ):
+            result = ORCH._execute_deployment_impl(
+                model, 2, head, "test-user"
+            )
+
+    _assert_failed_at(result, DeploymentStage.RAY_CLUSTER_READY)
+    assert not engine_launch_seen, "engine launched without a registered worker"
+    print("PASS: Ray registration timeout stops engine launch")
+
+
 def test_ray_engine_exec_failure_is_consumed():
     model = _model_for("2_node", ray=True)
     head = ORCH.PRIMARY_HOST
@@ -217,6 +257,7 @@ if __name__ == "__main__":
     test_contract_rejects_success_after_failure()
     test_pre_deploy_teardown_failure_stops_launch()
     test_host_preparation_failure_stops_launch()
+    test_ray_registration_timeout_stops_engine_launch()
     test_ray_engine_exec_failure_is_consumed()
     test_wait_timeout_is_a_deployment_failure()
     print("\nAll deployment contract tests passed.")
