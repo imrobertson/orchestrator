@@ -41,7 +41,6 @@ def _write_catalog_snapshot() -> None:
     print(f"Updated {CATALOG_SNAPSHOT_PATH}")
 
 
-
 def _fresh_cluster_config():
     """
     Bypass load_cluster_config()'s lru_cache so tests that mutate the
@@ -248,7 +247,7 @@ topologies:
 
         original_dir = recipes_mod.RECIPES_DIR
         recipes_mod.RECIPES_DIR = tmp_path
-        cfg = _fresh_cluster_config()
+        _fresh_cluster_config()
         try:
             recipes = load_recipes(bypass_cache=True)
             assert recipes["cluster-only-model"].topologies["2_node"].cluster_only is True, (
